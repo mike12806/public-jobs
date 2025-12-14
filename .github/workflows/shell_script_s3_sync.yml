@@ -86,7 +86,8 @@ jobs:
                 sudo cp "$file" "changed_files/"
               fi
             fi
-          done
+        run: |
+          shopt -s globstar
 
       - name: Upload changed files to S3
         run: |
