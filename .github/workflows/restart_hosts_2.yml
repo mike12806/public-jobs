@@ -1,0 +1,67 @@
+name: Restart Hosts 2 Group (If Needed)
+
+on:
+  schedule:
+    - cron: '45 7 * * 6' # Adjusted to run on Saturday at 07:45 UTC
+  workflow_dispatch:  # Allows manual triggering
+
+concurrency:
+  group: restart_hosts_2
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout gh_hdc
+        uses: actions/checkout@v6
+        with:
+          repository: mfaherty/gh_hdc
+          token: ${{ secrets.GH_HDC_PAT }}
+          path: gh_hdc
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          hostname: github-runner-restart-hosts-2
+          version: latest
+
+      - name: Write SSH Private Key to File
+        run: |
+          echo "${{ secrets.MIKEYSSHKEYLINODE }}" | sed 's/\\n/\n/g' > /tmp/mike_ssh_key
+          chmod 600 /tmp/mike_ssh_key
+
+      - name: Write SSH Public Key to File
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.MIKESSHKEYLINODEPUB }}" | sed 's/\\n/\n/g' >> ~/.ssh/authorized_keys
+          chmod 600 ~/.ssh/authorized_keys
+
+      - name: Run Ansible Playbook
+        working-directory: gh_hdc/ansible  # Adjust path as needed
+        env:
+          ANSIBLE_SSH_PASS: ${{ secrets.ANSIBLE_SSH_PASSWORD_1 }}
+          ANSIBLE_PYTHON_INTERPRETER: /usr/bin/python3
+          ANSIBLE_GATHERING: smart
+          ANSIBLE_TIMEOUT: 30
+          ANSIBLE_STDOUT_CALLBACK: yaml
+          ANSIBLE_HOST_KEY_CHECKING: false
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          pipx run --spec ansible ansible-playbook playbooks/playbook_weekly_restart.yaml \
+            -i inventory/needs_restart_2 \
+            -u root \
+            --private-key=/tmp/mike_ssh_key \
+            --extra-vars "ansible_ssh_pass=${ANSIBLE_SSH_PASS} ansible_ssh_common_args='-o StrictHostKeyChecking=no'"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -f /tmp/mike_ssh_key
+          rm -rf ~/.ssh/authorized_keys
+          rm -rf ~/.ssh

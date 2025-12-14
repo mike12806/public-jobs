@@ -1,0 +1,86 @@
+name: Check Kubernetes Node Health
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '15 10 * * *'  # 6:15 AM Eastern Time (10:15 UTC)
+
+jobs:
+  check-k8s-nodes:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout gh_hdc
+        uses: actions/checkout@v6
+        with:
+          repository: mfaherty/gh_hdc
+          token: ${{ secrets.GH_HDC_PAT }}
+          path: gh_hdc
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          hostname: github-runner-daily-node-checker
+          version: latest
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'latest'
+      
+      - name: Set up kubeconfig
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBECONFIG }}" | base64 -d > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+          # Verify kubectl can connect to the cluster
+          kubectl cluster-info
+          if [ $? -ne 0 ]; then
+            echo "Failed to connect to the cluster"
+            kubectl config view --minify
+            exit 1
+          fi
+
+      - name: Check node readiness
+        id: check_nodes
+        run: |
+          NOT_READY=$(kubectl get nodes --no-headers | grep -v " Ready " || true)
+          PENDING_REBOOT=$(kubectl get nodes -o json | jq -r '.items[] | select(.spec.taints != null) | select(.spec.taints[] | select(.key == "weave.works/kured-node-reboot" and .value == "true")) | .metadata.name' || true)
+
+          if [ -z "$NOT_READY" ] && [ -z "$PENDING_REBOOT" ]; then
+            echo "status=OK" >> $GITHUB_OUTPUT
+            echo "subject=✅ All K8s Nodes Ready" >> $GITHUB_ENV
+            echo "body=All nodes in your Kubernetes cluster are Ready and no nodes are pending reboot." >> $GITHUB_ENV
+          else
+            echo "status=FAIL" >> $GITHUB_OUTPUT
+            echo "subject=❌ K8s Nodes Issue Detected" >> $GITHUB_ENV
+            {
+              echo "The following issues were detected:"
+              echo
+              if [ ! -z "$NOT_READY" ]; then
+                echo "Nodes not in Ready state:"
+                echo "$NOT_READY"
+                echo
+              fi
+              if [ ! -z "$PENDING_REBOOT" ]; then
+                echo "Nodes pending reboot:"
+                echo "$PENDING_REBOOT"
+              fi
+            } >> $GITHUB_ENV
+          fi
+
+      - name: Send email
+        if: always()
+        uses: dawidd6/action-send-mail@v6
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: ${{ env.subject }}
+          body: ${{ env.body }}
+          to: ${{ secrets.EMAIL_TO }}
+          from: ${{ secrets.EMAIL_FROM }}

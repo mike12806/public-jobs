@@ -1,0 +1,218 @@
+name: Update TrueNAS NFS Client IPs
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/15 * * * *'  # every 15 minutes
+
+concurrency:
+  group: nfs-ip-security-list-updater
+  cancel-in-progress: true
+
+jobs:
+  update-nfs-clients:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+
+    steps:
+      - name: Checkout gh_hdc
+        uses: actions/checkout@v6
+        with:
+          repository: mfaherty/gh_hdc
+          token: ${{ secrets.GH_HDC_PAT }}
+          path: gh_hdc
+          fetch-depth: 0
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          hostname: github-runner-nfs-ip-updater
+          version: latest
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'latest'
+
+      - name: Set up kubeconfig
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBECONFIG }}" | base64 -d > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+          # Verify kubectl can connect to the cluster
+          kubectl cluster-info
+          if [ $? -ne 0 ]; then
+            echo "Failed to connect to the cluster"
+            kubectl config view --minify
+            exit 1
+          fi
+
+      - name: Get Kubernetes node IPs and Additional IPs
+        id: node_ips
+        run: |
+          # Get Kubernetes node IPs
+          KUBE_IPS=$(kubectl get nodes -o json | jq -r '.items[].status.addresses[] | select(.type=="InternalIP") | .address' | sort -u)
+          
+          # Function to extract IPs from ansible inventory files
+          extract_ips() {
+            local file="$1"
+            if [[ -f "$file" ]]; then
+              # Extract IPs from lines that don't start with [ or #, and grab the first field (usually the IP)
+              grep -v '^\[' "$file" | grep -v '^#' | awk '{print $1}' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'
+            fi
+          }
+          
+          # List all files in inventory directory for debugging
+          echo "Listing contents of gh_hdc/ansible/inventory:"
+          ls -la gh_hdc/ansible/inventory/
+
+          # Extract IPs from inventory files using correct paths
+          echo "Looking for IPs in inventory files..."
+          INVENTORY_FILES=(
+            "gh_hdc/ansible/inventory/non_docker_lxc"
+            "gh_hdc/ansible/inventory/non_kubernetes_ubuntu_vm_and_lxc"
+            "gh_hdc/ansible/inventory/proxmox_hosts"
+            "gh_hdc/ansible/inventory/pihole_mac_hosts"
+            "gh_hdc/ansible/inventory/kubernetes_hosts"
+            "gh_hdc/ansible/inventory/mac_hosts"
+          )
+
+          INVENTORY_IPS=""
+          for file in "${INVENTORY_FILES[@]}"; do
+            echo "Processing file: $file"
+            if [[ -f "$file" ]]; then
+              echo "Found file: $file"
+              echo "File contents:"
+              cat "$file" || echo "Failed to read file"
+              
+              file_ips=$(extract_ips "$file")
+              if [[ -n "$file_ips" ]]; then
+                echo "IPs found in $file:"
+                echo "$file_ips"
+                INVENTORY_IPS+="$file_ips"$'\n'
+              else
+                echo "No IPs found in $file"
+              fi
+            else
+              echo "File not found: $file"
+            fi
+          done
+
+          # Clean up and deduplicate inventory IPs
+          INVENTORY_IPS=$(echo "$INVENTORY_IPS" | sort -u | grep -v '^$')
+
+          echo "Kubernetes IPs:"
+          echo "$KUBE_IPS"
+          echo "Inventory IPs:"
+          echo "$INVENTORY_IPS"
+          
+          # Combine, filter empty values, and deduplicate all IPs
+          ALL_IPS=$(echo -e "${KUBE_IPS}\n${INVENTORY_IPS}" | grep -v '^[[:space:]]*$' | sort -u | tr '\n' ',' | sed 's/,$//')
+          
+          echo "Combined IPs: $ALL_IPS"
+          echo "ips=$ALL_IPS" >> $GITHUB_OUTPUT
+
+      - name: Get all NFS share IDs from TrueNAS
+        id: get_share_ids
+        run: |
+          # Get NFS shares from TrueNAS API
+          RESPONSE=$(curl -sk -w "\n%{http_code}" \
+            -H "Authorization: Bearer ${{ secrets.TRUENAS_API_KEY }}" \
+            "${{ secrets.TRUENAS_API_URL }}/api/v2.0/sharing/nfs")
+          
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+          
+          if [[ "$HTTP_CODE" != "200" ]]; then
+            echo "Error getting NFS shares"
+            echo "HTTP Code: $HTTP_CODE"
+            echo "Response: $BODY"
+            exit 1
+          fi
+          
+          # Parse share IDs and convert to comma-separated list
+          SHARE_IDS=$(echo "$BODY" | jq -r '.[].id' | paste -sd, -)
+          if [[ -z "$SHARE_IDS" ]]; then
+            echo "No NFS shares found"
+            echo "Response: $BODY"
+            exit 1
+          fi
+          echo "share_ids=$SHARE_IDS" >> $GITHUB_OUTPUT
+          echo "Found NFS share IDs: $SHARE_IDS"
+
+      - name: Patch NFS shares with new IPs
+        run: |
+          # Parse comma-separated lists into arrays
+          IFS=',' read -ra IDS <<< "${{ steps.get_share_ids.outputs.share_ids }}"
+          IFS=',' read -ra IPS <<< "${{ steps.node_ips.outputs.ips }}"
+
+          for ID in "${IDS[@]}"; do
+            # Skip empty IDs
+            [[ -z "$ID" ]] && continue
+
+            # Get current share configuration
+            SHARE_CONFIG=$(curl -sk \
+              -H "Authorization: Bearer ${{ secrets.TRUENAS_API_KEY }}" \
+              "${{ secrets.TRUENAS_API_URL }}/api/v2.0/sharing/nfs/id/$ID")
+            
+            # Validate the share configuration
+            if ! echo "$SHARE_CONFIG" | jq -e . >/dev/null 2>&1; then
+              echo "Error: Invalid JSON response for share $ID"
+              echo "Response: $SHARE_CONFIG"
+              exit 1
+            fi
+
+            # Extract path from config (handles both 'path' and 'paths' fields)
+            PATHS=$(echo "$SHARE_CONFIG" | jq -r 'if has("paths") then .paths[] else .path end')
+            if [[ -z "$PATHS" ]]; then
+              echo "Error: No path found in share configuration for ID $ID"
+              echo "Config: $SHARE_CONFIG"
+              exit 1
+            fi
+            
+            # Format the hosts array with plain IPs, filtering out empty values
+            HOSTS_JSON="["
+            for IP in "${IPS[@]}"; do
+              if [[ -n "$IP" ]]; then
+                HOSTS_JSON+="\"$IP\","
+              fi
+            done
+            HOSTS_JSON=${HOSTS_JSON%,}
+            HOSTS_JSON+="]"
+            
+            echo "Updating NFS share ID: $ID with IPs: $HOSTS_JSON"
+            
+            # Create properly formatted JSON payload
+            PAYLOAD=$(jq -n \
+              --arg path "$PATHS" \
+              --argjson hosts "$HOSTS_JSON" \
+              '{
+                "path": $path,
+                "hosts": $hosts,
+                "enabled": true
+              }')
+
+            # Make the API request
+            
+            RESPONSE=$(curl -sk -w "\n%{http_code}" \
+              -X PUT \
+              -H "Content-Type: application/json" \
+              -H "Authorization: Bearer ${{ secrets.TRUENAS_API_KEY }}" \
+              -d "$PAYLOAD" \
+              "${{ secrets.TRUENAS_API_URL }}/api/v2.0/sharing/nfs/id/$ID")
+            
+            HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+            BODY=$(echo "$RESPONSE" | sed '$d')
+            
+            if [[ "$HTTP_CODE" != "200" ]]; then
+              echo "Error updating NFS share $ID"
+              echo "HTTP Code: $HTTP_CODE"
+              echo "Response: $BODY"
+              exit 1
+            fi
+
+            echo "Successfully updated NFS share ID: $ID"
+          done
