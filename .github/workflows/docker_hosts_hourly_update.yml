@@ -2,7 +2,7 @@ name: Hourly Docker Host Update Check
 
 on:
   schedule:
-    - cron: "30 6,18 * * *"  # Runs twice daily at 6:30 AM and 6:30 PM UTC
+    - cron: "0 * * * *"  # Runs hourly at the top of every hour
   workflow_dispatch:  # Allows manual triggering from GitHub Actions UI
 
 concurrency:
