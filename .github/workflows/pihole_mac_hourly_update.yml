@@ -3,7 +3,7 @@ name: Hourly Pihole Update Check
 on:
   schedule:
     - cron: "0 8,20 * * *"  # Runs twice daily at 8:00 AM and 8:00 PM UTC
-  workflow_dispatch:  # Allows manual triggering from Gitea Actions UI
+  workflow_dispatch:  # Allows manual triggering from GitHub Actions UI
 
 concurrency:
   group: pihole_mac_hourly_update
