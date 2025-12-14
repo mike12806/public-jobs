@@ -1,0 +1,40 @@
+name: Home Lab Connectivity (Final Verification)
+
+on: workflow_dispatch
+
+permissions:
+  contents: read
+
+jobs:
+  network-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout gh_hdc
+        uses: actions/checkout@v6
+        with:
+          repository: mike12806/gh_hdc
+          token: ${{ secrets.GH_HDC_PAT }}
+          path: gh_hdc
+
+      - name: Connect to Cloudflare WARP
+        uses: Boostport/setup-cloudflare-warp@v1
+        with:
+          organization: ${{ secrets.CF_ORGANIZATION }}
+          auth_client_id: ${{ secrets.CF_CLIENT_ID }}
+          auth_client_secret: ${{ secrets.CF_CLIENT_SECRET }}
+
+      - name: Install DNS Utils
+        run: sudo apt-get update && sudo apt-get install -y dnsutils iputils-ping
+
+      # We do NOT touch resolv.conf or systemd.
+      # We rely on the tunnel working correctly now that you are on Host Network.
+      
+      - name: Check DNS Resolution
+        run: |
+          echo "--- Resolving truenas1.mfaherty.net ---"
+          nslookup truenas1.mfaherty.net
+
+      - name: Ping TrueNAS
+        run: |
+          echo "--- Pinging TrueNAS ---"
+          ping -c 4 truenas1.mfaherty.net

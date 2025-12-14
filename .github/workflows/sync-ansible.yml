@@ -1,0 +1,77 @@
+name: Sync Ansible Config
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - 'ansible/**'  # Only trigger on changes within the 'ansible' directory
+
+concurrency:
+  group: sync_ansible
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  sync-ansible:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout gh_hdc
+        uses: actions/checkout@v6
+        with:
+          repository: mike12806/gh_hdc
+          token: ${{ secrets.GH_HDC_PAT }}
+          path: gh_hdc
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          hostname: github-runner-sync-ansible
+          version: latest
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y rsync openssh-client
+
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Sync Ansible files to remote server
+        id: sync
+        env:
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+        run: |
+          rsync -avz --delete --checksum --progress \
+            -e "ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no" \
+            gh_hdc/ansible/ "$SSH_USER@$SSH_HOST:/etc/ansible/" || echo "failure" >> job_status.txt
+
+      - name: Verify Sync
+        id: verify
+        env:
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+        run: |
+          ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" "ls -lah /etc/ansible/" || echo "failure" >> job_status.txt
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -f ~/.ssh/id_rsa
+          rm -f ~/.ssh/known_hosts
+

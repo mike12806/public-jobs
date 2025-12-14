@@ -1,0 +1,407 @@
+name: Purge old logs (ES async job, sequential)
+
+on:
+  workflow_dispatch:
+    inputs:
+      retention_days:
+        description: 'Keep logs newer than N days (delete logs older than this)'
+        required: false
+        default: '7'
+        type: string
+      bucket_days:
+        description: 'Size of each time bucket (smaller = more parallel tasks)'
+        required: false
+        default: '0.125'
+        type: string
+      max_parallel:
+        description: 'Max concurrent deletion tasks (adjust based on cluster capacity)'
+        required: false
+        default: '1'
+        type: string
+      slices:
+        description: 'ES slices per delete-by-query (higher = more internal parallelism, use "auto" for ES to decide)'
+        required: false
+        default: 'auto'
+        type: string
+      max_buckets:
+        description: 'Maximum number of time buckets to create'
+        required: false
+        default: '168'
+        type: string
+  schedule:
+    - cron: '0 */6 * * *'  # Every 6 hours (at 00:00, 06:00, 12:00, and 18:00 UTC)
+
+concurrency:
+  group: log-purge
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  plan-buckets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout gh_hdc
+        uses: actions/checkout@v6
+        with:
+          repository: mike12806/gh_hdc
+          token: ${{ secrets.GH_HDC_PAT }}
+          path: gh_hdc
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          hostname: github-runner-log-purge-plan
+          version: latest
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq curl
+
+    env:
+      ES_BASE_URL: ${{ secrets.ES_BASE_URL }}
+      ES_USER: ${{ secrets.ES_USER }}
+      ES_PASSWORD: ${{ secrets.ES_PASSWORD }}
+      ES_INDEX: ks-logstash-log*
+      TS_FIELD: '@timestamp'
+      RETENTION_DAYS: ${{ inputs.retention_days || '7' }}
+      BUCKET_DAYS: ${{ inputs.bucket_days || '0.042' }}
+      MAX_BUCKETS: ${{ inputs.max_buckets || '60' }}
+    outputs:
+      buckets: ${{ steps.plan.outputs.buckets }}
+      has_work: ${{ steps.plan.outputs.has_work }}
+      total_buckets: ${{ steps.plan.outputs.total_buckets }}
+      total_docs: ${{ steps.plan.outputs.total_docs }}
+    steps:
+      - name: Sanity check endpoint & index
+        run: |
+          set -euo pipefail
+          echo "Checking index pattern: ${ES_INDEX}"
+          
+          # Get list of matching indices
+          INDICES_RESP=$(curl -sS -u "${ES_USER}:${ES_PASSWORD}" "${ES_BASE_URL}/_cat/indices/${ES_INDEX}?h=index,docs.count&format=json")
+          echo "Matching indices:"
+          echo "${INDICES_RESP}" | jq -r '.[] | "\(.index): \(.["docs.count"]) documents"'
+          
+          # Check if pattern matches any indices
+          INDEX_COUNT=$(echo "${INDICES_RESP}" | jq 'length')
+          if [ "${INDEX_COUNT}" = "0" ]; then
+            echo "❌ No indices match pattern: ${ES_INDEX}"
+            exit 1
+          fi
+          
+          # Get total document count across all matching indices
+          TOTAL_DOCS=$(echo "${INDICES_RESP}" | jq '[.[] | .["docs.count"] | tonumber] | add // 0')
+          echo "Total documents across all matching indices: ${TOTAL_DOCS}"
+          
+          echo "✓ Index pattern reachable and valid"
+
+      - name: Plan time buckets
+        id: plan
+        run: |
+          set -euo pipefail
+          # Calculate cutoff: now - retention_days (delete logs older than this)
+          now_sec=$(date +%s)
+          retention_sec=$(awk "BEGIN {print ${RETENTION_DAYS} * 86400}")
+          cutoff_sec=$(awk "BEGIN {print ${now_sec} - ${retention_sec}}")
+          cutoff_sec=${cutoff_sec%.*}
+          cutoff_iso=$(date -u -d "@${cutoff_sec}" +%Y-%m-%dT%H:%M:%SZ)
+          
+          echo "Cutoff date (logs older than this will be deleted): ${cutoff_iso}"
+          
+          # Count documents older than cutoff
+          now_iso=$(date -u -d "@${now_sec}" +%Y-%m-%dT%H:%M:%SZ)
+          echo "Current time: ${now_iso}"
+          
+          COUNT_BODY=$(printf '{"query":{"range":{"%s":{"lt":"%s"}}}}' "${TS_FIELD}" "${cutoff_iso}")
+          COUNT_RESP=$(curl -sS -u "${ES_USER}:${ES_PASSWORD}" -H 'Content-Type: application/json' -X POST \
+            "${ES_BASE_URL}/${ES_INDEX}/_count" -d "${COUNT_BODY}")
+          
+          # Check for Elasticsearch errors in count response
+          COUNT_ERROR=$(echo "${COUNT_RESP}" | jq -r '.error.type // empty')
+          if [ -n "${COUNT_ERROR}" ]; then
+            COUNT_ERROR_REASON=$(echo "${COUNT_RESP}" | jq -r '.error.reason // "Unknown error"')
+            echo "❌ Elasticsearch error during count: ${COUNT_ERROR} - ${COUNT_ERROR_REASON}"
+            echo "Query body: ${COUNT_BODY}"
+            exit 1
+          fi
+          
+          MATCHES=$(echo "${COUNT_RESP}" | jq -r '.count // 0')
+          echo "Found ${MATCHES} documents older than ${RETENTION_DAYS} days (cutoff: $(date -u -d @${cutoff_sec} +%Y-%m-%d))."
+
+          if [ "${MATCHES}" = "0" ]; then
+            echo "has_work=false" >> "$GITHUB_OUTPUT"
+            echo "buckets=[]" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          
+          # Find the actual oldest timestamp of logs to be deleted (for planning buckets)
+          SRCH_BODY=$(jq -n --arg f "${TS_FIELD}" --arg c "${cutoff_iso}" \
+            '{size:0, query:{range:{($f):{lt:$c}}}, aggs:{min_ts:{min:{field:($f)}}}}')
+          SRCH_RESP=$(curl -sS -u "${ES_USER}:${ES_PASSWORD}" -H 'Content-Type: application/json' -X POST \
+            "${ES_BASE_URL}/${ES_INDEX}/_search" -d "${SRCH_BODY}")
+          
+          # Check for Elasticsearch errors
+          ERROR_TYPE=$(echo "${SRCH_RESP}" | jq -r '.error.type // empty')
+          if [ -n "${ERROR_TYPE}" ]; then
+            ERROR_REASON=$(echo "${SRCH_RESP}" | jq -r '.error.reason // "Unknown error"')
+            echo "❌ Elasticsearch error: ${ERROR_TYPE} - ${ERROR_REASON}"
+            echo "Query body: ${SRCH_BODY}"
+            exit 1
+          fi
+          
+          MIN_VAL=$(echo "${SRCH_RESP}" | jq -r '.aggregations.min_ts.value // empty')
+          if [ -z "${MIN_VAL}" ] || [ "${MIN_VAL}" = "null" ]; then
+            echo "No documents found in deletion range"
+            echo "has_work=false" >> "$GITHUB_OUTPUT"
+            echo "buckets=[]" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          
+          # Compute bucket boundaries in bash (UTC), requires GNU date
+          start_sec=$(( ${MIN_VAL%.*} / 1000 ))
+          echo "Found oldest log to delete: $(date -u -d @${start_sec} +%Y-%m-%dT%H:%M:%SZ)"
+          
+          # Ensure start is in the past
+          if [ "${start_sec}" -ge "${now_sec}" ]; then
+            echo "❌ Oldest log timestamp is in the future! This indicates data quality issues."
+            echo "Oldest log: $(date -u -d @${start_sec} +%Y-%m-%dT%H:%M:%SZ)"
+            echo "Current time: ${now_iso}"
+            echo "Skipping deletion to prevent accidental data loss."
+            echo "has_work=false" >> "$GITHUB_OUTPUT"
+            echo "buckets=[]" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          
+          # Set start_iso from the oldest timestamp to delete
+          start_iso=$(date -u -d "@${start_sec}" +%Y-%m-%dT%H:%M:%SZ)
+          bucket_days=${BUCKET_DAYS}
+          max_buckets=${MAX_BUCKETS}
+          bucket_sec=$(awk "BEGIN {print ${bucket_days} * 86400}")
+          bucket_sec=${bucket_sec%.*}
+          
+          echo "Time range: $(date -u -d @${start_sec} +%Y-%m-%d) to $(date -u -d @${cutoff_sec} +%Y-%m-%d)"
+          echo "Bucket size: ${bucket_days} days, Max buckets: ${max_buckets}"
+
+          BUCKETS_JSON="["
+          cur=${start_sec}
+          i=0
+          while [ "${cur}" -lt "${cutoff_sec}" ] && [ "${i}" -lt "${max_buckets}" ]; do
+            end=$(( cur + bucket_sec ))
+            if [ "${end}" -gt "${cutoff_sec}" ]; then end=${cutoff_sec}; fi
+            start_iso=$(date -u -d "@${cur}" +%Y-%m-%dT%H:%M:%SZ)
+            end_iso=$(date -u -d "@${end}" +%Y-%m-%dT%H:%M:%SZ)
+            BUCKETS_JSON+="{\"start\":\"${start_iso}\",\"end\":\"${end_iso}\"},"
+            cur=${end}
+            i=$(( i + 1 ))
+          done
+          # Trim trailing comma if present
+          if [ "${BUCKETS_JSON: -1}" = "," ]; then BUCKETS_JSON=${BUCKETS_JSON::-1}; fi
+          BUCKETS_JSON+="]"
+
+          if [ -z "${BUCKETS_JSON}" ] || [ "${BUCKETS_JSON}" = "[]" ]; then
+            echo "has_work=false" >> "$GITHUB_OUTPUT"
+            echo "buckets=[]" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_work=true" >> "$GITHUB_OUTPUT"
+            echo "buckets=${BUCKETS_JSON}" >> "$GITHUB_OUTPUT"
+            bucket_count=$(echo "${BUCKETS_JSON}" | jq 'length')
+            echo "total_buckets=${bucket_count}" >> "$GITHUB_OUTPUT"
+            echo "total_docs=${MATCHES}" >> "$GITHUB_OUTPUT"
+            echo "Planned ${bucket_count} buckets for ${MATCHES} documents"
+          fi
+
+
+  purge-old-logs:
+    needs: plan-buckets
+    if: needs.plan-buckets.outputs.has_work == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout gh_hdc
+        uses: actions/checkout@v6
+        with:
+          repository: mike12806/gh_hdc
+          token: ${{ secrets.GH_HDC_PAT }}
+          path: gh_hdc
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          hostname: github-runner-log-purge-job
+          version: latest
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y curl
+
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJson(inputs.max_parallel || '6') }}
+      matrix:
+        bucket: ${{ fromJson(needs.plan-buckets.outputs.buckets) }}
+    env:
+      ES_BASE_URL: ${{ secrets.ES_BASE_URL }}
+      ES_USER: ${{ secrets.ES_USER }}
+      ES_PASSWORD: ${{ secrets.ES_PASSWORD }}
+      ES_INDEX: ks-logstash-log*
+      TS_FIELD: '@timestamp'
+      TIMEOUT: '30m'
+      MAX_DOCS: ''               # optional cap per bucket
+      POLL_BUDGET_SEC: '19800'   # 330 minutes per bucket (5.5 hours, leaves 30min buffer)
+      SLICES: ${{ inputs.slices || 'auto' }}
+      REQUESTS_PER_SECOND: '-1'  # unlimited for maximum speed
+      START: ${{ matrix.bucket.start }}
+      END: ${{ matrix.bucket.end }}
+    steps:
+      - name: Sanity check endpoint & index
+        run: |
+          set -euo pipefail
+          curl -fsS -u "${ES_USER}:${ES_PASSWORD}" "${ES_BASE_URL}/_cat/indices/${ES_INDEX}" >/dev/null
+          echo "Index reachable"
+
+      - name: Start async delete-by-query (bucket)
+        id: start_delete
+        run: |
+          set -euo pipefail
+          # Use bucket time range for deletion
+          # Note: Buckets are already constrained to be < cutoff (which is < now)
+          # Adding explicit NOW check as safety constraint against clock skew
+          NOW_ISO=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          
+          # Ensure END is not in the future (safety check)
+          END_SEC=$(date -d "${END}" +%s)
+          NOW_SEC=$(date -d "${NOW_ISO}" +%s)
+          if [ "${END_SEC}" -gt "${NOW_SEC}" ]; then
+            echo "⚠️  Bucket end time ${END} is in the future, capping at ${NOW_ISO}"
+            SAFE_END="${NOW_ISO}"
+          else
+            SAFE_END="${END}"
+          fi
+          
+          QUERY=$(jq -n \
+            --arg f "${TS_FIELD}" --arg s "${START}" --arg e "${SAFE_END}" \
+            '{query:{range:{($f):{gte:$s, lt:$e}}}}')
+
+          if [ -n "${MAX_DOCS}" ]; then
+            BODY=$(jq --argjson m "${MAX_DOCS}" '. + {max_docs:$m}' <<<"${QUERY}")
+          else
+            BODY="${QUERY}"
+          fi
+
+          RESP=$(curl -sS -u "${ES_USER}:${ES_PASSWORD}" -H 'Content-Type: application/json' \
+            -X POST "${ES_BASE_URL}/${ES_INDEX}/_delete_by_query?conflicts=proceed&refresh=false&slices=${SLICES}&wait_for_completion=false&timeout=${TIMEOUT}&requests_per_second=${REQUESTS_PER_SECOND}" \
+            -d "${BODY}")
+
+          echo "${RESP}" | jq .
+          TASK_ID=$(echo "${RESP}" | jq -r '.task // empty')
+          if [ -z "${TASK_ID}" ]; then
+            echo "No task id returned from ES"
+            exit 1
+          fi
+          echo "task_id=${TASK_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Poll task until completion
+        id: poll
+        run: |
+          set -euo pipefail
+          TASK_ID="${{ steps.start_delete.outputs.task_id }}"
+          START_SEC=${SECONDS}
+          SLEEP=30
+          MAXSLEEP=120
+
+          while true; do
+            if [ $((SECONDS - START_SEC)) -ge "${POLL_BUDGET_SEC}" ]; then
+              echo "Polling budget exceeded (${POLL_BUDGET_SEC}s). Check: GET /_tasks/${TASK_ID}"
+              exit 1
+            fi
+
+            RESP=$(curl -sS -u "${ES_USER}:${ES_PASSWORD}" -H 'Content-Type: application/json' -X GET "${ES_BASE_URL}/_tasks/${TASK_ID}")
+            COMPLETED=$(echo "${RESP}" | jq -r '.completed // false')
+
+            if [ "${COMPLETED}" = "true" ]; then
+              ELAPSED=$((SECONDS - START_SEC))
+              DELETED=$(echo "${RESP}" | jq -r '.response.deleted // 0')
+              FAILURES=$(echo "${RESP}" | jq -r '.response.failures | length // 0')
+              echo "deleted=${DELETED}" >> "$GITHUB_OUTPUT"
+              echo "failures=${FAILURES}" >> "$GITHUB_OUTPUT"
+              echo "elapsed=${ELAPSED}" >> "$GITHUB_OUTPUT"
+              if [ "${DELETED}" -gt 0 ]; then
+                RATE=$(( DELETED / (ELAPSED > 0 ? ELAPSED : 1) ))
+                echo "rate=${RATE}" >> "$GITHUB_OUTPUT"
+                echo "✓ Deleted ${DELETED} docs in ${ELAPSED}s (${RATE} docs/sec)"
+              else
+                echo "✓ No documents to delete in this bucket"
+              fi
+              break
+            fi
+
+            # Show progress if available
+            PROGRESS=$(echo "${RESP}" | jq -r '.task.status.deleted // 0')
+            if [ "${PROGRESS}" -gt 0 ]; then
+              echo "Progress: ${PROGRESS} docs deleted so far..."
+            fi
+
+            sleep "${SLEEP}"
+            if [ "${SLEEP}" -lt "${MAXSLEEP}" ]; then
+              SLEEP=$(( SLEEP + 15 ))
+              if [ "${SLEEP}" -gt "${MAXSLEEP}" ]; then SLEEP="${MAXSLEEP}"; fi
+            fi
+          done
+
+      - name: Fail if shard failures
+        if: steps.poll.outputs.failures != '' && steps.poll.outputs.failures != '0'
+        run: |
+          echo "Shard failures detected: ${{ steps.poll.outputs.failures }}"
+          exit 1
+
+      - name: Summary (bucket)
+        if: always()
+        run: |
+          echo "=== Bucket Summary ==="
+          echo "Time range: ${START} -> ${END}"
+          echo "Deleted:  ${{ steps.poll.outputs.deleted || '0' }}"
+          if [ -n "${{ steps.poll.outputs.elapsed }}" ]; then
+            echo "Duration: ${{ steps.poll.outputs.elapsed }}s"
+            echo "Rate:     ${{ steps.poll.outputs.rate || '0' }} docs/sec"
+          fi
+
+    runs-on: ubuntu-latest
+    needs: [plan-buckets, purge-old-logs]
+    if: always() && needs.plan-buckets.outputs.has_work == 'true'
+    runs-on: self-hosted
+    timeout-minutes: 10
+    steps:
+      - name: Aggregate performance metrics
+        run: |
+          echo "╔════════════════════════════════════════════════════════╗"
+          echo "║         Log Purge Performance Summary                  ║"
+          echo "╚════════════════════════════════════════════════════════╝"
+          echo ""
+          echo "Configuration:"
+          echo "  • Retention:      ${{ inputs.retention_days || '7' }} days"
+          echo "  • Bucket size:    ${{ inputs.bucket_days || '0.042' }} days"
+          echo "  • Max parallel:   ${{ inputs.max_parallel || '6' }} tasks"
+          echo "  • ES slices:      ${{ inputs.slices || 'auto' }} per task"
+          echo "  • Total buckets:  ${{ needs.plan-buckets.outputs.total_buckets }}"
+          echo "  • Total docs:     ${{ needs.plan-buckets.outputs.total_docs }}"
+          echo ""
+          echo "Job Status: ${{ needs.purge-old-logs.result }}"
+          echo ""
+          echo "Next Steps:"
+          echo "  • Monitor ES cluster health and adjust max_parallel if needed"
+          echo "  • Reduce bucket_days for more parallelism (min ~7 days)"
+          echo "  • Increase slices (max = shard count) for higher throughput"
+          echo "  • Consider ES ILM for order-of-magnitude improvements"

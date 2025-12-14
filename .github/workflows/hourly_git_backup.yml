@@ -1,0 +1,175 @@
+name: Hourly Git Backup to B2
+
+on:
+  schedule:
+    - cron: '0 * * * *'    # Run every hour
+  workflow_dispatch:      # Allow manual trigger
+
+permissions:
+  contents: read
+
+env:
+  B2_APPLICATION_KEY_ID: ${{ secrets.B2_KEY_ID }}
+  B2_APPLICATION_KEY:    ${{ secrets.B2_APP_KEY }}
+  ENCRYPTION_KEY:        ${{ secrets.BACKUP_ENCRYPTION_KEY }}
+  PRIVATE_GIT_USERNAME:  ${{ secrets.PRIVATE_GIT_USERNAME }}
+  PRIVATE_GITHUB_TOKEN:  ${{ secrets.PRIVATE_GITHUB_TOKEN }}
+  PRIVATE_GIT_TOKEN:     ${{ secrets.PRIVATE_GIT_TOKEN }}
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout gh_hdc
+        uses: actions/checkout@v6
+        with:
+          repository: mike12806/gh_hdc
+          token: ${{ secrets.GH_HDC_PAT }}
+          path: gh_hdc
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          hostname: github-runner-git-backup
+          version: latest
+
+      - name: Cache B2 CLI
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/bin/b2
+          key: ${{ runner.os }}-b2cli-latest
+          restore-keys: |
+            ${{ runner.os }}-b2cli-
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y git jq gpg curl
+          curl -fsSL -L https://github.com/Backblaze/B2_Command_Line_Tool/releases/latest/download/b2-linux -o /tmp/b2
+          sudo install -m 0755 /tmp/b2 /usr/local/bin/b2
+          rm /tmp/b2
+
+      - name: Prepare workspace
+        run: |
+          mkdir -p github_backup gitea_backup
+          echo "$ENCRYPTION_KEY" > encryption_key.txt
+
+      - name: Mirror all GitHub repos
+        run: |
+          cd github_backup
+          curl -s -H "Authorization: token $PRIVATE_GITHUB_TOKEN" \
+            "https://api.github.com/user/repos?affiliation=owner&per_page=100" \
+            | jq -r '.[].clone_url' \
+            | while read url; do
+                url_auth=$(echo "$url" | sed "s|https://|https://${PRIVATE_GIT_USERNAME}:${PRIVATE_GITHUB_TOKEN}@|")
+                git clone --mirror "$url_auth"
+              done
+
+      - name: Mirror all Gitea repos
+        run: |
+          cd gitea_backup
+          curl -s -H "Authorization: token $PRIVATE_GIT_TOKEN" \
+            "https://git.mfaherty.net/api/v1/users/$PRIVATE_GIT_USERNAME/repos" \
+            | jq -r '.[].clone_url' \
+            | while read url; do
+                url_auth=$(echo "$url" | sed "s|https://|https://${PRIVATE_GIT_USERNAME}:${PRIVATE_GIT_TOKEN}@|")
+                git clone --mirror "$url_auth"
+              done
+
+      - name: Create encrypted archives
+        run: |
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+
+          # Archive *contents* of each folder, not the folder itself
+          tar -C github_backup -czf - . \
+            | gpg --batch --yes --passphrase-file encryption_key.txt -c \
+            > github_backup_${TIMESTAMP}.tar.gz.gpg
+
+          tar -C gitea_backup -czf - . \
+            | gpg --batch --yes --passphrase-file encryption_key.txt -c \
+            > gitea_backup_${TIMESTAMP}.tar.gz.gpg
+
+      - name: Upload to B2
+        run: |
+          b2 account authorize "$B2_APPLICATION_KEY_ID" "$B2_APPLICATION_KEY"
+          GH_FILE=$(ls -t github_backup_*.tar.gz.gpg | head -1)
+          GT_FILE=$(ls -t gitea_backup_*.tar.gz.gpg  | head -1)
+          b2 file upload github-backup-bucket "$GH_FILE" "backups/$(date +%Y/%m/%d)/$GH_FILE"
+          b2 file upload  gitea-backup-bucket  "$GT_FILE" "backups/$(date +%Y/%m/%d)/$GT_FILE"
+
+      - name: Validate GitHub backup integrity
+        run: |
+          GH_FILE=$(ls -t github_backup_*.tar.gz.gpg | head -1)
+          mkdir -p validate_github
+          gpg --batch --yes --passphrase-file encryption_key.txt -d "$GH_FILE" \
+            | tar -C validate_github -xzf -
+          shopt -s nullglob
+          found_any=0
+          for repo in validate_github/*.git; do
+            found_any=1
+            echo "fsck $repo…"
+            git --git-dir="$repo" fsck --strict
+          done
+          if [[ $found_any -eq 0 ]]; then
+            echo "No .git repos found in validate_github. Archive structure may be wrong."
+            exit 1
+          fi
+
+      - name: Validate Gitea backup integrity
+        run: |
+          GT_FILE=$(ls -t gitea_backup_*.tar.gz.gpg | head -1)
+          mkdir -p validate_gitea
+          gpg --batch --yes --passphrase-file encryption_key.txt -d "$GT_FILE" \
+            | tar -C validate_gitea -xzf -
+          shopt -s nullglob
+          found_any=0
+          for repo in validate_gitea/*.git; do
+            found_any=1
+            echo "fsck $repo…"
+            git --git-dir="$repo" fsck --strict
+          done
+          if [[ $found_any -eq 0 ]]; then
+            echo "No .git repos found in validate_gitea. Archive structure may be wrong."
+            exit 1
+          fi
+
+      - name: Purge old backups (older than 180 days)
+        # Only run once per day at 3 AM UTC to minimize API costs
+        if: ${{ fromJSON(format('[ {0} ]', github.event.schedule == '0 * * * *' && '3' || '99'))[0] == 3 || (github.event_name == 'workflow_dispatch' && github.event.inputs.purge == 'true') }}
+        run: |
+          CURRENT_HOUR=$(date -u +%H)
+          if [[ "$CURRENT_HOUR" != "03" ]] && [[ "${{ github.event_name }}" != "workflow_dispatch" ]]; then
+            echo "Skipping purge - only runs at 3 AM UTC or manual dispatch"
+            exit 0
+          fi
+          CUTOFF_DATE=$(date -u -d '180 days ago' +%s)
+          
+          # Purge old GitHub backups
+          b2 ls --recursive github-backup-bucket backups/ --json | jq -r '.fileName' | while read file; do
+            FILE_TIME=$(b2 file info "b2://github-backup-bucket/$file" --json | jq -r '.uploadTimestamp' | cut -d. -f1)
+            FILE_TIME_SEC=$((FILE_TIME / 1000))
+            if [[ $FILE_TIME_SEC -lt $CUTOFF_DATE ]]; then
+              echo "Deleting old GitHub backup: $file"
+              b2 file delete "b2://github-backup-bucket/$file"
+            fi
+          done
+          
+          # Purge old Gitea backups
+          b2 ls --recursive gitea-backup-bucket backups/ --json | jq -r '.fileName' | while read file; do
+            FILE_TIME=$(b2 file info "b2://gitea-backup-bucket/$file" --json | jq -r '.uploadTimestamp' | cut -d. -f1)
+            FILE_TIME_SEC=$((FILE_TIME / 1000))
+            if [[ $FILE_TIME_SEC -lt $CUTOFF_DATE ]]; then
+              echo "Deleting old Gitea backup: $file"
+              b2 file delete "b2://gitea-backup-bucket/$file"
+            fi
+          done
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -rf github_backup gitea_backup validate_github validate_gitea \
+                 github_backup_*.tar.gz.gpg gitea_backup_*.tar.gz.gpg encryption_key.txt

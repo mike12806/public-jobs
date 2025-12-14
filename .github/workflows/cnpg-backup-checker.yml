@@ -1,0 +1,181 @@
+name: Check CloudNativePG Backups and WAL Archiving
+
+on:
+  schedule:
+    - cron: '15 * * * *'  # Run every hour at minute 15
+  workflow_dispatch:  # Allow manual trigger
+
+concurrency:
+  group: cnpg-backup-checker
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check-cnpg-backups:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout gh_hdc
+        uses: actions/checkout@v6
+        with:
+          repository: mike12806/gh_hdc
+          token: ${{ secrets.GH_HDC_PAT }}
+          path: gh_hdc
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          hostname: github-runner-cnpg-backup-checker
+          version: latest
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'latest'
+      
+      - name: Set up kubeconfig
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBECONFIG }}" | base64 -d > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+
+      - name: Check CNPG Cluster Backups and WAL Archiving
+        id: check_cnpg
+        run: |
+          set -euo pipefail
+          
+          echo "🔍 Checking CloudNativePG clusters..."
+          
+          # Get all CNPG clusters
+          CLUSTERS=$(kubectl -n cloudnative-pg get clusters.postgresql.cnpg.io -o jsonpath='{.items[*].metadata.name}')
+          
+          if [ -z "$CLUSTERS" ]; then
+            echo "❌ No CNPG clusters found"
+            echo "status=FAIL" >> $GITHUB_OUTPUT
+            echo "error=No CNPG clusters found in cloudnative-pg namespace" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          FAILED_CHECKS=""
+          ALL_PASSED=true
+          
+          for CLUSTER in $CLUSTERS; do
+            echo ""
+            echo "📊 Checking cluster: $CLUSTER"
+            echo "─────────────────────────────────────"
+            
+            # Get cluster status
+            CLUSTER_STATUS=$(kubectl -n cloudnative-pg get clusters.postgresql.cnpg.io $CLUSTER -o jsonpath='{.status.phase}')
+            echo "  Status: $CLUSTER_STATUS"
+            
+            if [ "$CLUSTER_STATUS" != "Cluster in healthy state" ]; then
+              echo "  ❌ Cluster is not healthy"
+              FAILED_CHECKS="${FAILED_CHECKS}${CLUSTER}: Cluster not healthy (status: $CLUSTER_STATUS)\n"
+              ALL_PASSED=false
+              continue
+            fi
+            
+            # Check WAL archiving status
+            WAL_ARCHIVING=$(kubectl -n cloudnative-pg get clusters.postgresql.cnpg.io $CLUSTER -o jsonpath='{.status.conditions[?(@.type=="ContinuousArchiving")].status}')
+            WAL_MESSAGE=$(kubectl -n cloudnative-pg get clusters.postgresql.cnpg.io $CLUSTER -o jsonpath='{.status.conditions[?(@.type=="ContinuousArchiving")].message}')
+            
+            echo "  WAL Archiving: $WAL_ARCHIVING"
+            
+            if [ "$WAL_ARCHIVING" != "True" ]; then
+              echo "  ❌ WAL archiving is not working: $WAL_MESSAGE"
+              FAILED_CHECKS="${FAILED_CHECKS}${CLUSTER}: WAL archiving failing - $WAL_MESSAGE\n"
+              ALL_PASSED=false
+            else
+              echo "  ✅ WAL archiving is working"
+            fi
+            
+            # Check last backup time
+            SCHEDULED_BACKUPS=$(kubectl -n cloudnative-pg get scheduledbackup -o json | jq -r ".items[] | select(.spec.cluster.name==\"$CLUSTER\") | .metadata.name")
+            
+            if [ -z "$SCHEDULED_BACKUPS" ]; then
+              echo "  ⚠️  No scheduled backup found for this cluster"
+            else
+              for SCHED_BACKUP in $SCHEDULED_BACKUPS; do
+                echo "  📅 Checking scheduled backup: $SCHED_BACKUP"
+                
+                # Get last successful backup time from cluster status
+                LAST_BACKUP_TIME=$(kubectl -n cloudnative-pg get clusters.postgresql.cnpg.io $CLUSTER -o jsonpath='{.status.lastSuccessfulBackup}')
+                LAST_FAILED_BACKUP=$(kubectl -n cloudnative-pg get clusters.postgresql.cnpg.io $CLUSTER -o jsonpath='{.status.lastFailedBackup}')
+                
+                if [ -z "$LAST_BACKUP_TIME" ]; then
+                  echo "    ❌ No successful backups found for cluster"
+                  FAILED_CHECKS="${FAILED_CHECKS}${CLUSTER}: No successful backups found\n"
+                  ALL_PASSED=false
+                  continue
+                fi
+                
+                echo "    Latest successful backup: $LAST_BACKUP_TIME"
+                
+                # Check if there was a failed backup after the successful one
+                if [ -n "$LAST_FAILED_BACKUP" ]; then
+                  echo "    ⚠️  Last failed backup: $LAST_FAILED_BACKUP"
+                fi
+                
+                # Check backup age
+                BACKUP_TIMESTAMP=$(date -d "$LAST_BACKUP_TIME" +%s 2>/dev/null || echo "0")
+                CURRENT_TIMESTAMP=$(date +%s)
+                AGE_HOURS=$(( ($CURRENT_TIMESTAMP - $BACKUP_TIMESTAMP) / 3600 ))
+                
+                echo "    Backup age: ${AGE_HOURS} hours"
+                
+                if [ $AGE_HOURS -gt 48 ]; then
+                  echo "    ❌ Backup is older than 48 hours"
+                  FAILED_CHECKS="${FAILED_CHECKS}${CLUSTER}: Latest backup is ${AGE_HOURS} hours old (threshold: 48 hours)\n"
+                  ALL_PASSED=false
+                else
+                  echo "    ✅ Backup is recent (< 48 hours)"
+                fi
+              done
+            fi
+            
+            echo "─────────────────────────────────────"
+          done
+          
+          echo ""
+          if [ "$ALL_PASSED" = true ]; then
+            echo "✅ All CNPG cluster checks passed"
+            echo "status=PASS" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Some CNPG cluster checks failed:"
+            echo -e "$FAILED_CHECKS"
+            echo "status=FAIL" >> $GITHUB_OUTPUT
+            echo "error<<EOF" >> $GITHUB_OUTPUT
+            echo -e "$FAILED_CHECKS" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Send email on failure
+        if: steps.check_cnpg.outputs.status == 'FAIL'
+        uses: dawidd6/action-send-mail@v6
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "❌ CloudNativePG Backup/WAL Check Failed"
+          body: |
+            CloudNativePG health check failed.
+            
+            Failures detected:
+            ${{ steps.check_cnpg.outputs.error }}
+            
+            Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          to: ${{ secrets.EMAIL_TO }}
+          from: ${{ secrets.EMAIL_FROM }}
+

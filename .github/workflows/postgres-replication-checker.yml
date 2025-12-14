@@ -1,0 +1,247 @@
+name: Check PostgreSQL Replication
+
+on:
+  schedule:
+    - cron: '37 * * * *'  # Run every hour at minute 37
+  workflow_dispatch:  # Allow manual trigger
+
+concurrency:
+  group: postgres-replication-checker
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check-replication:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout gh_hdc
+        uses: actions/checkout@v6
+        with:
+          repository: mike12806/gh_hdc
+          token: ${{ secrets.GH_HDC_PAT }}
+          path: gh_hdc
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          hostname: github-runner-postgres-replication
+          version: latest
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y postgresql-client
+
+      - name: Check PostgreSQL Replication Status
+        id: check_replication
+        run: |
+          set -euo pipefail
+          
+          # Thresholds
+          LAG_WARNING_SECONDS=10
+          LAG_CRITICAL_SECONDS=60
+          LSN_DIFF_WARNING_BYTES=104857600  # 100MB
+          
+          # Expected replica IPs
+          EXPECTED_REPLICAS=("${K8S_DB_SECONDARY}" "${K8S_DB_TERTIARY}")
+          
+          # Check streaming replication status on primary server (pg_basebackup uses streaming replication)
+          REPLICATION_STATUS=$(PGPASSWORD="${K8S_DB_PASSWORD}" psql \
+            -h "${K8S_DB_PRIMARY}" \
+            -U "${K8S_DB_USER}" \
+            -d "${K8S_DB_NAME}" \
+            -p 5432 \
+            -t -c "SELECT client_addr, application_name, state, sync_state, sent_lsn, write_lsn, flush_lsn, replay_lsn, write_lag, flush_lag, replay_lag FROM pg_stat_replication;" 2>&1) || {
+              echo "❌ PostgreSQL streaming replication check failed: Failed to connect to PostgreSQL primary"
+              echo "status=FAIL" >> $GITHUB_OUTPUT
+              echo "error=Failed to connect to PostgreSQL primary" >> $GITHUB_OUTPUT
+              exit 0
+          }
+          
+          if [ -z "$REPLICATION_STATUS" ] || [ "$(echo "$REPLICATION_STATUS" | tr -d '[:space:]')" == "" ]; then
+            echo "❌ PostgreSQL streaming replication check failed: No replication streams found"
+            echo "status=FAIL" >> $GITHUB_OUTPUT
+            echo "error=No streaming replication connections found - standby may be down or not connected" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # Check that we have at least 2 replicas
+          REPLICA_COUNT=$(echo "$REPLICATION_STATUS" | grep -c "streaming" || true)
+          if [ "$REPLICA_COUNT" -lt 2 ]; then
+            echo "❌ PostgreSQL streaming replication check failed: Expected 2 replicas, found $REPLICA_COUNT"
+            echo "status=FAIL" >> $GITHUB_OUTPUT
+            echo "error=Expected 2 replicas but found only $REPLICA_COUNT" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # Check for streaming state (pg_basebackup uses physical streaming replication)
+          if ! echo "$REPLICATION_STATUS" | grep -q "streaming"; then
+            echo "❌ PostgreSQL streaming replication check failed: Replication is not in streaming state"
+            echo "status=FAIL" >> $GITHUB_OUTPUT
+            echo "error=Streaming replication is not active" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # Verify both expected replicas are connected
+          for REPLICA_IP in "${EXPECTED_REPLICAS[@]}"; do
+            if ! echo "$REPLICATION_STATUS" | grep -q "$REPLICA_IP"; then
+              echo "❌ PostgreSQL streaming replication check failed: Expected replica $REPLICA_IP not found"
+              echo "status=FAIL" >> $GITHUB_OUTPUT
+              echo "error=Expected replica at $REPLICA_IP is not connected to replication" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+          done
+          
+          # Check sync_state is valid (async or sync, not potential)
+          if echo "$REPLICATION_STATUS" | grep -q "potential"; then
+            echo "⚠️  Warning: At least one replica has sync_state 'potential' - may indicate configuration issues"
+          fi
+          
+          # Check replication lag for each replica
+          HAS_CRITICAL_LAG=false
+          while IFS='|' read -r client_addr app_name state sync_state sent_lsn write_lsn flush_lsn replay_lsn write_lag flush_lag replay_lag; do
+            # Skip empty lines
+            [ -z "$client_addr" ] && continue
+            
+            # Trim whitespace
+            client_addr="${client_addr#"${client_addr%%[![:space:]]*}"}"
+            client_addr="${client_addr%"${client_addr##*[![:space:]]}"}"
+            replay_lag="${replay_lag#"${replay_lag%%[![:space:]]*}"}"
+            replay_lag="${replay_lag%"${replay_lag##*[![:space:]]}"}"
+            
+            # Check if replay_lag is not empty and not null
+            if [ -n "$replay_lag" ] && [ "$replay_lag" != "" ]; then
+              # Extract seconds from interval format (e.g., "00:00:05.123456" or "1:05:30" -> seconds)
+              if [[ "$replay_lag" =~ ^[0-9]+:[0-9]{2}:([0-9]+\.?[0-9]*) ]]; then
+                REPLAY_LAG_SECONDS="${BASH_REMATCH[1]}"
+                REPLAY_LAG_INT=$(printf "%.0f" "$REPLAY_LAG_SECONDS" 2>/dev/null || echo "0")
+                
+                if [ "$REPLAY_LAG_INT" -gt "$LAG_CRITICAL_SECONDS" ]; then
+                  echo "❌ Replica at $client_addr has critical replay lag: ${REPLAY_LAG_INT}s"
+                  HAS_CRITICAL_LAG=true
+                elif [ "$REPLAY_LAG_INT" -gt "$LAG_WARNING_SECONDS" ]; then
+                  echo "⚠️  Warning: Replica at $client_addr has replay lag: ${REPLAY_LAG_INT}s (warning threshold: ${LAG_WARNING_SECONDS}s)"
+                fi
+              fi
+            fi
+          done <<< "$REPLICATION_STATUS"
+          
+          if [ "$HAS_CRITICAL_LAG" = true ]; then
+            echo "status=FAIL" >> $GITHUB_OUTPUT
+            echo "error=One or more replicas have critical replay lag (threshold: ${LAG_CRITICAL_SECONDS}s)" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # Check LSN difference (bytes behind) for each replica
+          while IFS='|' read -r client_addr app_name state sync_state sent_lsn write_lsn flush_lsn replay_lsn write_lag flush_lag replay_lag; do
+            # Skip empty lines
+            [ -z "$client_addr" ] && continue
+            
+            # Trim whitespace
+            client_addr="${client_addr#"${client_addr%%[![:space:]]*}"}"
+            client_addr="${client_addr%"${client_addr##*[![:space:]]}"}"
+            sent_lsn="${sent_lsn#"${sent_lsn%%[![:space:]]*}"}"
+            sent_lsn="${sent_lsn%"${sent_lsn##*[![:space:]]}"}"
+            replay_lsn="${replay_lsn#"${replay_lsn%%[![:space:]]*}"}"
+            replay_lsn="${replay_lsn%"${replay_lsn##*[![:space:]]}"}"
+            
+            if [ -n "$sent_lsn" ] && [ -n "$replay_lsn" ] && [ "$sent_lsn" != "" ] && [ "$replay_lsn" != "" ]; then
+              # Validate LSN format (e.g., "0/12345678") to prevent SQL injection
+              if [[ "$sent_lsn" =~ ^[0-9A-Fa-f]+/[0-9A-Fa-f]+$ ]] && [[ "$replay_lsn" =~ ^[0-9A-Fa-f]+/[0-9A-Fa-f]+$ ]]; then
+                LSN_DIFF=$(PGPASSWORD="${K8S_DB_PASSWORD}" psql \
+                  -h "${K8S_DB_PRIMARY}" \
+                  -U "${K8S_DB_USER}" \
+                  -d "${K8S_DB_NAME}" \
+                  -p 5432 \
+                  -t -c "SELECT pg_wal_lsn_diff('$sent_lsn', '$replay_lsn');" 2>&1)
+                
+                if [ -n "$LSN_DIFF" ]; then
+                  LSN_DIFF_INT=$(printf "%.0f" "$LSN_DIFF" 2>/dev/null || echo "0")
+                  LSN_DIFF_MB=$((LSN_DIFF_INT / 1048576))
+                  if [ "$LSN_DIFF_INT" -gt "$LSN_DIFF_WARNING_BYTES" ]; then
+                    echo "⚠️  Warning: Replica at $client_addr is ${LSN_DIFF_MB}MB behind primary (threshold: $((LSN_DIFF_WARNING_BYTES / 1048576))MB)"
+                  fi
+                fi
+              fi
+            fi
+          done <<< "$REPLICATION_STATUS"
+          
+          echo "✅ PostgreSQL streaming replication is healthy and active (2 replicas)"
+          echo ""
+          echo "====== Replication Status ======"
+          echo ""
+          # Parse and display the replication status in a human-readable format
+          while IFS='|' read -r client_addr app_name state sync_state sent_lsn write_lsn flush_lsn replay_lsn write_lag flush_lag replay_lag; do
+            # Skip empty lines
+            [ -z "$client_addr" ] && continue
+            
+            # Trim whitespace from each field using parameter expansion
+            client_addr="${client_addr#"${client_addr%%[![:space:]]*}"}"
+            client_addr="${client_addr%"${client_addr##*[![:space:]]}"}"
+            app_name="${app_name#"${app_name%%[![:space:]]*}"}"
+            app_name="${app_name%"${app_name##*[![:space:]]}"}"
+            state="${state#"${state%%[![:space:]]*}"}"
+            state="${state%"${state##*[![:space:]]}"}"
+            sync_state="${sync_state#"${sync_state%%[![:space:]]*}"}"
+            sync_state="${sync_state%"${sync_state##*[![:space:]]}"}"
+            sent_lsn="${sent_lsn#"${sent_lsn%%[![:space:]]*}"}"
+            sent_lsn="${sent_lsn%"${sent_lsn##*[![:space:]]}"}"
+            write_lsn="${write_lsn#"${write_lsn%%[![:space:]]*}"}"
+            write_lsn="${write_lsn%"${write_lsn##*[![:space:]]}"}"
+            flush_lsn="${flush_lsn#"${flush_lsn%%[![:space:]]*}"}"
+            flush_lsn="${flush_lsn%"${flush_lsn##*[![:space:]]}"}"
+            replay_lsn="${replay_lsn#"${replay_lsn%%[![:space:]]*}"}"
+            replay_lsn="${replay_lsn%"${replay_lsn##*[![:space:]]}"}"
+            write_lag="${write_lag#"${write_lag%%[![:space:]]*}"}"
+            write_lag="${write_lag%"${write_lag##*[![:space:]]}"}"
+            flush_lag="${flush_lag#"${flush_lag%%[![:space:]]*}"}"
+            flush_lag="${flush_lag%"${flush_lag##*[![:space:]]}"}"
+            replay_lag="${replay_lag#"${replay_lag%%[![:space:]]*}"}"
+            replay_lag="${replay_lag%"${replay_lag##*[![:space:]]}"}"
+            
+            echo "Replica IP:       $client_addr"
+            echo "Application:      $app_name"
+            echo "State:            $state"
+            echo "Sync State:       $sync_state"
+            echo ""
+            echo "--- WAL Positions ---"
+            echo "Sent LSN:         $sent_lsn"
+            echo "Write LSN:        $write_lsn"
+            echo "Flush LSN:        $flush_lsn"
+            echo "Replay LSN:       $replay_lsn"
+            echo ""
+            echo "--- Replication Lag ---"
+            echo "Write Lag:        $write_lag"
+            echo "Flush Lag:        $flush_lag"
+            echo "Replay Lag:       $replay_lag"
+            echo ""
+            echo "================================"
+          done <<< "$REPLICATION_STATUS"
+          echo "status=OK" >> $GITHUB_OUTPUT
+        env:
+          K8S_DB_PRIMARY: ${{ secrets.K8S_DB_PRIMARY }}
+          K8S_DB_SECONDARY: ${{ secrets.K8S_DB_SECONDARY }}
+          K8S_DB_TERTIARY: ${{ secrets.K8S_DB_TERTIARY }}
+          K8S_DB_USER: ${{ secrets.K8S_DB_USER }}
+          K8S_DB_PASSWORD: ${{ secrets.K8S_DB_PASSWORD }}
+          K8S_DB_NAME: ${{ secrets.K8S_DB_NAME }}
+
+      - name: Send email on failure
+        if: steps.check_replication.outputs.status == 'FAIL'
+        uses: dawidd6/action-send-mail@v6
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "❌ PostgreSQL Streaming Replication Issue Detected"
+          body: "PostgreSQL streaming replication check failed. Error: ${{ steps.check_replication.outputs.error }}"
+          to: ${{ secrets.EMAIL_TO }}
+          from: ${{ secrets.EMAIL_FROM }}

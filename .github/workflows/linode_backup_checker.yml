@@ -1,0 +1,132 @@
+name: Linode Backup Check
+
+on:
+  schedule:
+    - cron: "0 6,18 * * *"  # Runs twice daily at 6:00 AM and 6:00 PM UTC
+  workflow_dispatch:  # Allows manual triggering from the GitHub Actions UI
+
+concurrency:
+  group: linode_backup_checker
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check-backups:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout gh_hdc
+        uses: actions/checkout@v6
+        with:
+          repository: mike12806/gh_hdc
+          token: ${{ secrets.GH_HDC_PAT }}
+          path: gh_hdc
+          fetch-depth: 0
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          hostname: github-runner-linode-backup
+          version: latest
+
+      - name: Cache pipx and linode-cli
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.local/bin
+            ~/.local/pipx
+          key: ${{ runner.os }}-pipx-linode-cli-v1
+          restore-keys: |
+            ${{ runner.os }}-pipx-linode-cli-
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y python3-pip python3-venv pipx
+          pipx install linode-cli
+          pipx ensurepath
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Configure Linode CLI
+        run: |
+          export PATH="$PATH:$HOME/.local/bin"
+          /bin/mkdir -p ~/.config/linode
+          /bin/echo -e "[DEFAULT]\ntoken = $LINODE_CLI_TOKEN\nregion = us-east" > ~/.config/linode/linode-cli
+        env:
+          LINODE_CLI_TOKEN: ${{ secrets.LINODE_CLI_TOKEN }}
+
+      - name: Check Linode Backups
+        run: |
+          export PATH="$PATH:$HOME/.local/bin"
+          # Get Linode IDs from secrets
+          LINODE_ID_1="${{ secrets.LINODE_ID_1 }}"
+          LINODE_ID_2="${{ secrets.LINODE_ID_2 }}"
+
+          # Get current date minus 5 days (ISO format) using absolute path for date
+          five_days_ago=$(/bin/date -d "-5 days" --iso-8601=seconds)
+          echo "Five days ago: $five_days_ago"
+
+          # Function to check backups for a given Linode ID
+          check_backups() {
+            local LINODE_ID=$1
+            echo "🔍 Checking backups for Linode ID: $LINODE_ID"
+
+            # Define a temporary file
+            tmp_file="backup_${LINODE_ID}.json"
+
+            # Write the raw JSON output directly to the temporary file
+            linode-cli linodes backups-list "$LINODE_ID" --json > "$tmp_file" 2>/dev/null
+            echo "Wrote JSON to $tmp_file"
+            
+            # Show a snippet and file size for debugging
+            head_output=$(/bin/head -n 5 "$tmp_file")
+            echo "🔍 JSON snippet from file:"
+            echo "$head_output"
+            file_size=$(/usr/bin/wc -c < "$tmp_file" 2>/dev/null || echo "unknown")
+            echo "File size (bytes): $file_size"
+
+            # Validate JSON using Python via its absolute path
+            if ! /usr/bin/python3 -c "import json,sys; json.load(sys.stdin)" < "$tmp_file"; then
+              echo "❌ Error: Invalid JSON received from linode-cli in $tmp_file (Python validation failed)"
+              exit 1
+            fi
+
+            # Filter backups created in the last 5 days using jq
+            recent_backups=$(/usr/bin/jq --arg date "$five_days_ago" '[.[] | select(.created? and .created >= $date)]' "$tmp_file")
+            echo "Filtered backups:"
+            echo "$recent_backups" | /usr/bin/jq '.'
+
+            if [[ $(echo "$recent_backups" | /usr/bin/jq 'length') -gt 0 ]]; then
+              echo "✅ Backup found for Linode ID: $LINODE_ID"
+              return 0
+            else
+              echo "❌ No backups found for Linode ID: $LINODE_ID"
+              return 1
+            fi
+          }
+
+          # Check backups for both Linodes
+          check_backups "$LINODE_ID_1"
+          result1=$?
+          check_backups "$LINODE_ID_2"
+          result2=$?
+
+          if [[ $result1 -eq 1 || $result2 -eq 1 ]]; then
+            exit 1
+          else
+            exit 0
+          fi
+        env:
+          LINODE_CLI_TOKEN: ${{ secrets.LINODE_CLI_TOKEN }}
+
+      - name: Cleanup
+        if: always()
+        run: |
+          /bin/rm -f backup_*.json
+          /bin/rm -rf ~/.config/linode
