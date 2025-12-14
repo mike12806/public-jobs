@@ -29,7 +29,7 @@ jobs:
           path: gh_hdc
 
       - name: Connect to Tailscale
-        uses: tailscale/github-action@v3
+        uses: tailscale/github-action@v4
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
@@ -38,7 +38,7 @@ jobs:
           version: latest
 
       - name: Cache B2 CLI
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: /usr/local/bin/b2
           key: ${{ runner.os }}-b2cli-latest
