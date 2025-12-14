@@ -42,6 +42,20 @@ jobs:
   plan-buckets:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      ES_BASE_URL: ${{ secrets.ES_BASE_URL }}
+      ES_USER: ${{ secrets.ES_USER }}
+      ES_PASSWORD: ${{ secrets.ES_PASSWORD }}
+      ES_INDEX: ks-logstash-log*
+      TS_FIELD: '@timestamp'
+      RETENTION_DAYS: ${{ inputs.retention_days || '7' }}
+      BUCKET_DAYS: ${{ inputs.bucket_days || '0.042' }}
+      MAX_BUCKETS: ${{ inputs.max_buckets || '60' }}
+    outputs:
+      buckets: ${{ steps.plan.outputs.buckets }}
+      has_work: ${{ steps.plan.outputs.has_work }}
+      total_buckets: ${{ steps.plan.outputs.total_buckets }}
+      total_docs: ${{ steps.plan.outputs.total_docs }}
 
     steps:
       - name: Checkout gh_hdc
@@ -65,21 +79,6 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y jq curl
 
-    env:
-      ES_BASE_URL: ${{ secrets.ES_BASE_URL }}
-      ES_USER: ${{ secrets.ES_USER }}
-      ES_PASSWORD: ${{ secrets.ES_PASSWORD }}
-      ES_INDEX: ks-logstash-log*
-      TS_FIELD: '@timestamp'
-      RETENTION_DAYS: ${{ inputs.retention_days || '7' }}
-      BUCKET_DAYS: ${{ inputs.bucket_days || '0.042' }}
-      MAX_BUCKETS: ${{ inputs.max_buckets || '60' }}
-    outputs:
-      buckets: ${{ steps.plan.outputs.buckets }}
-      has_work: ${{ steps.plan.outputs.has_work }}
-      total_buckets: ${{ steps.plan.outputs.total_buckets }}
-      total_docs: ${{ steps.plan.outputs.total_docs }}
-    steps:
       - name: Sanity check endpoint & index
         run: |
           set -euo pipefail
@@ -224,6 +223,24 @@ jobs:
     if: needs.plan-buckets.outputs.has_work == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJson(inputs.max_parallel || '6') }}
+      matrix:
+        bucket: ${{ fromJson(needs.plan-buckets.outputs.buckets) }}
+    env:
+      ES_BASE_URL: ${{ secrets.ES_BASE_URL }}
+      ES_USER: ${{ secrets.ES_USER }}
+      ES_PASSWORD: ${{ secrets.ES_PASSWORD }}
+      ES_INDEX: ks-logstash-log*
+      TS_FIELD: '@timestamp'
+      TIMEOUT: '30m'
+      MAX_DOCS: ''               # optional cap per bucket
+      POLL_BUDGET_SEC: '19800'   # 330 minutes per bucket (5.5 hours, leaves 30min buffer)
+      SLICES: ${{ inputs.slices || 'auto' }}
+      REQUESTS_PER_SECOND: '-1'  # unlimited for maximum speed
+      START: ${{ matrix.bucket.start }}
+      END: ${{ matrix.bucket.end }}
 
     steps:
       - name: Checkout gh_hdc
@@ -247,25 +264,6 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y curl
 
-    strategy:
-      fail-fast: false
-      max-parallel: ${{ fromJson(inputs.max_parallel || '6') }}
-      matrix:
-        bucket: ${{ fromJson(needs.plan-buckets.outputs.buckets) }}
-    env:
-      ES_BASE_URL: ${{ secrets.ES_BASE_URL }}
-      ES_USER: ${{ secrets.ES_USER }}
-      ES_PASSWORD: ${{ secrets.ES_PASSWORD }}
-      ES_INDEX: ks-logstash-log*
-      TS_FIELD: '@timestamp'
-      TIMEOUT: '30m'
-      MAX_DOCS: ''               # optional cap per bucket
-      POLL_BUDGET_SEC: '19800'   # 330 minutes per bucket (5.5 hours, leaves 30min buffer)
-      SLICES: ${{ inputs.slices || 'auto' }}
-      REQUESTS_PER_SECOND: '-1'  # unlimited for maximum speed
-      START: ${{ matrix.bucket.start }}
-      END: ${{ matrix.bucket.end }}
-    steps:
       - name: Sanity check endpoint & index
         run: |
           set -euo pipefail
