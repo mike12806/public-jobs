@@ -1,5 +1,8 @@
 name: Check Kubernetes Node Health
 
+permissions:
+  contents: read
+
 on:
   workflow_dispatch:
   schedule:
