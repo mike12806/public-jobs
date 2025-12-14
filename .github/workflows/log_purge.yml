@@ -378,7 +378,7 @@ jobs:
             echo "Rate:     ${{ steps.poll.outputs.rate || '0' }} docs/sec"
           fi
 
-  report-summary:
+    runs-on: ubuntu-latest
     needs: [plan-buckets, purge-old-logs]
     if: always() && needs.plan-buckets.outputs.has_work == 'true'
     runs-on: self-hosted
