@@ -9,6 +9,9 @@ concurrency:
   group: nfs-ip-security-list-updater
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   update-nfs-clients:
     runs-on: ubuntu-latest

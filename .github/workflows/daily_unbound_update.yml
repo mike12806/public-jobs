@@ -9,6 +9,9 @@ concurrency:
   group: unbound_hosts_daily_update
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   deploy:
     runs-on: ubuntu-latest

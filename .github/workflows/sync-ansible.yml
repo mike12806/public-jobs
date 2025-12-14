@@ -14,6 +14,9 @@ concurrency:
   group: sync_ansible
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   sync-ansible:
     runs-on: ubuntu-latest

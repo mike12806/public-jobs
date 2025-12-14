@@ -2,6 +2,9 @@ name: Home Lab Connectivity (Final Verification)
 
 on: workflow_dispatch
 
+permissions:
+  contents: read
+
 jobs:
   network-check:
     runs-on: ubuntu-latest

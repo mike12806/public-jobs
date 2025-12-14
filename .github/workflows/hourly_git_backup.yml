@@ -5,6 +5,9 @@ on:
     - cron: '0 * * * *'    # Run every hour
   workflow_dispatch:      # Allow manual trigger
 
+permissions:
+  contents: read
+
 env:
   B2_APPLICATION_KEY_ID: ${{ secrets.B2_KEY_ID }}
   B2_APPLICATION_KEY:    ${{ secrets.B2_APP_KEY }}

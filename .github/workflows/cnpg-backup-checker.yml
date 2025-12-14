@@ -9,7 +9,8 @@ concurrency:
   group: cnpg-backup-checker
   cancel-in-progress: true
 
-permissions: {}
+permissions:
+  contents: read
 
 jobs:
   check-cnpg-backups:

@@ -35,6 +35,9 @@ concurrency:
   group: log-purge
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
 jobs:
   plan-buckets:
     runs-on: ubuntu-latest

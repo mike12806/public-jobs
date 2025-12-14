@@ -9,6 +9,9 @@ concurrency:
   group: linode_backup_checker
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   check-backups:
     runs-on: ubuntu-latest
