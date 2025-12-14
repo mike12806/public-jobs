@@ -1,0 +1,43 @@
+name: Test Homelab Connectivity (Tailscale OAuth)
+
+on: [workflow_dispatch]
+
+env:
+  TARGET_IP: "192.168.1.108"
+
+jobs:
+  tailscale-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          # Use OAuth instead of Auth Key
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          hostname: github-runner
+          version: latest
+
+      - name: Test Connectivity
+        run: |
+          echo "--------------------------------------"
+          echo "DEBUG: Tailscale Status"
+          tailscale status
+          
+          echo "--------------------------------------"
+          echo "TEST 1: Ping (ICMP)"
+          # Tailscale handles routing automatically.
+          ping -c 4 ${{ env.TARGET_IP }}
+
+      - name: Test TrueNAS (HTTPS)
+        run: |
+          echo "--------------------------------------"
+          echo "TEST 2: HTTPS Connection"
+          # -v: Verbose
+          # -k: Ignore self-signed certs
+          # --connect-timeout 5: Fail fast
+          curl -v -k --connect-timeout 5 https://${{ env.TARGET_IP }}
