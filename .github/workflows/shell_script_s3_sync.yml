@@ -51,10 +51,16 @@ jobs:
         run: |
           sudo apt-get update -y
           sudo apt-get install -y curl unzip
-          curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "/tmp/awscliv2.zip"
-          unzip -q /tmp/awscliv2.zip -d /tmp
-          sudo /tmp/aws/install
-          rm -rf /tmp/awscliv2.zip /tmp/aws
+          
+          # Check if AWS CLI is already installed
+          if [ -f /usr/local/bin/aws ]; then
+            echo "AWS CLI already installed, skipping installation"
+          else
+            curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "/tmp/awscliv2.zip"
+            unzip -q /tmp/awscliv2.zip -d /tmp
+            sudo /tmp/aws/install
+            rm -rf /tmp/awscliv2.zip /tmp/aws
+          fi
 
       - name: Configure AWS CLI
         run: |
