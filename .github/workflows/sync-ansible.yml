@@ -59,7 +59,7 @@ jobs:
         run: |
           rsync -avz --delete --checksum --progress \
             -e "ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no" \
-            gh_hdc/ansible/ "$SSH_USER@$SSH_HOST:/etc/ansible/" || echo "failure" >> job_status.txt
+            gh_hdc/ansible/ "$SSH_USER@$SSH_HOST:/etc/ansible/"
 
       - name: Verify Sync
         id: verify
@@ -67,7 +67,7 @@ jobs:
           SSH_USER: ${{ secrets.SSH_USER }}
           SSH_HOST: ${{ secrets.SSH_HOST }}
         run: |
-          ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" "ls -lah /etc/ansible/" || echo "failure" >> job_status.txt
+          ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" "ls -lah /etc/ansible/"
 
       - name: Cleanup
         if: always()
