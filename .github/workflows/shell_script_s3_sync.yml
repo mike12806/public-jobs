@@ -1,4 +1,5 @@
 name: Upload Shell Scripts to S3
+
 permissions:
   contents: read
 
@@ -13,9 +14,6 @@ on:
 concurrency:
   group: s3_sync_process_shell_scripts
   cancel-in-progress: true
-
-permissions:
-  contents: read
 
 jobs:
   upload:

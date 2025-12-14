@@ -1,4 +1,5 @@
 name: Sync Ansible Config
+
 permissions:
   contents: read
 
@@ -13,9 +14,6 @@ on:
 concurrency:
   group: sync_ansible
   cancel-in-progress: true
-
-permissions:
-  contents: read
 
 jobs:
   sync-ansible:

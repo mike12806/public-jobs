@@ -42,6 +42,20 @@ jobs:
   plan-buckets:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      ES_BASE_URL: ${{ secrets.ES_BASE_URL }}
+      ES_USER: ${{ secrets.ES_USER }}
+      ES_PASSWORD: ${{ secrets.ES_PASSWORD }}
+      ES_INDEX: ks-logstash-log*
+      TS_FIELD: '@timestamp'
+      RETENTION_DAYS: ${{ inputs.retention_days || '7' }}
+      BUCKET_DAYS: ${{ inputs.bucket_days || '0.042' }}
+      MAX_BUCKETS: ${{ inputs.max_buckets || '60' }}
+    outputs:
+      buckets: ${{ steps.plan.outputs.buckets }}
+      has_work: ${{ steps.plan.outputs.has_work }}
+      total_buckets: ${{ steps.plan.outputs.total_buckets }}
+      total_docs: ${{ steps.plan.outputs.total_docs }}
 
     steps:
       - name: Checkout gh_hdc
@@ -65,21 +79,6 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y jq curl
 
-    env:
-      ES_BASE_URL: ${{ secrets.ES_BASE_URL }}
-      ES_USER: ${{ secrets.ES_USER }}
-      ES_PASSWORD: ${{ secrets.ES_PASSWORD }}
-      ES_INDEX: ks-logstash-log*
-      TS_FIELD: '@timestamp'
-      RETENTION_DAYS: ${{ inputs.retention_days || '7' }}
-      BUCKET_DAYS: ${{ inputs.bucket_days || '0.042' }}
-      MAX_BUCKETS: ${{ inputs.max_buckets || '60' }}
-    outputs:
-      buckets: ${{ steps.plan.outputs.buckets }}
-      has_work: ${{ steps.plan.outputs.has_work }}
-      total_buckets: ${{ steps.plan.outputs.total_buckets }}
-      total_docs: ${{ steps.plan.outputs.total_docs }}
-    steps:
       - name: Sanity check endpoint & index
         run: |
           set -euo pipefail
