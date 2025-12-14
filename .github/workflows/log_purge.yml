@@ -379,7 +379,7 @@ jobs:
   report-summary:
     needs: [plan-buckets, purge-old-logs]
     if: always() && needs.plan-buckets.outputs.has_work == 'true'
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - name: Aggregate performance metrics
