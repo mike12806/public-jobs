@@ -70,7 +70,8 @@ jobs:
           ANSIBLE_PYTHON_INTERPRETER: /usr/bin/python3
           ANSIBLE_GATHERING: smart
           ANSIBLE_TIMEOUT: 30
-          ANSIBLE_STDOUT_CALLBACK: yaml
+          ANSIBLE_STDOUT_CALLBACK: ansible.builtin.default
+          ANSIBLE_CALLBACK_RESULT_FORMAT: yaml
           ANSIBLE_HOST_KEY_CHECKING: false
         run: |
           pipx run --spec ansible ansible-playbook playbooks/playbook_unbound_update.yml \
