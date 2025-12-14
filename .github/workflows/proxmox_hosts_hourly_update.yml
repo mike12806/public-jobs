@@ -2,7 +2,7 @@ name: Hourly Proxmox Host Update Check
 
 on:
   schedule:
-    - cron: "30 7,19 * * *"  # Runs twice daily at 7:30 AM and 7:30 PM UTC
+    - cron: "0 * * * *"  # Runs hourly at the top of every hour
   workflow_dispatch:  # Allows manual triggering from Gitea Actions UI
 
 concurrency:
