@@ -1,0 +1,45 @@
+name: renovate-config-validation
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  validate:
+    name: validate-renovate-config
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 'lts/*'
+
+      - name: Install Renovate CLI
+        run: npm install --global renovate@latest
+
+      - name: Validate Renovate config
+        run: |
+          # Find all potential Renovate config files
+          config_files=$(find . -type f \( \
+            -name "renovate.json" -o \
+            -name "renovate.json5" -o \
+            -name ".renovaterc.json" -o \
+            -name ".renovaterc" \
+          \))
+
+          # Validate each config file
+          for config in $config_files; do
+            echo "Validating $config..."
+            renovate-config-validator "$config"
+            if [ $? -ne 0 ]; then
+              echo "Error: Invalid Renovate configuration in $config"
+              exit 1
+            fi
+          done

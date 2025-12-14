@@ -1,0 +1,22 @@
+name: Docker Compose Validate
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  validate-docker-manifests:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Find and validate Docker Compose files
+        run: |
+          find docker -name "docker-compose.yml" -o -name "docker-compose.yaml" | while read -r file; do
+            echo "Validating configuration for $file..."
+            # Only validate the configuration syntax using docker-compose
+            docker-compose -f "$file" config --quiet || exit 1
+            echo "✓ Configuration validation passed for $file"
+          done
+
