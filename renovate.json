@@ -1,0 +1,125 @@
+{
+  "configMigration": true,
+  "extends": [
+    "config:recommended"
+  ],
+  "enabledManagers": [
+    "docker-compose",
+    "helm-values",
+    "kubernetes",
+    "argocd",
+    "github-actions"
+  ],
+  "registryAliases": {
+    "harbor.mfaherty.net/dockerhub-proxy": "docker.io",
+    "harbor.mfaherty.net/ghcr-proxy": "ghcr.io",
+    "harbor.mfaherty.net/quay-proxy": "quay.io"
+  },
+  "automerge": true,
+  "automergeStrategy": "squash",
+  "platformAutomerge": true,
+  "respectLatest": true,
+  "ignoreTests": true,
+  "minimumReleaseAge": null,
+  "rebaseWhen": "auto",
+  "packageRules": [
+    {
+      "description": "NEVER automerge NGINX ingress controller ArgoCD manifest",
+      "matchFileNames": [
+        "kubernetes/apps/ingress-nginx.yaml"
+      ],
+      "automerge": false,
+      "labels": [
+        "needs-nginx-review"
+      ]
+    },
+    {
+      "description": "NEVER automerge ingress-nginx controller image updates in values.yaml",
+      "matchFileNames": [
+        "kubernetes/ingress-nginx/helm/values.yaml"
+      ],
+      "automerge": false,
+      "labels": [
+        "needs-nginx-review"
+      ],
+      "matchPackageNames": [
+        "registry.k8s.io/ingress-nginx/controller"
+      ]
+    },
+    {
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "automerge": false
+    },
+    {
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "automerge": true
+    },
+    {
+      "description": "NEVER automerge CloudNativePG database image updates",
+      "matchFileNames": [
+        "kubernetes/cloudnative-pg/databases/.*\\.ya?ml$"
+      ],
+      "automerge": false,
+      "labels": [
+        "needs-db-review"
+      ]
+    }
+  ],
+  "argocd": {
+    "managerFilePatterns": [
+      "/kubernetes/apps/.*\\.ya?ml$/"
+    ]
+  },
+  "helm-values": {
+    "managerFilePatterns": [
+      "/(^|/)values\\.ya?ml$/"
+    ]
+  },
+  "kubernetes": {
+    "managerFilePatterns": [
+      "/deployment.yaml$/",
+      "/deployment.yml$/"
+    ]
+  },
+  "docker-compose": {
+    "managerFilePatterns": [
+      "/docker-compose.yaml$/",
+      "/docker-compose.yml$/"
+    ]
+  },
+  "github-actions": {
+    "managerFilePatterns": [
+      "/^\\.github/workflows/[^/]+\\.ya?ml$/"
+    ]
+  },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/kubernetes/cloudnative-pg/databases/.*\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "imageName:\\s*(?<depName>[^:]+):(?<currentValue>.+?)\\n"
+      ],
+      "datasourceTemplate": "docker",
+      "versioningTemplate": "semver"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "image:\\s*tag:\\s*(?<currentValue>.*?)\\n"
+      ],
+      "datasourceTemplate": "docker",
+      "depNameTemplate": "immich",
+      "versioningTemplate": "semver"
+    }
+  ]
+}
