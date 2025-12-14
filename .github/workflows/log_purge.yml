@@ -16,7 +16,7 @@ on:
       max_parallel:
         description: 'Max concurrent deletion tasks (adjust based on cluster capacity)'
         required: false
-        default: '1'
+        default: '6'
         type: string
       slices:
         description: 'ES slices per delete-by-query (higher = more internal parallelism, use "auto" for ES to decide)'
@@ -33,7 +33,7 @@ on:
 
 concurrency:
   group: log-purge
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 permissions:
   contents: read
