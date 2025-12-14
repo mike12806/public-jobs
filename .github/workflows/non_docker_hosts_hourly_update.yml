@@ -21,7 +21,7 @@ jobs:
       - name: Checkout gh_hdc
         uses: actions/checkout@v6
         with:
-          repository: mfaherty/gh_hdc
+          repository: mike12806/gh_hdc
           token: ${{ secrets.GH_HDC_PAT }}
           path: gh_hdc
 
