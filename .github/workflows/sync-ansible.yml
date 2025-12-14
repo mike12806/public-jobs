@@ -1,4 +1,6 @@
 name: Sync Ansible Config
+permissions:
+  contents: read
 
 on:
   workflow_dispatch:
