@@ -34,6 +34,22 @@ jobs:
           hostname: github-runner-git-backup
           version: latest
 
+      - name: Cache B2 CLI
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/bin/b2
+          key: ${{ runner.os }}-b2cli-latest
+          restore-keys: |
+            ${{ runner.os }}-b2cli-
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y git jq gpg curl
+          curl -fsSL -L https://github.com/Backblaze/B2_Command_Line_Tool/releases/latest/download/b2-linux -o /tmp/b2
+          sudo install -m 0755 /tmp/b2 /usr/local/bin/b2
+          rm /tmp/b2
+
       - name: Prepare workspace
         run: |
           mkdir -p github_backup gitea_backup

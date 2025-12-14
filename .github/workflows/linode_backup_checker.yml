@@ -32,6 +32,24 @@ jobs:
           hostname: github-runner-linode-backup
           version: latest
 
+      - name: Cache pipx and linode-cli
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.local/bin
+            ~/.local/pipx
+          key: ${{ runner.os }}-pipx-linode-cli-v1
+          restore-keys: |
+            ${{ runner.os }}-pipx-linode-cli-
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y python3-pip python3-venv pipx
+          pipx install linode-cli
+          pipx ensurepath
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
       - name: Configure Linode CLI
         run: |
           export PATH="$PATH:$HOME/.local/bin"

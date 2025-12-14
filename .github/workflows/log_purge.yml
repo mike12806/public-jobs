@@ -57,6 +57,11 @@ jobs:
           hostname: github-runner-log-purge-plan
           version: latest
 
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq curl
+
     env:
       ES_BASE_URL: ${{ secrets.ES_BASE_URL }}
       ES_USER: ${{ secrets.ES_USER }}
@@ -233,6 +238,11 @@ jobs:
           tags: tag:ci
           hostname: github-runner-log-purge-job
           version: latest
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y curl
 
     strategy:
       fail-fast: false

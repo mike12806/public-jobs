@@ -31,6 +31,23 @@ jobs:
           hostname: github-runner-restart-hosts-1
           version: latest
 
+      - name: Cache pipx and ansible
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.local/bin
+            ~/.local/pipx
+          key: ${{ runner.os }}-pipx-ansible-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pipx-ansible-
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y python3-pip python3-venv pipx sshpass openssh-client
+          pipx install ansible
+          pipx ensurepath
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
 
       - name: Write SSH Private Key to File
         run: |

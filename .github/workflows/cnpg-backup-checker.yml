@@ -33,6 +33,11 @@ jobs:
           hostname: github-runner-cnpg-backup-checker
           version: latest
 
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq
+
       - name: Setup kubectl
         uses: azure/setup-kubectl@v4
         with:

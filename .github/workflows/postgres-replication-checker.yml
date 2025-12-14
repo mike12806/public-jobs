@@ -33,6 +33,11 @@ jobs:
           hostname: github-runner-postgres-replication
           version: latest
 
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y postgresql-client
+
       - name: Check PostgreSQL Replication Status
         id: check_replication
         run: |
