@@ -1,0 +1,162 @@
+name: Sync Tailscale DNS to Pi-hole
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/15 * * * *'  # every 15 minutes
+
+concurrency:
+  group: tailscale-dns-pihole-sync
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  sync-dns:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_CLIENT_SECRET }}
+          tags: tag:ci
+          hostname: github-runner-tailscale-dns-sync
+          version: latest
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq curl
+
+      - name: Get Tailscale DNS records
+        id: tailscale_dns
+        run: |
+          # Get tailnet name from Tailscale status
+          TAILNET=$(tailscale status --json | jq -r '.Self.DNSName' | sed 's/\.ts\.net\.$//' | sed 's/^[^.]*\.//')
+          
+          if [[ -z "$TAILNET" ]]; then
+            echo "Error: Could not determine tailnet name"
+            exit 1
+          fi
+          
+          # Validate tailnet name format (should not be empty and should be valid)
+          if [[ ! "$TAILNET" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+            echo "Error: Invalid tailnet name format"
+            exit 1
+          fi
+          
+          echo "Tailnet: $TAILNET"
+          
+          # Get OAuth token for API calls
+          TOKEN_RESPONSE=$(curl -s -X POST \
+            -d "client_id=${{ secrets.TS_OAUTH_CLIENT_ID }}" \
+            -d "client_secret=${{ secrets.TS_OAUTH_CLIENT_SECRET }}" \
+            "https://api.tailscale.com/api/v2/oauth/token" 2>&1)
+          
+          ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.access_token // empty')
+          
+          if [[ -z "$ACCESS_TOKEN" ]]; then
+            echo "Error: Could not get OAuth access token"
+            exit 1
+          fi
+          
+          # Get all devices in the tailnet
+          DEVICES=$(curl -s \
+            -H "Authorization: Bearer $ACCESS_TOKEN" \
+            "https://api.tailscale.com/api/v2/tailnet/$TAILNET/devices" 2>&1)
+          
+          # Validate the response is valid JSON
+          if ! echo "$DEVICES" | jq -e . >/dev/null 2>&1; then
+            echo "Error: Invalid response from Tailscale API"
+            exit 1
+          fi
+          
+          # Filter devices that don't have tag:ci and extract IPv4 and hostname
+          # Format: ip=hostname (one per line)
+          DNS_RECORDS=$(echo "$DEVICES" | jq -r '
+            .devices[] |
+            select(.tags == null or (.tags | map(select(. == "tag:ci")) | length == 0)) |
+            select(.addresses[]? | startswith("100.")) |
+            (.addresses[] | select(startswith("100."))) as $ipv4 |
+            ($ipv4 + "=" + .hostname)
+          ' | sort -u)
+          
+          if [[ -z "$DNS_RECORDS" ]]; then
+            echo "No DNS records found (excluding tag:ci devices)"
+            echo "records=" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          RECORD_COUNT=$(echo "$DNS_RECORDS" | wc -l)
+          echo "Found $RECORD_COUNT DNS records (excluding tag:ci devices)"
+          
+          # Save records to output (base64 encode to handle multiline)
+          echo "records=$(echo "$DNS_RECORDS" | base64 -w 0)" >> $GITHUB_OUTPUT
+
+      - name: Sync DNS records to Pi-hole
+        if: steps.tailscale_dns.outputs.records != ''
+        run: |
+          # Decode the DNS records
+          DNS_RECORDS=$(echo "${{ steps.tailscale_dns.outputs.records }}" | base64 -d)
+          
+          # Parse PRIMARY_PIHOLE_IP_AND_PORT to extract IP and port
+          PIHOLE_HOST="${{ secrets.PRIMARY_PIHOLE_IP_AND_PORT }}"
+          
+          echo "Syncing DNS records to Pi-hole..."
+          
+          RECORDS_PROCESSED=0
+          RECORDS_SUCCEEDED=0
+          RECORDS_FAILED=0
+          
+          # Process each record
+          while IFS= read -r record; do
+            if [[ -z "$record" ]]; then
+              continue
+            fi
+            
+            # Split record into IP and hostname
+            IPV4=$(echo "$record" | cut -d= -f1)
+            HOSTNAME=$(echo "$record" | cut -d= -f2)
+            
+            RECORDS_PROCESSED=$((RECORDS_PROCESSED + 1))
+            
+            # Add or update DNS record in Pi-hole v6 using the new REST API
+            # Pi-hole v6 uses /api/dns/custom endpoint with JSON payload
+            # Using -s flag and 2>&1 redirection ensures token is never logged
+            RESPONSE=$(curl -s -w "\n%{http_code}" \
+              -X POST \
+              -H "Content-Type: application/json" \
+              -H "Authorization: Bearer ${{ secrets.PRIMARY_PIHOLE_TOKEN }}" \
+              -d "{\"domain\":\"${HOSTNAME}\",\"ip\":\"${IPV4}\"}" \
+              "http://${PIHOLE_HOST}/api/dns/custom" 2>&1)
+            
+            HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+            BODY=$(echo "$RESPONSE" | sed '$d')
+            
+            # Don't log response body as it might contain sensitive info
+            # Pi-hole v6 returns 200 for success, 409 if record already exists (which we treat as success)
+            if [[ "$HTTP_CODE" != "200" ]] && [[ "$HTTP_CODE" != "201" ]] && [[ "$HTTP_CODE" != "409" ]]; then
+              RECORDS_FAILED=$((RECORDS_FAILED + 1))
+              continue
+            fi
+            
+            # Check if the response indicates success
+            # Pi-hole v6 returns proper HTTP status codes
+            SUCCESS_DETECTED=false
+            if [[ "$HTTP_CODE" == "200" ]] || [[ "$HTTP_CODE" == "201" ]] || [[ "$HTTP_CODE" == "409" ]]; then
+              SUCCESS_DETECTED=true
+            fi
+            
+            if [[ "$SUCCESS_DETECTED" == "true" ]]; then
+              RECORDS_SUCCEEDED=$((RECORDS_SUCCEEDED + 1))
+            else
+              RECORDS_FAILED=$((RECORDS_FAILED + 1))
+            fi
+            
+          done <<< "$DNS_RECORDS"
+          
+          echo "DNS sync complete: Processed $RECORDS_PROCESSED records, Succeeded: $RECORDS_SUCCEEDED, Failed: $RECORDS_FAILED"
