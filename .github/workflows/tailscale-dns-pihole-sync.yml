@@ -22,7 +22,7 @@ jobs:
         uses: tailscale/github-action@v4
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
-          oauth-secret: ${{ secrets.TS_OAUTH_CLIENT_SECRET }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
           tags: tag:ci
           hostname: github-runner-tailscale-dns-sync
           version: latest
@@ -54,7 +54,7 @@ jobs:
           # Get OAuth token for API calls
           TOKEN_RESPONSE=$(curl -s -X POST \
             -d "client_id=${{ secrets.TS_OAUTH_CLIENT_ID }}" \
-            -d "client_secret=${{ secrets.TS_OAUTH_CLIENT_SECRET }}" \
+            -d "client_secret=${{ secrets.TS_OAUTH_SECRET }}" \
             "https://api.tailscale.com/api/v2/oauth/token" 2>&1)
           
           ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.access_token // empty')
