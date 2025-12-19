@@ -67,15 +67,17 @@ jobs:
           DEVICE_COUNT=$(echo "$DEVICES" | jq '(.devices // []) | length')
           echo "Found $DEVICE_COUNT total devices in Tailscale"
           
-          # Filter devices that don't have tag:ci and extract IPv4 and hostname
-          # Format: ip=hostname (one per line)
+          # Filter devices that don't have tag:ci and extract IPv4 and MagicDNS name
+          # Format: ip=magicdns_name (one per line)
+          # Use .name for the full MagicDNS name (e.g., tailscale-lxc-2.tail402f58.ts.net)
+          # instead of .hostname which is just the short name
           # Use // [] to provide an empty array if .devices is null
           DNS_RECORDS=$(echo "$DEVICES" | jq -r '
             (.devices // [])[] |
             select(.tags == null or (.tags | map(select(. == "tag:ci")) | length == 0)) |
             select(.addresses[]? | startswith("100.")) |
             (.addresses[] | select(startswith("100."))) as $ipv4 |
-            ($ipv4 + "=" + .hostname)
+            ($ipv4 + "=" + .name)
           ' | sort -u)
           
           if [[ -z "$DNS_RECORDS" ]]; then
@@ -139,7 +141,7 @@ jobs:
               continue
             fi
             
-            # Split record into IP and hostname
+            # Split record into IP and MagicDNS name
             IPV4=$(echo "$record" | cut -d= -f1)
             HOSTNAME=$(echo "$record" | cut -d= -f2)
             
