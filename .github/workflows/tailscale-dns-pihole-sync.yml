@@ -77,15 +77,14 @@ jobs:
           fi
           
           # Check if devices array exists and is not null
-          DEVICE_COUNT=$(echo "$DEVICES" | jq '.devices | length // 0')
+          DEVICE_COUNT=$(echo "$DEVICES" | jq '(.devices // []) | length')
           echo "Found $DEVICE_COUNT total devices in Tailscale"
           
           # Filter devices that don't have tag:ci and extract IPv4 and hostname
           # Format: ip=hostname (one per line)
           # Use // [] to provide an empty array if .devices is null
           DNS_RECORDS=$(echo "$DEVICES" | jq -r '
-            (.devices // []) |
-            .[] |
+            (.devices // [])[] |
             select(.tags == null or (.tags | map(select(. == "tag:ci")) | length == 0)) |
             select(.addresses[]? | startswith("100.")) |
             (.addresses[] | select(startswith("100."))) as $ipv4 |
