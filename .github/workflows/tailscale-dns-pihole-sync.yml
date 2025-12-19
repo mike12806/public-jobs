@@ -146,22 +146,39 @@ jobs:
             RECORDS_PROCESSED=$((RECORDS_PROCESSED + 1))
             
             # Add DNS record in Pi-hole v6 using the REST API
-            # Pi-hole v6 uses POST to /api/customdns for adding local DNS records
-            # Format: domain and ip in JSON body
+            # Pi-hole v6 uses PATCH to /api/config/dns/hosts to add local DNS records
+            # Format: "IP HOSTNAME" as the value to add
             RESPONSE=$(curl -s -w "\n%{http_code}" \
-              -X POST \
+              -X PATCH \
               -H "Content-Type: application/json" \
               -H "X-FTL-SID: ${SESSION_ID}" \
-              -d "{\"domain\":\"${HOSTNAME}\",\"ip\":\"${IPV4}\"}" \
-              "http://${PIHOLE_HOST}/api/customdns" 2>&1)
+              -d "{\"value\":\"${IPV4} ${HOSTNAME}\",\"action\":\"add\"}" \
+              "http://${PIHOLE_HOST}/api/config/dns/hosts" 2>&1)
             
             HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+            BODY=$(echo "$RESPONSE" | sed '$d')
             
-            # Pi-hole v6 returns 201 for created, 200 for success, 409 for already exists (treat as success)
-            if [[ "$HTTP_CODE" == "200" ]] || [[ "$HTTP_CODE" == "201" ]] || [[ "$HTTP_CODE" == "409" ]]; then
+            # Log the HTTP code for debugging
+            echo "Record ${HOSTNAME}: HTTP ${HTTP_CODE}"
+            
+            # Pi-hole v6 returns 200/201 for success, check if already exists is ok
+            if [[ "$HTTP_CODE" == "200" ]] || [[ "$HTTP_CODE" == "201" ]] || [[ "$HTTP_CODE" == "204" ]]; then
               RECORDS_SUCCEEDED=$((RECORDS_SUCCEEDED + 1))
             else
-              RECORDS_FAILED=$((RECORDS_FAILED + 1))
+              # Check if it failed because entry already exists (which is fine)
+              if echo "$BODY" | jq -e '.error' >/dev/null 2>&1; then
+                ERROR_MSG=$(echo "$BODY" | jq -r '.error // ""')
+                if [[ "$ERROR_MSG" == *"already"* ]] || [[ "$ERROR_MSG" == *"exists"* ]] || [[ "$ERROR_MSG" == *"duplicate"* ]]; then
+                  echo "  (already exists, counting as success)"
+                  RECORDS_SUCCEEDED=$((RECORDS_SUCCEEDED + 1))
+                else
+                  echo "  Failed: $ERROR_MSG"
+                  RECORDS_FAILED=$((RECORDS_FAILED + 1))
+                fi
+              else
+                echo "  Failed response: ${BODY:0:200}"
+                RECORDS_FAILED=$((RECORDS_FAILED + 1))
+              fi
             fi
             
           done <<< "$DNS_RECORDS"
