@@ -72,7 +72,8 @@ jobs:
           # Validate the response is valid JSON
           if ! echo "$DEVICES" | jq -e . >/dev/null 2>&1; then
             echo "Error: Invalid response from Tailscale API"
-            echo "Response: $DEVICES"
+            # Only show first 200 chars to avoid leaking sensitive data
+            echo "Response preview: ${DEVICES:0:200}"
             exit 1
           fi
           
