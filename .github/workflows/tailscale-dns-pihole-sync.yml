@@ -146,14 +146,16 @@ jobs:
             RECORDS_PROCESSED=$((RECORDS_PROCESSED + 1))
             
             # Add DNS record in Pi-hole v6 using the REST API
-            # Pi-hole v6 uses PATCH to /api/config/dns/hosts to add local DNS records
-            # Format: "IP HOSTNAME" as the value to add
+            # Pi-hole v6 uses PUT to /api/config/dns/hosts/{item} to add individual DNS records
+            # URL-encode the entry (IP space HOSTNAME) for the URL path
+            DNS_ENTRY="${IPV4} ${HOSTNAME}"
+            ENCODED_ENTRY=$(echo -n "$DNS_ENTRY" | jq -sRr @uri)
+            
             RESPONSE=$(curl -s -w "\n%{http_code}" \
-              -X PATCH \
+              -X PUT \
               -H "Content-Type: application/json" \
               -H "X-FTL-SID: ${SESSION_ID}" \
-              -d "{\"value\":\"${IPV4} ${HOSTNAME}\",\"action\":\"add\"}" \
-              "http://${PIHOLE_HOST}/api/config/dns/hosts" 2>&1)
+              "http://${PIHOLE_HOST}/api/config/dns/hosts/${ENCODED_ENTRY}" 2>&1)
             
             HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
             BODY=$(echo "$RESPONSE" | sed '$d')
