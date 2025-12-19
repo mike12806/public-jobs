@@ -124,35 +124,30 @@ jobs:
             
             RECORDS_PROCESSED=$((RECORDS_PROCESSED + 1))
             
-            # Add or update DNS record in Pi-hole using the custom DNS API
-            # Note: Pi-hole API requires token as query parameter (not in headers/body)
+            # Add or update DNS record in Pi-hole v6 using the new REST API
+            # Pi-hole v6 uses /api/dns/custom endpoint with JSON payload
             # Using -s flag and 2>&1 redirection ensures token is never logged
             RESPONSE=$(curl -s -w "\n%{http_code}" \
               -X POST \
-              "http://${PIHOLE_HOST}/admin/api.php?customdns&action=add&ip=${IPV4}&domain=${HOSTNAME}&token=${{ secrets.PRIMARY_PIHOLE_TOKEN }}" 2>&1)
+              -H "Content-Type: application/json" \
+              -H "Authorization: Bearer ${{ secrets.PRIMARY_PIHOLE_TOKEN }}" \
+              -d "{\"domain\":\"${HOSTNAME}\",\"ip\":\"${IPV4}\"}" \
+              "http://${PIHOLE_HOST}/api/dns/custom" 2>&1)
             
             HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
             BODY=$(echo "$RESPONSE" | sed '$d')
             
             # Don't log response body as it might contain sensitive info
-            if [[ "$HTTP_CODE" != "200" ]]; then
+            # Pi-hole v6 returns 200 for success, 409 if record already exists (which we treat as success)
+            if [[ "$HTTP_CODE" != "200" ]] && [[ "$HTTP_CODE" != "201" ]] && [[ "$HTTP_CODE" != "409" ]]; then
               RECORDS_FAILED=$((RECORDS_FAILED + 1))
               continue
             fi
             
             # Check if the response indicates success
-            # Only count as success if we get an explicit success=true or a valid empty/success response
+            # Pi-hole v6 returns proper HTTP status codes
             SUCCESS_DETECTED=false
-            if echo "$BODY" | jq -e '.success' >/dev/null 2>&1; then
-              SUCCESS=$(echo "$BODY" | jq -r '.success')
-              if [[ "$SUCCESS" == "true" ]]; then
-                SUCCESS_DETECTED=true
-              fi
-            elif echo "$BODY" | jq -e 'has("success")' >/dev/null 2>&1; then
-              # Has success field but it's false/null
-              SUCCESS_DETECTED=false
-            elif [[ -z "$BODY" ]] || [[ "$BODY" == "{}" ]]; then
-              # Empty response with 200 status is considered success
+            if [[ "$HTTP_CODE" == "200" ]] || [[ "$HTTP_CODE" == "201" ]] || [[ "$HTTP_CODE" == "409" ]]; then
               SUCCESS_DETECTED=true
             fi
             
