@@ -162,9 +162,6 @@ jobs:
             HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
             BODY=$(echo "$RESPONSE" | sed '$d')
             
-            # Log the HTTP code for debugging
-            echo "Record ${HOSTNAME}: HTTP ${HTTP_CODE}"
-            
             # Pi-hole v6 returns 200/201 for success, check if already exists is ok
             if [[ "$HTTP_CODE" == "200" ]] || [[ "$HTTP_CODE" == "201" ]] || [[ "$HTTP_CODE" == "204" ]]; then
               RECORDS_SUCCEEDED=$((RECORDS_SUCCEEDED + 1))
@@ -173,14 +170,11 @@ jobs:
               if echo "$BODY" | jq -e '.error' >/dev/null 2>&1; then
                 ERROR_MSG=$(echo "$BODY" | jq -r '.error // ""')
                 if [[ "$ERROR_MSG" == *"already"* ]] || [[ "$ERROR_MSG" == *"exists"* ]] || [[ "$ERROR_MSG" == *"duplicate"* ]]; then
-                  echo "  (already exists, counting as success)"
                   RECORDS_SUCCEEDED=$((RECORDS_SUCCEEDED + 1))
                 else
-                  echo "  Failed: $ERROR_MSG"
                   RECORDS_FAILED=$((RECORDS_FAILED + 1))
                 fi
               else
-                echo "  Failed response: ${BODY:0:200}"
                 RECORDS_FAILED=$((RECORDS_FAILED + 1))
               fi
             fi
