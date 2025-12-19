@@ -36,10 +36,16 @@ jobs:
         id: tailscale_dns
         run: |
           # Get tailnet name from Tailscale status
-          TAILNET=$(tailscale status --json | jq -r '.Self.DNSName' | sed 's/\.[^.]*$//' | cut -d. -f2-)
+          TAILNET=$(tailscale status --json | jq -r '.Self.DNSName' | sed 's/\.ts\.net\.$//' | sed 's/^[^.]*\.//')
           
           if [[ -z "$TAILNET" ]]; then
             echo "Error: Could not determine tailnet name"
+            exit 1
+          fi
+          
+          # Validate tailnet name format (should not be empty and should be valid)
+          if [[ ! "$TAILNET" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+            echo "Error: Invalid tailnet name format"
             exit 1
           fi
           
@@ -119,7 +125,8 @@ jobs:
             RECORDS_PROCESSED=$((RECORDS_PROCESSED + 1))
             
             # Add or update DNS record in Pi-hole using the custom DNS API
-            # Pi-hole API endpoint: /admin/api.php?customdns&action=add
+            # Note: Pi-hole API requires token as query parameter (not in headers/body)
+            # Using -s flag and 2>&1 redirection ensures token is never logged
             RESPONSE=$(curl -s -w "\n%{http_code}" \
               -X POST \
               "http://${PIHOLE_HOST}/admin/api.php?customdns&action=add&ip=${IPV4}&domain=${HOSTNAME}&token=${{ secrets.PRIMARY_PIHOLE_TOKEN }}" 2>&1)
@@ -134,15 +141,25 @@ jobs:
             fi
             
             # Check if the response indicates success
+            # Only count as success if we get an explicit success=true or a valid empty/success response
+            SUCCESS_DETECTED=false
             if echo "$BODY" | jq -e '.success' >/dev/null 2>&1; then
               SUCCESS=$(echo "$BODY" | jq -r '.success')
               if [[ "$SUCCESS" == "true" ]]; then
-                RECORDS_SUCCEEDED=$((RECORDS_SUCCEEDED + 1))
-              else
-                RECORDS_FAILED=$((RECORDS_FAILED + 1))
+                SUCCESS_DETECTED=true
               fi
-            else
+            elif echo "$BODY" | jq -e 'has("success")' >/dev/null 2>&1; then
+              # Has success field but it's false/null
+              SUCCESS_DETECTED=false
+            elif [[ -z "$BODY" ]] || [[ "$BODY" == "{}" ]]; then
+              # Empty response with 200 status is considered success
+              SUCCESS_DETECTED=true
+            fi
+            
+            if [[ "$SUCCESS_DETECTED" == "true" ]]; then
               RECORDS_SUCCEEDED=$((RECORDS_SUCCEEDED + 1))
+            else
+              RECORDS_FAILED=$((RECORDS_FAILED + 1))
             fi
             
           done <<< "$DNS_RECORDS"
