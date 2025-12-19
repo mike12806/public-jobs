@@ -46,14 +46,14 @@ jobs:
           echo "Tailnet: $TAILNET"
           
           # Get OAuth token for API calls
-          TOKEN_RESPONSE=$(curl -s -u "${{ secrets.TS_OAUTH_CLIENT_ID }}:${{ secrets.TS_OAUTH_CLIENT_SECRET }}" \
+          TOKEN_RESPONSE=$(curl -s -X POST \
             -d "client_id=${{ secrets.TS_OAUTH_CLIENT_ID }}" \
             -d "client_secret=${{ secrets.TS_OAUTH_CLIENT_SECRET }}" \
-            "https://api.tailscale.com/api/v2/oauth/token")
+            "https://api.tailscale.com/api/v2/oauth/token" 2>&1)
           
-          ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.access_token')
+          ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.access_token // empty')
           
-          if [[ -z "$ACCESS_TOKEN" || "$ACCESS_TOKEN" == "null" ]]; then
+          if [[ -z "$ACCESS_TOKEN" ]]; then
             echo "Error: Could not get OAuth access token"
             exit 1
           fi
@@ -61,7 +61,13 @@ jobs:
           # Get all devices in the tailnet
           DEVICES=$(curl -s \
             -H "Authorization: Bearer $ACCESS_TOKEN" \
-            "https://api.tailscale.com/api/v2/tailnet/$TAILNET/devices")
+            "https://api.tailscale.com/api/v2/tailnet/$TAILNET/devices" 2>&1)
+          
+          # Validate the response is valid JSON
+          if ! echo "$DEVICES" | jq -e . >/dev/null 2>&1; then
+            echo "Error: Invalid response from Tailscale API"
+            exit 1
+          fi
           
           # Filter devices that don't have tag:ci and extract IPv4 and hostname
           # Format: ip=hostname (one per line)
@@ -79,8 +85,8 @@ jobs:
             exit 0
           fi
           
-          echo "Found DNS records:"
-          echo "$DNS_RECORDS"
+          RECORD_COUNT=$(echo "$DNS_RECORDS" | wc -l)
+          echo "Found $RECORD_COUNT DNS records (excluding tag:ci devices)"
           
           # Save records to output (base64 encode to handle multiline)
           echo "records=$(echo "$DNS_RECORDS" | base64 -w 0)" >> $GITHUB_OUTPUT
@@ -96,6 +102,10 @@ jobs:
           
           echo "Syncing DNS records to Pi-hole..."
           
+          RECORDS_PROCESSED=0
+          RECORDS_SUCCEEDED=0
+          RECORDS_FAILED=0
+          
           # Process each record
           while IFS= read -r record; do
             if [[ -z "$record" ]]; then
@@ -106,20 +116,20 @@ jobs:
             IPV4=$(echo "$record" | cut -d= -f1)
             HOSTNAME=$(echo "$record" | cut -d= -f2)
             
-            echo "Adding DNS record: $HOSTNAME -> $IPV4"
+            RECORDS_PROCESSED=$((RECORDS_PROCESSED + 1))
             
             # Add or update DNS record in Pi-hole using the custom DNS API
             # Pi-hole API endpoint: /admin/api.php?customdns&action=add
             RESPONSE=$(curl -s -w "\n%{http_code}" \
               -X POST \
-              "http://${PIHOLE_HOST}/admin/api.php?customdns&action=add&ip=${IPV4}&domain=${HOSTNAME}&token=${{ secrets.PRIMARY_PIHOLE_TOKEN }}")
+              "http://${PIHOLE_HOST}/admin/api.php?customdns&action=add&ip=${IPV4}&domain=${HOSTNAME}&token=${{ secrets.PRIMARY_PIHOLE_TOKEN }}" 2>&1)
             
             HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
             BODY=$(echo "$RESPONSE" | sed '$d')
             
+            # Don't log response body as it might contain sensitive info
             if [[ "$HTTP_CODE" != "200" ]]; then
-              echo "Warning: Failed to add DNS record for $HOSTNAME"
-              echo "HTTP Code: $HTTP_CODE"
+              RECORDS_FAILED=$((RECORDS_FAILED + 1))
               continue
             fi
             
@@ -127,14 +137,14 @@ jobs:
             if echo "$BODY" | jq -e '.success' >/dev/null 2>&1; then
               SUCCESS=$(echo "$BODY" | jq -r '.success')
               if [[ "$SUCCESS" == "true" ]]; then
-                echo "Successfully added/updated DNS record for $HOSTNAME"
+                RECORDS_SUCCEEDED=$((RECORDS_SUCCEEDED + 1))
               else
-                echo "Warning: API returned success=false for $HOSTNAME"
+                RECORDS_FAILED=$((RECORDS_FAILED + 1))
               fi
             else
-              echo "Successfully processed DNS record for $HOSTNAME"
+              RECORDS_SUCCEEDED=$((RECORDS_SUCCEEDED + 1))
             fi
             
           done <<< "$DNS_RECORDS"
           
-          echo "DNS sync complete"
+          echo "DNS sync complete: Processed $RECORDS_PROCESSED records, Succeeded: $RECORDS_SUCCEEDED, Failed: $RECORDS_FAILED"
