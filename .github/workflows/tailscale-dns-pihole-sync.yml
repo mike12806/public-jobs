@@ -72,13 +72,20 @@ jobs:
           # Validate the response is valid JSON
           if ! echo "$DEVICES" | jq -e . >/dev/null 2>&1; then
             echo "Error: Invalid response from Tailscale API"
+            # Only show first 200 chars to avoid leaking sensitive data
+            echo "Response preview: ${DEVICES:0:200}"
             exit 1
           fi
           
+          # Check if devices array exists and is not null
+          DEVICE_COUNT=$(echo "$DEVICES" | jq '(.devices // []) | length')
+          echo "Found $DEVICE_COUNT total devices in Tailscale"
+          
           # Filter devices that don't have tag:ci and extract IPv4 and hostname
           # Format: ip=hostname (one per line)
+          # Use // [] to provide an empty array if .devices is null
           DNS_RECORDS=$(echo "$DEVICES" | jq -r '
-            .devices[] |
+            (.devices // [])[] |
             select(.tags == null or (.tags | map(select(. == "tag:ci")) | length == 0)) |
             select(.addresses[]? | startswith("100.")) |
             (.addresses[] | select(startswith("100."))) as $ipv4 |
