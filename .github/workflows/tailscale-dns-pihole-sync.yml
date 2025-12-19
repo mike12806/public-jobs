@@ -34,13 +34,12 @@ jobs:
 
       - name: Get Tailscale DNS records
         id: tailscale_dns
+        env:
+          TAILNET: ${{ secrets.TS_ID }}
         run: |
-          # Get tailnet name from Tailscale status
-          # Extract the MagicDNS suffix (e.g., "tail402f58.ts.net") which is the correct format for the API
-          TAILNET=$(tailscale status --json | jq -r '.MagicDNSSuffix' | sed 's/\.$//')
-          
+          # Use the tailnet ID from secrets
           if [[ -z "$TAILNET" ]]; then
-            echo "Error: Could not determine tailnet name"
+            echo "Error: TS_ID secret is not set"
             exit 1
           fi
           
