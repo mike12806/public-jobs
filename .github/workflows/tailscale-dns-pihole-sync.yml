@@ -36,7 +36,8 @@ jobs:
         id: tailscale_dns
         run: |
           # Get tailnet name from Tailscale status
-          TAILNET=$(tailscale status --json | jq -r '.Self.DNSName' | sed 's/\.ts\.net\.$//' | sed 's/^[^.]*\.//')
+          # Extract the MagicDNS suffix (e.g., "tail402f58.ts.net") which is the correct format for the API
+          TAILNET=$(tailscale status --json | jq -r '.MagicDNSSuffix' | sed 's/\.$//')
           
           if [[ -z "$TAILNET" ]]; then
             echo "Error: Could not determine tailnet name"
