@@ -35,22 +35,6 @@ jobs:
       - name: Get Tailscale DNS records
         id: tailscale_dns
         run: |
-          # Get tailnet name from Tailscale status
-          TAILNET=$(tailscale status --json | jq -r '.Self.DNSName' | sed 's/\.ts\.net\.$//' | sed 's/^[^.]*\.//')
-          
-          if [[ -z "$TAILNET" ]]; then
-            echo "Error: Could not determine tailnet name"
-            exit 1
-          fi
-          
-          # Validate tailnet name format (should not be empty and should be valid)
-          if [[ ! "$TAILNET" =~ ^[a-zA-Z0-9._-]+$ ]]; then
-            echo "Error: Invalid tailnet name format"
-            exit 1
-          fi
-          
-          echo "Tailnet: $TAILNET"
-          
           # Get OAuth token for API calls
           TOKEN_RESPONSE=$(curl -s -X POST \
             -d "client_id=${{ secrets.TS_OAUTH_CLIENT_ID }}" \
@@ -65,9 +49,11 @@ jobs:
           fi
           
           # Get all devices in the tailnet
+          # Use "-" to represent the tailnet associated with the OAuth token
+          # This is the recommended approach per Tailscale API documentation
           DEVICES=$(curl -s \
             -H "Authorization: Bearer $ACCESS_TOKEN" \
-            "https://api.tailscale.com/api/v2/tailnet/$TAILNET/devices" 2>&1)
+            "https://api.tailscale.com/api/v2/tailnet/-/devices" 2>&1)
           
           # Validate the response is valid JSON
           if ! echo "$DEVICES" | jq -e . >/dev/null 2>&1; then
