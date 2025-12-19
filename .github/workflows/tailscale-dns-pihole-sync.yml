@@ -1,0 +1,140 @@
+name: Sync Tailscale DNS to Pi-hole
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/15 * * * *'  # every 15 minutes
+
+concurrency:
+  group: tailscale-dns-pihole-sync
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  sync-dns:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_CLIENT_SECRET }}
+          tags: tag:ci
+          hostname: github-runner-tailscale-dns-sync
+          version: latest
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq curl
+
+      - name: Get Tailscale DNS records
+        id: tailscale_dns
+        run: |
+          # Get tailnet name from Tailscale status
+          TAILNET=$(tailscale status --json | jq -r '.Self.DNSName' | sed 's/\.[^.]*$//' | cut -d. -f2-)
+          
+          if [[ -z "$TAILNET" ]]; then
+            echo "Error: Could not determine tailnet name"
+            exit 1
+          fi
+          
+          echo "Tailnet: $TAILNET"
+          
+          # Get OAuth token for API calls
+          TOKEN_RESPONSE=$(curl -s -u "${{ secrets.TS_OAUTH_CLIENT_ID }}:${{ secrets.TS_OAUTH_CLIENT_SECRET }}" \
+            -d "client_id=${{ secrets.TS_OAUTH_CLIENT_ID }}" \
+            -d "client_secret=${{ secrets.TS_OAUTH_CLIENT_SECRET }}" \
+            "https://api.tailscale.com/api/v2/oauth/token")
+          
+          ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.access_token')
+          
+          if [[ -z "$ACCESS_TOKEN" || "$ACCESS_TOKEN" == "null" ]]; then
+            echo "Error: Could not get OAuth access token"
+            exit 1
+          fi
+          
+          # Get all devices in the tailnet
+          DEVICES=$(curl -s \
+            -H "Authorization: Bearer $ACCESS_TOKEN" \
+            "https://api.tailscale.com/api/v2/tailnet/$TAILNET/devices")
+          
+          # Filter devices that don't have tag:ci and extract IPv4 and hostname
+          # Format: ip=hostname (one per line)
+          DNS_RECORDS=$(echo "$DEVICES" | jq -r '
+            .devices[] |
+            select(.tags == null or (.tags | map(select(. == "tag:ci")) | length == 0)) |
+            select(.addresses[]? | startswith("100.")) |
+            (.addresses[] | select(startswith("100."))) as $ipv4 |
+            ($ipv4 + "=" + .hostname)
+          ' | sort -u)
+          
+          if [[ -z "$DNS_RECORDS" ]]; then
+            echo "No DNS records found (excluding tag:ci devices)"
+            echo "records=" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          echo "Found DNS records:"
+          echo "$DNS_RECORDS"
+          
+          # Save records to output (base64 encode to handle multiline)
+          echo "records=$(echo "$DNS_RECORDS" | base64 -w 0)" >> $GITHUB_OUTPUT
+
+      - name: Sync DNS records to Pi-hole
+        if: steps.tailscale_dns.outputs.records != ''
+        run: |
+          # Decode the DNS records
+          DNS_RECORDS=$(echo "${{ steps.tailscale_dns.outputs.records }}" | base64 -d)
+          
+          # Parse PRIMARY_PIHOLE_IP_AND_PORT to extract IP and port
+          PIHOLE_HOST="${{ secrets.PRIMARY_PIHOLE_IP_AND_PORT }}"
+          
+          echo "Syncing DNS records to Pi-hole..."
+          
+          # Process each record
+          while IFS= read -r record; do
+            if [[ -z "$record" ]]; then
+              continue
+            fi
+            
+            # Split record into IP and hostname
+            IPV4=$(echo "$record" | cut -d= -f1)
+            HOSTNAME=$(echo "$record" | cut -d= -f2)
+            
+            echo "Adding DNS record: $HOSTNAME -> $IPV4"
+            
+            # Add or update DNS record in Pi-hole using the custom DNS API
+            # Pi-hole API endpoint: /admin/api.php?customdns&action=add
+            RESPONSE=$(curl -s -w "\n%{http_code}" \
+              -X POST \
+              "http://${PIHOLE_HOST}/admin/api.php?customdns&action=add&ip=${IPV4}&domain=${HOSTNAME}&token=${{ secrets.PRIMARY_PIHOLE_TOKEN }}")
+            
+            HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+            BODY=$(echo "$RESPONSE" | sed '$d')
+            
+            if [[ "$HTTP_CODE" != "200" ]]; then
+              echo "Warning: Failed to add DNS record for $HOSTNAME"
+              echo "HTTP Code: $HTTP_CODE"
+              continue
+            fi
+            
+            # Check if the response indicates success
+            if echo "$BODY" | jq -e '.success' >/dev/null 2>&1; then
+              SUCCESS=$(echo "$BODY" | jq -r '.success')
+              if [[ "$SUCCESS" == "true" ]]; then
+                echo "Successfully added/updated DNS record for $HOSTNAME"
+              else
+                echo "Warning: API returned success=false for $HOSTNAME"
+              fi
+            else
+              echo "Successfully processed DNS record for $HOSTNAME"
+            fi
+            
+          done <<< "$DNS_RECORDS"
+          
+          echo "DNS sync complete"
