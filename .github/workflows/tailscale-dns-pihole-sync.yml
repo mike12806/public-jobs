@@ -35,22 +35,6 @@ jobs:
       - name: Get Tailscale DNS records
         id: tailscale_dns
         run: |
-          # Get tailnet name from Tailscale status
-          TAILNET=$(tailscale status --json | jq -r '.Self.DNSName' | sed 's/\.ts\.net\.$//' | sed 's/^[^.]*\.//')
-          
-          if [[ -z "$TAILNET" ]]; then
-            echo "Error: Could not determine tailnet name"
-            exit 1
-          fi
-          
-          # Validate tailnet name format (should not be empty and should be valid)
-          if [[ ! "$TAILNET" =~ ^[a-zA-Z0-9._-]+$ ]]; then
-            echo "Error: Invalid tailnet name format"
-            exit 1
-          fi
-          
-          echo "Tailnet: $TAILNET"
-          
           # Get OAuth token for API calls
           TOKEN_RESPONSE=$(curl -s -X POST \
             -d "client_id=${{ secrets.TS_OAUTH_CLIENT_ID }}" \
@@ -65,9 +49,11 @@ jobs:
           fi
           
           # Get all devices in the tailnet
+          # Use "-" to represent the tailnet associated with the OAuth token
+          # This is the recommended approach per Tailscale API documentation
           DEVICES=$(curl -s \
             -H "Authorization: Bearer $ACCESS_TOKEN" \
-            "https://api.tailscale.com/api/v2/tailnet/$TAILNET/devices" 2>&1)
+            "https://api.tailscale.com/api/v2/tailnet/-/devices" 2>&1)
           
           # Validate the response is valid JSON
           if ! echo "$DEVICES" | jq -e . >/dev/null 2>&1; then
@@ -81,15 +67,17 @@ jobs:
           DEVICE_COUNT=$(echo "$DEVICES" | jq '(.devices // []) | length')
           echo "Found $DEVICE_COUNT total devices in Tailscale"
           
-          # Filter devices that don't have tag:ci and extract IPv4 and hostname
-          # Format: ip=hostname (one per line)
+          # Filter devices that don't have tag:ci and extract IPv4 and MagicDNS name
+          # Format: ip=magicdns_name (one per line)
+          # Use .name for the full MagicDNS name (e.g., tailscale-lxc-2.tail402f58.ts.net)
+          # instead of .hostname which is just the short name
           # Use // [] to provide an empty array if .devices is null
           DNS_RECORDS=$(echo "$DEVICES" | jq -r '
             (.devices // [])[] |
             select(.tags == null or (.tags | map(select(. == "tag:ci")) | length == 0)) |
             select(.addresses[]? | startswith("100.")) |
             (.addresses[] | select(startswith("100."))) as $ipv4 |
-            ($ipv4 + "=" + .hostname)
+            ($ipv4 + "=" + .name)
           ' | sort -u)
           
           if [[ -z "$DNS_RECORDS" ]]; then
@@ -110,9 +98,37 @@ jobs:
           # Decode the DNS records
           DNS_RECORDS=$(echo "${{ steps.tailscale_dns.outputs.records }}" | base64 -d)
           
-          # Parse PRIMARY_PIHOLE_IP_AND_PORT to extract IP and port
+          # Pi-hole host and password
           PIHOLE_HOST="${{ secrets.PRIMARY_PIHOLE_IP_AND_PORT }}"
+          PIHOLE_PASSWORD="${{ secrets.PRIMARY_PIHOLE_TOKEN }}"
           
+          echo "Authenticating with Pi-hole v6..."
+          
+          # Pi-hole v6 uses session-based authentication
+          # First, authenticate to get a session ID (SID)
+          AUTH_RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d "{\"password\":\"${PIHOLE_PASSWORD}\"}" \
+            "http://${PIHOLE_HOST}/api/auth" 2>&1)
+          
+          AUTH_HTTP_CODE=$(echo "$AUTH_RESPONSE" | tail -n1)
+          AUTH_BODY=$(echo "$AUTH_RESPONSE" | sed '$d')
+          
+          if [[ "$AUTH_HTTP_CODE" != "200" ]]; then
+            echo "Error: Failed to authenticate with Pi-hole (HTTP $AUTH_HTTP_CODE)"
+            exit 1
+          fi
+          
+          # Extract session ID from response
+          SESSION_ID=$(echo "$AUTH_BODY" | jq -r '.session.sid // empty')
+          
+          if [[ -z "$SESSION_ID" ]]; then
+            echo "Error: Could not get session ID from Pi-hole"
+            exit 1
+          fi
+          
+          echo "Successfully authenticated with Pi-hole v6"
           echo "Syncing DNS records to Pi-hole..."
           
           RECORDS_PROCESSED=0
@@ -125,45 +141,59 @@ jobs:
               continue
             fi
             
-            # Split record into IP and hostname
+            # Split record into IP and MagicDNS name
             IPV4=$(echo "$record" | cut -d= -f1)
             HOSTNAME=$(echo "$record" | cut -d= -f2)
             
             RECORDS_PROCESSED=$((RECORDS_PROCESSED + 1))
             
-            # Add or update DNS record in Pi-hole v6 using the new REST API
-            # Pi-hole v6 uses /api/dns/custom endpoint with JSON payload
-            # Using -s flag and 2>&1 redirection ensures token is never logged
+            # Add DNS record in Pi-hole v6 using the REST API
+            # Pi-hole v6 uses PUT to /api/config/dns/hosts/{item} to add individual DNS records
+            # URL-encode the entry (IP space HOSTNAME) for the URL path
+            DNS_ENTRY="${IPV4} ${HOSTNAME}"
+            ENCODED_ENTRY=$(echo -n "$DNS_ENTRY" | jq -sRr @uri)
+            
             RESPONSE=$(curl -s -w "\n%{http_code}" \
-              -X POST \
+              -X PUT \
               -H "Content-Type: application/json" \
-              -H "Authorization: Bearer ${{ secrets.PRIMARY_PIHOLE_TOKEN }}" \
-              -d "{\"domain\":\"${HOSTNAME}\",\"ip\":\"${IPV4}\"}" \
-              "http://${PIHOLE_HOST}/api/dns/custom" 2>&1)
+              -H "X-FTL-SID: ${SESSION_ID}" \
+              "http://${PIHOLE_HOST}/api/config/dns/hosts/${ENCODED_ENTRY}" 2>&1)
             
             HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
             BODY=$(echo "$RESPONSE" | sed '$d')
             
-            # Don't log response body as it might contain sensitive info
-            # Pi-hole v6 returns 200 for success, 409 if record already exists (which we treat as success)
-            if [[ "$HTTP_CODE" != "200" ]] && [[ "$HTTP_CODE" != "201" ]] && [[ "$HTTP_CODE" != "409" ]]; then
-              RECORDS_FAILED=$((RECORDS_FAILED + 1))
-              continue
-            fi
-            
-            # Check if the response indicates success
-            # Pi-hole v6 returns proper HTTP status codes
-            SUCCESS_DETECTED=false
-            if [[ "$HTTP_CODE" == "200" ]] || [[ "$HTTP_CODE" == "201" ]] || [[ "$HTTP_CODE" == "409" ]]; then
-              SUCCESS_DETECTED=true
-            fi
-            
-            if [[ "$SUCCESS_DETECTED" == "true" ]]; then
+            # Pi-hole v6 returns 200/201 for success, check if already exists is ok
+            if [[ "$HTTP_CODE" == "200" ]] || [[ "$HTTP_CODE" == "201" ]] || [[ "$HTTP_CODE" == "204" ]]; then
               RECORDS_SUCCEEDED=$((RECORDS_SUCCEEDED + 1))
             else
-              RECORDS_FAILED=$((RECORDS_FAILED + 1))
+              # Check if it failed because entry already exists (which is fine)
+              if echo "$BODY" | jq -e '.error' >/dev/null 2>&1; then
+                ERROR_MSG=$(echo "$BODY" | jq -r '.error // ""')
+                if [[ "$ERROR_MSG" == *"already"* ]] || [[ "$ERROR_MSG" == *"exists"* ]] || [[ "$ERROR_MSG" == *"duplicate"* ]]; then
+                  RECORDS_SUCCEEDED=$((RECORDS_SUCCEEDED + 1))
+                else
+                  RECORDS_FAILED=$((RECORDS_FAILED + 1))
+                fi
+              else
+                RECORDS_FAILED=$((RECORDS_FAILED + 1))
+              fi
             fi
             
           done <<< "$DNS_RECORDS"
           
+          # Logout from Pi-hole session
+          LOGOUT_RESPONSE=$(curl -s -w "\n%{http_code}" -X DELETE \
+            -H "X-FTL-SID: ${SESSION_ID}" \
+            "http://${PIHOLE_HOST}/api/auth" 2>&1)
+          LOGOUT_CODE=$(echo "$LOGOUT_RESPONSE" | tail -n1)
+          if [[ "$LOGOUT_CODE" != "200" ]] && [[ "$LOGOUT_CODE" != "204" ]]; then
+            echo "Warning: Failed to logout from Pi-hole session (HTTP $LOGOUT_CODE)"
+          fi
+          
           echo "DNS sync complete: Processed $RECORDS_PROCESSED records, Succeeded: $RECORDS_SUCCEEDED, Failed: $RECORDS_FAILED"
+          
+          # Fail the job if all records failed
+          if [[ "$RECORDS_FAILED" -gt 0 ]] && [[ "$RECORDS_SUCCEEDED" -eq 0 ]]; then
+            echo "Error: All records failed to sync"
+            exit 1
+          fi
