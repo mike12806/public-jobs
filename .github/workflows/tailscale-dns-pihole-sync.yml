@@ -135,22 +135,12 @@ jobs:
           RECORDS_SUCCEEDED=0
           RECORDS_FAILED=0
           
-          # Process each record
-          while IFS= read -r record; do
-            if [[ -z "$record" ]]; then
-              continue
-            fi
+          # Function to add a DNS record to Pi-hole
+          add_dns_record() {
+            local ip="$1"
+            local hostname="$2"
             
-            # Split record into IP and MagicDNS name
-            IPV4=$(echo "$record" | cut -d= -f1)
-            HOSTNAME=$(echo "$record" | cut -d= -f2)
-            
-            RECORDS_PROCESSED=$((RECORDS_PROCESSED + 1))
-            
-            # Add DNS record in Pi-hole v6 using the REST API
-            # Pi-hole v6 uses PUT to /api/config/dns/hosts/{item} to add individual DNS records
-            # URL-encode the entry (IP space HOSTNAME) for the URL path
-            DNS_ENTRY="${IPV4} ${HOSTNAME}"
+            DNS_ENTRY="${ip} ${hostname}"
             ENCODED_ENTRY=$(echo -n "$DNS_ENTRY" | jq -sRr @uri)
             
             RESPONSE=$(curl -s -w "\n%{http_code}" \
@@ -164,19 +154,46 @@ jobs:
             
             # Pi-hole v6 returns 200/201 for success, check if already exists is ok
             if [[ "$HTTP_CODE" == "200" ]] || [[ "$HTTP_CODE" == "201" ]] || [[ "$HTTP_CODE" == "204" ]]; then
-              RECORDS_SUCCEEDED=$((RECORDS_SUCCEEDED + 1))
+              return 0
             else
               # Check if it failed because entry already exists (which is fine)
               if echo "$BODY" | jq -e '.error' >/dev/null 2>&1; then
                 ERROR_MSG=$(echo "$BODY" | jq -r '.error // ""')
                 if [[ "$ERROR_MSG" == *"already"* ]] || [[ "$ERROR_MSG" == *"exists"* ]] || [[ "$ERROR_MSG" == *"duplicate"* ]]; then
-                  RECORDS_SUCCEEDED=$((RECORDS_SUCCEEDED + 1))
-                else
-                  RECORDS_FAILED=$((RECORDS_FAILED + 1))
+                  return 0
                 fi
-              else
-                RECORDS_FAILED=$((RECORDS_FAILED + 1))
               fi
+              return 1
+            fi
+          }
+          
+          # Process each record
+          while IFS= read -r record; do
+            if [[ -z "$record" ]]; then
+              continue
+            fi
+            
+            # Split record into IP and MagicDNS name
+            IPV4=$(echo "$record" | cut -d= -f1)
+            FULL_HOSTNAME=$(echo "$record" | cut -d= -f2)
+            
+            # Extract short hostname (first part before the first dot)
+            SHORT_HOSTNAME=$(echo "$FULL_HOSTNAME" | cut -d. -f1)
+            
+            # Add DNS record for full MagicDNS name (e.g., tailscale-lxc-2.tail402f58.ts.net)
+            RECORDS_PROCESSED=$((RECORDS_PROCESSED + 1))
+            if add_dns_record "$IPV4" "$FULL_HOSTNAME"; then
+              RECORDS_SUCCEEDED=$((RECORDS_SUCCEEDED + 1))
+            else
+              RECORDS_FAILED=$((RECORDS_FAILED + 1))
+            fi
+            
+            # Add DNS record for short hostname (e.g., tailscale-lxc-2)
+            RECORDS_PROCESSED=$((RECORDS_PROCESSED + 1))
+            if add_dns_record "$IPV4" "$SHORT_HOSTNAME"; then
+              RECORDS_SUCCEEDED=$((RECORDS_SUCCEEDED + 1))
+            else
+              RECORDS_FAILED=$((RECORDS_FAILED + 1))
             fi
             
           done <<< "$DNS_RECORDS"
