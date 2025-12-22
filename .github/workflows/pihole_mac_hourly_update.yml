@@ -1,4 +1,4 @@
-name: Hourly Pihole Update Check
+name: Hourly Mac Pihole Update Check
 
 on:
   schedule:
