@@ -146,17 +146,36 @@ jobs:
           async def truenas_call(url, token, method, params):
               """Call TrueNAS API via WebSocket with proper JSON-RPC 2.0 authentication"""
               try:
-                  # Create headers dictionary for authentication
-                  headers = {"Authorization": f"Bearer {token}"}
-                  
                   # Debug output
                   print(f"Connecting to: {url}", file=sys.stderr)
                   print(f"Method: {method}", file=sys.stderr)
                   print(f"Params: {params}", file=sys.stderr)
                   
-                  async with websockets.connect(url, additional_headers=headers) as websocket:
-                      # TrueNAS uses standard JSON-RPC 2.0 format
-                      # Format: {"jsonrpc": "2.0", "method": "method_name", "params": [...], "id": 1}
+                  # Connect without auth headers - TrueNAS requires login via API call
+                  async with websockets.connect(url) as websocket:
+                      # First, authenticate using auth.login_with_api_key
+                      auth_request = {
+                          "jsonrpc": "2.0",
+                          "method": "auth.login_with_api_key",
+                          "params": [token],
+                          "id": "auth"
+                      }
+                      
+                      print(f"Authenticating...", file=sys.stderr)
+                      await websocket.send(json.dumps(auth_request))
+                      
+                      # Wait for auth response
+                      auth_response = await asyncio.wait_for(websocket.recv(), timeout=10.0)
+                      print(f"Auth response: {auth_response[:200]}", file=sys.stderr)
+                      
+                      auth_json = json.loads(auth_response)
+                      if "error" in auth_json:
+                          print(f"Authentication failed: {json.dumps(auth_json['error'])}", file=sys.stderr)
+                          return json.dumps(auth_json)
+                      
+                      print(f"Authentication successful", file=sys.stderr)
+                      
+                      # Now make the actual API call
                       request = {
                           "jsonrpc": "2.0",
                           "method": method,
@@ -168,7 +187,6 @@ jobs:
                       await websocket.send(json.dumps(request))
                       
                       # Wait for response with timeout
-                      # TrueNAS sends back a JSON-RPC 2.0 response with matching id
                       try:
                           response = await asyncio.wait_for(websocket.recv(), timeout=30.0)
                           print(f"Received response (len={len(response)}): {response[:500]}", file=sys.stderr)
