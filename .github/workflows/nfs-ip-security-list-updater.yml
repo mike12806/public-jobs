@@ -182,14 +182,8 @@ jobs:
           
           API_KEY="${{ secrets.TRUENAS_API_KEY }}"
           
-          echo "Connecting to: $API_URI"
-          
           # Call TrueNAS API using official client
           RESPONSE=$(python3 /tmp/truenas_api.py "$API_URI" "$API_KEY" "sharing.nfs.query" "[]")
-          
-          echo "Response received"
-          echo "Raw response length: ${#RESPONSE}"
-          echo "First 200 chars: ${RESPONSE:0:200}"
           
           # Check if response is valid JSON
           if ! echo "$RESPONSE" | jq -e . >/dev/null 2>&1; then
