@@ -150,9 +150,10 @@ jobs:
                   headers = {"Authorization": f"Bearer {token}"}
                   
                   async with websockets.connect(url, additional_headers=headers) as websocket:
-                      # Send JSON-RPC request
+                      # TrueNAS expects simple JSON-RPC format with msg property
+                      # Format: {"msg": "method", "method": "method_name", "params": [...], "id": "id"}
                       request = {
-                          "jsonrpc": "2.0",
+                          "msg": "method",
                           "method": method,
                           "params": params,
                           "id": "api-call-1"
