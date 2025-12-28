@@ -126,22 +126,10 @@ jobs:
       - name: Get all NFS share IDs from TrueNAS
         id: get_share_ids
         run: |
-          # Get NFS shares from TrueNAS JSON-RPC API
-          JSON_PAYLOAD=$(jq -n \
-            --arg method "sharing.nfs.query" \
-            '{
-              "jsonrpc": "2.0",
-              "method": $method,
-              "params": [],
-              "id": 1
-            }')
-          
+          # Get NFS shares from TrueNAS API
           RESPONSE=$(curl -sk -w "\n%{http_code}" \
-            -X POST \
-            -H "Content-Type: application/json" \
             -H "Authorization: Bearer ${{ secrets.TRUENAS_API_KEY }}" \
-            -d "$JSON_PAYLOAD" \
-            "${{ secrets.TRUENAS_API_URL }}/api/v2.0/_call")
+            "${{ secrets.TRUENAS_API_URL }}/api/v2.0/sharing/nfs")
           
           HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
           BODY=$(echo "$RESPONSE" | sed '$d')
@@ -153,8 +141,8 @@ jobs:
             exit 1
           fi
           
-          # Parse share IDs from JSON-RPC response (result field contains the array)
-          SHARE_IDS=$(echo "$BODY" | jq -r '.result[].id' | paste -sd, -)
+          # Parse share IDs and convert to comma-separated list
+          SHARE_IDS=$(echo "$BODY" | jq -r '.[].id' | paste -sd, -)
           if [[ -z "$SHARE_IDS" ]]; then
             echo "No NFS shares found"
             echo "Response: $BODY"
@@ -173,25 +161,10 @@ jobs:
             # Skip empty IDs
             [[ -z "$ID" ]] && continue
 
-            # Get current share configuration using JSON-RPC API
-            GET_PAYLOAD=$(jq -n \
-              --argjson id "$ID" \
-              '{
-                "jsonrpc": "2.0",
-                "method": "sharing.nfs.get_instance",
-                "params": [$id],
-                "id": 2
-              }')
-            
-            SHARE_RESPONSE=$(curl -sk \
-              -X POST \
-              -H "Content-Type: application/json" \
+            # Get current share configuration
+            SHARE_CONFIG=$(curl -sk \
               -H "Authorization: Bearer ${{ secrets.TRUENAS_API_KEY }}" \
-              -d "$GET_PAYLOAD" \
-              "${{ secrets.TRUENAS_API_URL }}/api/v2.0/_call")
-            
-            # Extract result from JSON-RPC response
-            SHARE_CONFIG=$(echo "$SHARE_RESPONSE" | jq -r '.result')
+              "${{ secrets.TRUENAS_API_URL }}/api/v2.0/sharing/nfs/id/$ID")
             
             # Validate the share configuration
             if ! echo "$SHARE_CONFIG" | jq -e . >/dev/null 2>&1; then
@@ -221,7 +194,7 @@ jobs:
             echo "Updating NFS share ID: $ID with IPs: $HOSTS_JSON"
             
             # Create properly formatted JSON payload
-            UPDATE_DATA=$(jq -n \
+            PAYLOAD=$(jq -n \
               --arg path "$PATHS" \
               --argjson hosts "$HOSTS_JSON" \
               '{
@@ -230,24 +203,14 @@ jobs:
                 "enabled": true
               }')
 
-            # Create JSON-RPC request payload
-            UPDATE_PAYLOAD=$(jq -n \
-              --argjson id "$ID" \
-              --argjson data "$UPDATE_DATA" \
-              '{
-                "jsonrpc": "2.0",
-                "method": "sharing.nfs.update",
-                "params": [$id, $data],
-                "id": 3
-              }')
-
-            # Make the JSON-RPC API request
+            # Make the API request
+            
             RESPONSE=$(curl -sk -w "\n%{http_code}" \
-              -X POST \
+              -X PUT \
               -H "Content-Type: application/json" \
               -H "Authorization: Bearer ${{ secrets.TRUENAS_API_KEY }}" \
-              -d "$UPDATE_PAYLOAD" \
-              "${{ secrets.TRUENAS_API_URL }}/api/v2.0/_call")
+              -d "$PAYLOAD" \
+              "${{ secrets.TRUENAS_API_URL }}/api/v2.0/sharing/nfs/id/$ID")
             
             HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
             BODY=$(echo "$RESPONSE" | sed '$d')
