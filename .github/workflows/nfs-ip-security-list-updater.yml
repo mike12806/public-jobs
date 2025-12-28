@@ -203,11 +203,14 @@ jobs:
           RESPONSE=$(python3 /tmp/truenas_ws.py "$WS_URL" "$API_KEY" "sharing.nfs.query" "[]" 2>&1)
           
           echo "Response received"
+          echo "Raw response: $RESPONSE"
           
           # Check if response is valid JSON
           if ! echo "$RESPONSE" | jq -e . >/dev/null 2>&1; then
             echo "Error: Invalid JSON response"
             echo "Response: $RESPONSE"
+            echo "Response length: ${#RESPONSE}"
+            echo "First 100 chars: ${RESPONSE:0:100}"
             exit 1
           fi
           
