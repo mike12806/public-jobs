@@ -39,17 +39,10 @@ jobs:
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq curl python3 python3-pip
-          # Remove old websockets package if installed via apt
-          sudo apt-get remove -y python3-websockets 2>/dev/null || true
-          # Install Python websocket client (latest version for extra_headers support)
-          # Force reinstall to ensure we get the latest version
-          sudo pip3 install --force-reinstall --upgrade websockets
+          # Install official TrueNAS API client
+          sudo pip3 install --upgrade truenas_api_client
           # Verify installation
-          python3 -c "import websockets; print(f'websockets version: {websockets.__version__}')"
-          # Install websocat for WebSocket communication (backup)
-          wget -qO /tmp/websocat https://github.com/vi/websocat/releases/download/v1.13.0/websocat.x86_64-unknown-linux-musl
-          chmod +x /tmp/websocat
-          sudo mv /tmp/websocat /usr/local/bin/websocat
+          python3 -c "import truenas_api_client; print(f'truenas_api_client installed successfully')"
 
       - name: Setup kubectl
         uses: azure/setup-kubectl@v4
@@ -134,126 +127,58 @@ jobs:
           echo "Combined IPs: $ALL_IPS"
           echo "ips=$ALL_IPS" >> $GITHUB_OUTPUT
 
-      - name: Create TrueNAS WebSocket helper script
+      - name: Create TrueNAS API helper script
         run: |
-          cat > /tmp/truenas_ws.py << 'PYEOF'
+          cat > /tmp/truenas_api.py << 'PYEOF'
           #!/usr/bin/env python3
-          import asyncio
-          import websockets
+          """Simple wrapper around truenas_api_client for shell usage"""
           import json
           import sys
-
-          async def truenas_call(url, token, method, params):
-              """Call TrueNAS API via WebSocket with proper JSON-RPC 2.0 authentication"""
-              try:
-                  # Debug output
-                  print(f"Connecting to: {url}", file=sys.stderr)
-                  print(f"Method: {method}", file=sys.stderr)
-                  print(f"Params: {params}", file=sys.stderr)
-                  
-                  # Connect to TrueNAS WebSocket (no auth headers needed)
-                  async with websockets.connect(url) as websocket:
-                      # First, authenticate using auth.login_with_api_key as a normal method call
-                      auth_request = {
-                          "jsonrpc": "2.0",
-                          "method": "auth.login_with_api_key",
-                          "params": [token],
-                          "id": "auth"
-                      }
-                      
-                      print(f"Authenticating with API key...", file=sys.stderr)
-                      await websocket.send(json.dumps(auth_request))
-                      
-                      # Wait for auth response
-                      auth_response = await asyncio.wait_for(websocket.recv(), timeout=10.0)
-                      print(f"Auth response: {auth_response[:500]}", file=sys.stderr)
-                      
-                      auth_json = json.loads(auth_response)
-                      if "error" in auth_json:
-                          print(f"Authentication failed: {json.dumps(auth_json['error'])}", file=sys.stderr)
-                          return json.dumps(auth_json)
-                      
-                      # Check if auth was successful
-                      if not auth_json.get("result"):
-                          error_msg = "Authentication returned False - invalid API key"
-                          print(f"Error: {error_msg}", file=sys.stderr)
-                          return json.dumps({"error": error_msg})
-                      
-                      print(f"Authentication successful", file=sys.stderr)
-                      
-                      # Now make the actual API call
-                      request = {
-                          "jsonrpc": "2.0",
-                          "method": method,
-                          "params": params,
-                          "id": 1
-                      }
-                      
-                      print(f"Sending API request: {json.dumps(request)}", file=sys.stderr)
-                      await websocket.send(json.dumps(request))
-                      
-                      # Wait for response with timeout
-                      try:
-                          response = await asyncio.wait_for(websocket.recv(), timeout=30.0)
-                          print(f"Received response (len={len(response)}): {response[:500]}", file=sys.stderr)
-                          
-                          response_json = json.loads(response)
-                          
-                          # Check for JSON-RPC error in response
-                          if "error" in response_json:
-                              print(f"JSON-RPC Error: {json.dumps(response_json['error'])}", file=sys.stderr)
-                              return json.dumps(response_json)
-                          
-                          # Verify this is our response
-                          if response_json.get("id") == 1 and "result" in response_json:
-                              return response
-                          else:
-                              print(f"Unexpected response format: {response[:200]}", file=sys.stderr)
-                              return response
-                              
-                      except asyncio.TimeoutError:
-                          error_msg = "Timeout waiting for response from TrueNAS"
-                          print(f"Error: {error_msg}", file=sys.stderr)
-                          return json.dumps({"error": error_msg})
-                      
-              except Exception as e:
-                  print(f"Error: {e}", file=sys.stderr)
-                  import traceback
-                  traceback.print_exc(file=sys.stderr)
-                  return json.dumps({"error": str(e)})
+          from truenas_api_client import Client
 
           if __name__ == "__main__":
               if len(sys.argv) < 4:
-                  print("Usage: truenas_ws.py <ws_url> <token> <method> [params_json]", file=sys.stderr)
+                  print("Usage: truenas_api.py <uri> <api_key> <method> [params_json]", file=sys.stderr)
                   sys.exit(1)
               
-              url = sys.argv[1]
-              token = sys.argv[2]
+              uri = sys.argv[1]
+              api_key = sys.argv[2]
               method = sys.argv[3]
               params = json.loads(sys.argv[4]) if len(sys.argv) > 4 else []
               
-              response = asyncio.run(truenas_call(url, token, method, params))
-              print(response)
+              try:
+                  with Client(uri=uri) as c:
+                      # Authenticate with API key
+                      if not c.call("auth.login_with_api_key", api_key):
+                          print(json.dumps({"error": "Authentication failed - invalid API key"}))
+                          sys.exit(1)
+                      
+                      # Make the API call
+                      result = c.call(method, *params)
+                      print(json.dumps({"jsonrpc": "2.0", "result": result, "id": 1}))
+              except Exception as e:
+                  print(json.dumps({"error": str(e)}), file=sys.stderr)
+                  sys.exit(1)
           PYEOF
           
-          chmod +x /tmp/truenas_ws.py
+          chmod +x /tmp/truenas_api.py
 
       - name: Get all NFS share IDs from TrueNAS
         id: get_share_ids
         run: |
-          # Get NFS shares from TrueNAS JSON-RPC API over WebSocket
-          # Convert HTTP(S) URL to WebSocket URL (use /api/current not /websocket)
-          WS_URL="${{ secrets.TRUENAS_API_URL }}"
-          WS_URL="${WS_URL/http:/ws:}"
-          WS_URL="${WS_URL/https:/wss:}"
-          WS_URL="${WS_URL}/api/current"
+          # Get NFS shares from TrueNAS API
+          # Convert HTTP(S) URL to WebSocket URI with /api/current endpoint
+          API_URI="${{ secrets.TRUENAS_API_URL }}"
+          API_URI="${API_URI/http:/ws:}"
+          API_URI="${API_URI/https:/wss:}"
+          API_URI="${API_URI}/api/current"
           
           API_KEY="${{ secrets.TRUENAS_API_KEY }}"
           
-          echo "Connecting to WebSocket: $WS_URL"
+          echo "Connecting to: $API_URI"
           
-          # Call TrueNAS API using Python helper (stderr goes to console, stdout is response)
-          RESPONSE=$(python3 /tmp/truenas_ws.py "$WS_URL" "$API_KEY" "sharing.nfs.query" "[]")
+          # Call TrueNAS API using official client
+          RESPONSE=$(python3 /tmp/truenas_api.py "$API_URI" "$API_KEY" "sharing.nfs.query" "[]")
           
           echo "Response received"
           echo "Raw response length: ${#RESPONSE}"
@@ -285,11 +210,11 @@ jobs:
 
       - name: Patch NFS shares with new IPs
         run: |
-          # Convert HTTP(S) URL to WebSocket URL (use /api/current not /websocket)
-          WS_URL="${{ secrets.TRUENAS_API_URL }}"
-          WS_URL="${WS_URL/http:/ws:}"
-          WS_URL="${WS_URL/https:/wss:}"
-          WS_URL="${WS_URL}/api/current"
+          # Convert HTTP(S) URL to WebSocket URI with /api/current endpoint
+          API_URI="${{ secrets.TRUENAS_API_URL }}"
+          API_URI="${API_URI/http:/ws:}"
+          API_URI="${API_URI/https:/wss:}"
+          API_URI="${API_URI}/api/current"
           
           API_KEY="${{ secrets.TRUENAS_API_KEY }}"
           
@@ -303,9 +228,9 @@ jobs:
 
             echo "Processing NFS share ID: $ID"
 
-            # Get current share configuration using Python helper
+            # Get current share configuration using official client
             echo "Getting config for share $ID"
-            SHARE_RESPONSE=$(python3 /tmp/truenas_ws.py "$WS_URL" "$API_KEY" "sharing.nfs.get_instance" "[${ID}]")
+            SHARE_RESPONSE=$(python3 /tmp/truenas_api.py "$API_URI" "$API_KEY" "sharing.nfs.get_instance" "[${ID}]")
             
             # Validate the share configuration
             if ! echo "$SHARE_RESPONSE" | jq -e . >/dev/null 2>&1; then
@@ -359,7 +284,7 @@ jobs:
             UPDATE_PARAMS=$(jq -n --argjson id "$ID" --argjson data "$UPDATE_DATA" '[$id, $data]')
             
             echo "Sending update request for share $ID"
-            UPDATE_RESPONSE=$(python3 /tmp/truenas_ws.py "$WS_URL" "$API_KEY" "sharing.nfs.update" "$UPDATE_PARAMS")
+            UPDATE_RESPONSE=$(python3 /tmp/truenas_api.py "$API_URI" "$API_KEY" "sharing.nfs.update" "$UPDATE_PARAMS")
             
             # Validate response
             if ! echo "$UPDATE_RESPONSE" | jq -e . >/dev/null 2>&1; then
