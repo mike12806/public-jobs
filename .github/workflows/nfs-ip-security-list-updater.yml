@@ -36,7 +36,8 @@ jobs:
           version: latest
 
       - name: Install dependencies
-        run: |\n          sudo apt-get update -y
+        run: |
+          sudo apt-get update -y
           sudo apt-get install -y jq curl python3 python3-pip
           # Install official TrueNAS API client from GitHub
           sudo pip3 install --upgrade git+https://github.com/truenas/api_client.git
