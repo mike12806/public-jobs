@@ -150,7 +150,15 @@ jobs:
           echo "Sending: $JSON_PAYLOAD"
           
           # Send request over WebSocket and get response
+          # Note: websocat stderr only contains connection errors, not auth headers
           RESPONSE=$(echo "$JSON_PAYLOAD" | websocat -n1 -H="Authorization: Bearer ${{ secrets.TRUENAS_API_KEY }}" "$WS_URL" 2>&1)
+          
+          # Check if websocat connection failed
+          if [[ "$RESPONSE" == *"error"* ]] && [[ "$RESPONSE" != *"jsonrpc"* ]]; then
+            echo "WebSocket connection error"
+            echo "Failed to connect to: $WS_URL"
+            exit 1
+          fi
           
           echo "Response: $RESPONSE"
           
@@ -207,7 +215,15 @@ jobs:
               }')
             
             echo "Getting config for share $ID"
+            # Note: websocat stderr only contains connection errors, not auth headers
             SHARE_RESPONSE=$(echo "$GET_PAYLOAD" | websocat -n1 -H="Authorization: Bearer ${{ secrets.TRUENAS_API_KEY }}" "$WS_URL" 2>&1)
+            
+            # Check if websocat connection failed
+            if [[ "$SHARE_RESPONSE" == *"error"* ]] && [[ "$SHARE_RESPONSE" != *"jsonrpc"* ]]; then
+              echo "WebSocket connection error for share $ID"
+              echo "Failed to connect to: $WS_URL"
+              exit 1
+            fi
             
             # Validate the share configuration
             if ! echo "$SHARE_RESPONSE" | jq -e . >/dev/null 2>&1; then
@@ -269,7 +285,15 @@ jobs:
 
             # Make the JSON-RPC API request over WebSocket
             echo "Sending update request for share $ID"
+            # Note: websocat stderr only contains connection errors, not auth headers
             UPDATE_RESPONSE=$(echo "$UPDATE_PAYLOAD" | websocat -n1 -H="Authorization: Bearer ${{ secrets.TRUENAS_API_KEY }}" "$WS_URL" 2>&1)
+            
+            # Check if websocat connection failed
+            if [[ "$UPDATE_RESPONSE" == *"error"* ]] && [[ "$UPDATE_RESPONSE" != *"jsonrpc"* ]]; then
+              echo "WebSocket connection error updating share $ID"
+              echo "Failed to connect to: $WS_URL"
+              exit 1
+            fi
             
             # Validate response
             if ! echo "$UPDATE_RESPONSE" | jq -e . >/dev/null 2>&1; then
