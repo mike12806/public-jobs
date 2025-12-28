@@ -149,18 +149,32 @@ jobs:
           echo "Connecting to WebSocket: $WS_URL"
           echo "Sending: $JSON_PAYLOAD"
           
-          # Send request over WebSocket and get response
-          # Note: websocat stderr only contains connection errors, not auth headers
-          RESPONSE=$(echo "$JSON_PAYLOAD" | websocat -n1 -H="Authorization: Bearer ${{ secrets.TRUENAS_API_KEY }}" "$WS_URL" 2>&1)
+          # TrueNAS WebSocket authentication uses token in URL query parameter
+          API_KEY="${{ secrets.TRUENAS_API_KEY }}"
+          if [[ "$WS_URL" == *"?"* ]]; then
+            AUTH_WS_URL="${WS_URL}&token=${API_KEY}"
+          else
+            AUTH_WS_URL="${WS_URL}?token=${API_KEY}"
+          fi
           
-          # Check if websocat connection failed
-          if [[ "$RESPONSE" == *"error"* ]] && [[ "$RESPONSE" != *"jsonrpc"* ]]; then
-            echo "WebSocket connection error"
-            echo "Failed to connect to: $WS_URL"
+          # Send request over WebSocket and get response
+          RESPONSE=$(echo "$JSON_PAYLOAD" | websocat -n1 "$AUTH_WS_URL" 2>&1)
+          
+          # Check if websocat connection failed or response is empty
+          if [[ -z "$RESPONSE" ]]; then
+            echo "Error: Empty response from WebSocket"
+            echo "Connection URL: ${WS_URL}?token=***"
             exit 1
           fi
           
-          echo "Response: $RESPONSE"
+          if [[ "$RESPONSE" == *"error"* ]] && [[ "$RESPONSE" != *"jsonrpc"* ]]; then
+            echo "WebSocket connection error"
+            echo "Failed to connect to: $WS_URL"
+            echo "Error: $RESPONSE"
+            exit 1
+          fi
+          
+          echo "Response received"
           
           # Check if response is valid JSON
           if ! echo "$RESPONSE" | jq -e . >/dev/null 2>&1; then
@@ -194,6 +208,14 @@ jobs:
           WS_URL="${WS_URL/https:/wss:}"
           WS_URL="${WS_URL}/websocket"
           
+          # TrueNAS WebSocket authentication uses token in URL query parameter
+          API_KEY="${{ secrets.TRUENAS_API_KEY }}"
+          if [[ "$WS_URL" == *"?"* ]]; then
+            AUTH_WS_URL="${WS_URL}&token=${API_KEY}"
+          else
+            AUTH_WS_URL="${WS_URL}?token=${API_KEY}"
+          fi
+          
           # Parse comma-separated lists into arrays
           IFS=',' read -ra IDS <<< "${{ steps.get_share_ids.outputs.share_ids }}"
           IFS=',' read -ra IPS <<< "${{ steps.node_ips.outputs.ips }}"
@@ -215,13 +237,17 @@ jobs:
               }')
             
             echo "Getting config for share $ID"
-            # Note: websocat stderr only contains connection errors, not auth headers
-            SHARE_RESPONSE=$(echo "$GET_PAYLOAD" | websocat -n1 -H="Authorization: Bearer ${{ secrets.TRUENAS_API_KEY }}" "$WS_URL" 2>&1)
+            SHARE_RESPONSE=$(echo "$GET_PAYLOAD" | websocat -n1 "$AUTH_WS_URL" 2>&1)
             
-            # Check if websocat connection failed
+            # Check if websocat connection failed or response is empty
+            if [[ -z "$SHARE_RESPONSE" ]]; then
+              echo "Error: Empty response from WebSocket for share $ID"
+              exit 1
+            fi
+            
             if [[ "$SHARE_RESPONSE" == *"error"* ]] && [[ "$SHARE_RESPONSE" != *"jsonrpc"* ]]; then
               echo "WebSocket connection error for share $ID"
-              echo "Failed to connect to: $WS_URL"
+              echo "Error: $SHARE_RESPONSE"
               exit 1
             fi
             
@@ -285,13 +311,17 @@ jobs:
 
             # Make the JSON-RPC API request over WebSocket
             echo "Sending update request for share $ID"
-            # Note: websocat stderr only contains connection errors, not auth headers
-            UPDATE_RESPONSE=$(echo "$UPDATE_PAYLOAD" | websocat -n1 -H="Authorization: Bearer ${{ secrets.TRUENAS_API_KEY }}" "$WS_URL" 2>&1)
+            UPDATE_RESPONSE=$(echo "$UPDATE_PAYLOAD" | websocat -n1 "$AUTH_WS_URL" 2>&1)
             
-            # Check if websocat connection failed
+            # Check if websocat connection failed or response is empty
+            if [[ -z "$UPDATE_RESPONSE" ]]; then
+              echo "Error: Empty response from WebSocket updating share $ID"
+              exit 1
+            fi
+            
             if [[ "$UPDATE_RESPONSE" == *"error"* ]] && [[ "$UPDATE_RESPONSE" != *"jsonrpc"* ]]; then
               echo "WebSocket connection error updating share $ID"
-              echo "Failed to connect to: $WS_URL"
+              echo "Error: $UPDATE_RESPONSE"
               exit 1
             fi
             
