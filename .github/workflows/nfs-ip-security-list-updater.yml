@@ -146,7 +146,10 @@ jobs:
           async def truenas_call(url, token, method, params):
               """Call TrueNAS API via WebSocket with proper authentication"""
               try:
-                  async with websockets.connect(url, extra_headers={"Authorization": f"Bearer {token}"}) as websocket:
+                  # Create headers dictionary for authentication
+                  headers = {"Authorization": f"Bearer {token}"}
+                  
+                  async with websockets.connect(url, additional_headers=headers) as websocket:
                       # Send JSON-RPC request
                       request = {
                           "jsonrpc": "2.0",
