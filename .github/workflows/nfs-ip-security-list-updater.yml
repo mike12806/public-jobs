@@ -147,17 +147,24 @@ jobs:
               params = json.loads(sys.argv[4]) if len(sys.argv) > 4 else []
               
               try:
+                  # Use official TrueNAS API client
                   with Client(uri=uri) as c:
                       # Authenticate with API key
-                      if not c.call("auth.login_with_api_key", api_key):
-                          print(json.dumps({"error": "Authentication failed - invalid API key"}))
+                      auth_result = c.call("auth.login_with_api_key", api_key)
+                      if not auth_result:
+                          error = {"error": "Authentication failed - invalid API key"}
+                          print(json.dumps(error), file=sys.stderr)
                           sys.exit(1)
                       
-                      # Make the API call
-                      result = c.call(method, *params)
+                      # Make the API call - params should be unpacked
+                      result = c.call(method, *params) if params else c.call(method)
+                      
+                      # Return in JSON-RPC 2.0 format for compatibility with existing bash logic
                       print(json.dumps({"jsonrpc": "2.0", "result": result, "id": 1}))
+                      
               except Exception as e:
-                  print(json.dumps({"error": str(e)}), file=sys.stderr)
+                  error = {"error": str(e)}
+                  print(json.dumps(error), file=sys.stderr)
                   sys.exit(1)
           PYEOF
           
