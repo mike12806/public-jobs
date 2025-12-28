@@ -149,6 +149,11 @@ jobs:
                   # Create headers dictionary for authentication
                   headers = {"Authorization": f"Bearer {token}"}
                   
+                  # Debug output
+                  print(f"Connecting to: {url}", file=sys.stderr)
+                  print(f"Method: {method}", file=sys.stderr)
+                  print(f"Params: {params}", file=sys.stderr)
+                  
                   async with websockets.connect(url, additional_headers=headers) as websocket:
                       # TrueNAS expects simple JSON-RPC format with msg property
                       # Format: {"msg": "method", "method": "method_name", "params": [...], "id": "id"}
@@ -159,11 +164,26 @@ jobs:
                           "id": "api-call-1"
                       }
                       
+                      print(f"Sending request: {json.dumps(request)}", file=sys.stderr)
                       await websocket.send(json.dumps(request))
                       
-                      # Receive response
-                      response = await websocket.recv()
-                      return response
+                      # TrueNAS may send multiple messages - keep receiving until we get our response
+                      # Look for a message with id matching our request
+                      while True:
+                          response = await websocket.recv()
+                          print(f"Received raw response (len={len(response)}): {response[:200]}", file=sys.stderr)
+                          
+                          try:
+                              response_json = json.loads(response)
+                              # Check if this is the response to our request
+                              if response_json.get("id") == "api-call-1":
+                                  return response
+                              # Otherwise, continue waiting for our response
+                              print(f"Skipping message (id={response_json.get('id')})", file=sys.stderr)
+                          except json.JSONDecodeError:
+                              # If it's not JSON, skip it
+                              print(f"Skipping non-JSON message", file=sys.stderr)
+                              continue
                       
               except Exception as e:
                   print(f"Error: {e}", file=sys.stderr)
@@ -199,18 +219,17 @@ jobs:
           
           echo "Connecting to WebSocket: $WS_URL"
           
-          # Call TrueNAS API using Python helper
-          RESPONSE=$(python3 /tmp/truenas_ws.py "$WS_URL" "$API_KEY" "sharing.nfs.query" "[]" 2>&1)
+          # Call TrueNAS API using Python helper (stderr goes to console, stdout is response)
+          RESPONSE=$(python3 /tmp/truenas_ws.py "$WS_URL" "$API_KEY" "sharing.nfs.query" "[]")
           
           echo "Response received"
-          echo "Raw response: $RESPONSE"
+          echo "Raw response length: ${#RESPONSE}"
+          echo "First 200 chars: ${RESPONSE:0:200}"
           
           # Check if response is valid JSON
           if ! echo "$RESPONSE" | jq -e . >/dev/null 2>&1; then
             echo "Error: Invalid JSON response"
-            echo "Response: $RESPONSE"
-            echo "Response length: ${#RESPONSE}"
-            echo "First 100 chars: ${RESPONSE:0:100}"
+            echo "Full response: $RESPONSE"
             exit 1
           fi
           
@@ -253,7 +272,7 @@ jobs:
 
             # Get current share configuration using Python helper
             echo "Getting config for share $ID"
-            SHARE_RESPONSE=$(python3 /tmp/truenas_ws.py "$WS_URL" "$API_KEY" "sharing.nfs.get_instance" "[${ID}]" 2>&1)
+            SHARE_RESPONSE=$(python3 /tmp/truenas_ws.py "$WS_URL" "$API_KEY" "sharing.nfs.get_instance" "[${ID}]")
             
             # Validate the share configuration
             if ! echo "$SHARE_RESPONSE" | jq -e . >/dev/null 2>&1; then
@@ -307,7 +326,7 @@ jobs:
             UPDATE_PARAMS=$(jq -n --argjson id "$ID" --argjson data "$UPDATE_DATA" '[$id, $data]')
             
             echo "Sending update request for share $ID"
-            UPDATE_RESPONSE=$(python3 /tmp/truenas_ws.py "$WS_URL" "$API_KEY" "sharing.nfs.update" "$UPDATE_PARAMS" 2>&1)
+            UPDATE_RESPONSE=$(python3 /tmp/truenas_ws.py "$WS_URL" "$API_KEY" "sharing.nfs.update" "$UPDATE_PARAMS")
             
             # Validate response
             if ! echo "$UPDATE_RESPONSE" | jq -e . >/dev/null 2>&1; then
