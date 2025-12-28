@@ -144,7 +144,7 @@ jobs:
           import sys
 
           async def truenas_call(url, token, method, params):
-              """Call TrueNAS API via WebSocket with proper authentication"""
+              """Call TrueNAS API via WebSocket with proper JSON-RPC 2.0 authentication"""
               try:
                   # Create headers dictionary for authentication
                   headers = {"Authorization": f"Bearer {token}"}
@@ -155,38 +155,47 @@ jobs:
                   print(f"Params: {params}", file=sys.stderr)
                   
                   async with websockets.connect(url, additional_headers=headers) as websocket:
-                      # TrueNAS expects simple JSON-RPC format with msg property
-                      # Format: {"msg": "method", "method": "method_name", "params": [...], "id": "id"}
+                      # TrueNAS uses standard JSON-RPC 2.0 format
+                      # Format: {"jsonrpc": "2.0", "method": "method_name", "params": [...], "id": 1}
                       request = {
-                          "msg": "method",
+                          "jsonrpc": "2.0",
                           "method": method,
                           "params": params,
-                          "id": "api-call-1"
+                          "id": 1
                       }
                       
                       print(f"Sending request: {json.dumps(request)}", file=sys.stderr)
                       await websocket.send(json.dumps(request))
                       
-                      # TrueNAS may send multiple messages - keep receiving until we get our response
-                      # Look for a message with id matching our request
-                      while True:
-                          response = await websocket.recv()
-                          print(f"Received raw response (len={len(response)}): {response[:200]}", file=sys.stderr)
+                      # Wait for response with timeout
+                      # TrueNAS sends back a JSON-RPC 2.0 response with matching id
+                      try:
+                          response = await asyncio.wait_for(websocket.recv(), timeout=30.0)
+                          print(f"Received response (len={len(response)}): {response[:500]}", file=sys.stderr)
                           
-                          try:
-                              response_json = json.loads(response)
-                              # Check if this is the response to our request
-                              if response_json.get("id") == "api-call-1":
-                                  return response
-                              # Otherwise, continue waiting for our response
-                              print(f"Skipping message (id={response_json.get('id')})", file=sys.stderr)
-                          except json.JSONDecodeError:
-                              # If it's not JSON, skip it
-                              print(f"Skipping non-JSON message", file=sys.stderr)
-                              continue
+                          response_json = json.loads(response)
+                          
+                          # Check for JSON-RPC error in response
+                          if "error" in response_json:
+                              print(f"JSON-RPC Error: {json.dumps(response_json['error'])}", file=sys.stderr)
+                              return json.dumps(response_json)
+                          
+                          # Verify this is our response
+                          if response_json.get("id") == 1 and "result" in response_json:
+                              return response
+                          else:
+                              print(f"Unexpected response format: {response[:200]}", file=sys.stderr)
+                              return response
+                              
+                      except asyncio.TimeoutError:
+                          error_msg = "Timeout waiting for response from TrueNAS"
+                          print(f"Error: {error_msg}", file=sys.stderr)
+                          return json.dumps({"error": error_msg})
                       
               except Exception as e:
                   print(f"Error: {e}", file=sys.stderr)
+                  import traceback
+                  traceback.print_exc(file=sys.stderr)
                   return json.dumps({"error": str(e)})
 
           if __name__ == "__main__":
