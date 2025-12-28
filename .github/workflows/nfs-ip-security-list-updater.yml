@@ -39,6 +39,10 @@ jobs:
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq curl
+          # Install websocat for WebSocket communication
+          wget -qO /tmp/websocat https://github.com/vi/websocat/releases/download/v1.13.0/websocat.x86_64-unknown-linux-musl
+          chmod +x /tmp/websocat
+          sudo mv /tmp/websocat /usr/local/bin/websocat
 
       - name: Setup kubectl
         uses: azure/setup-kubectl@v4
@@ -126,26 +130,49 @@ jobs:
       - name: Get all NFS share IDs from TrueNAS
         id: get_share_ids
         run: |
-          # Get NFS shares from TrueNAS API
-          RESPONSE=$(curl -sk -w "\n%{http_code}" \
-            -H "Authorization: Bearer ${{ secrets.TRUENAS_API_KEY }}" \
-            "${{ secrets.TRUENAS_API_URL }}/api/v2.0/sharing/nfs")
+          # Get NFS shares from TrueNAS JSON-RPC API over WebSocket
+          # Convert HTTP(S) URL to WebSocket URL
+          WS_URL="${{ secrets.TRUENAS_API_URL }}"
+          WS_URL="${WS_URL/http:/ws:}"
+          WS_URL="${WS_URL/https:/wss:}"
+          WS_URL="${WS_URL}/websocket"
           
-          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
-          BODY=$(echo "$RESPONSE" | sed '$d')
+          # Create JSON-RPC request
+          JSON_PAYLOAD=$(jq -n \
+            '{
+              "jsonrpc": "2.0",
+              "method": "sharing.nfs.query",
+              "params": [],
+              "id": "nfs-query-1"
+            }')
           
-          if [[ "$HTTP_CODE" != "200" ]]; then
-            echo "Error getting NFS shares"
-            echo "HTTP Code: $HTTP_CODE"
-            echo "Response: $BODY"
+          echo "Connecting to WebSocket: $WS_URL"
+          echo "Sending: $JSON_PAYLOAD"
+          
+          # Send request over WebSocket and get response
+          RESPONSE=$(echo "$JSON_PAYLOAD" | websocat -n1 -H="Authorization: Bearer ${{ secrets.TRUENAS_API_KEY }}" "$WS_URL" 2>&1)
+          
+          echo "Response: $RESPONSE"
+          
+          # Check if response is valid JSON
+          if ! echo "$RESPONSE" | jq -e . >/dev/null 2>&1; then
+            echo "Error: Invalid JSON response"
+            echo "Response: $RESPONSE"
             exit 1
           fi
           
-          # Parse share IDs and convert to comma-separated list
-          SHARE_IDS=$(echo "$BODY" | jq -r '.[].id' | paste -sd, -)
+          # Check for JSON-RPC error
+          if echo "$RESPONSE" | jq -e '.error' >/dev/null 2>&1; then
+            echo "JSON-RPC Error:"
+            echo "$RESPONSE" | jq '.error'
+            exit 1
+          fi
+          
+          # Parse share IDs from JSON-RPC response (result field contains the array)
+          SHARE_IDS=$(echo "$RESPONSE" | jq -r '.result[].id' | paste -sd, -)
           if [[ -z "$SHARE_IDS" ]]; then
             echo "No NFS shares found"
-            echo "Response: $BODY"
+            echo "Response: $RESPONSE"
             exit 1
           fi
           echo "share_ids=$SHARE_IDS" >> $GITHUB_OUTPUT
@@ -153,6 +180,12 @@ jobs:
 
       - name: Patch NFS shares with new IPs
         run: |
+          # Convert HTTP(S) URL to WebSocket URL
+          WS_URL="${{ secrets.TRUENAS_API_URL }}"
+          WS_URL="${WS_URL/http:/ws:}"
+          WS_URL="${WS_URL/https:/wss:}"
+          WS_URL="${WS_URL}/websocket"
+          
           # Parse comma-separated lists into arrays
           IFS=',' read -ra IDS <<< "${{ steps.get_share_ids.outputs.share_ids }}"
           IFS=',' read -ra IPS <<< "${{ steps.node_ips.outputs.ips }}"
@@ -161,17 +194,37 @@ jobs:
             # Skip empty IDs
             [[ -z "$ID" ]] && continue
 
-            # Get current share configuration
-            SHARE_CONFIG=$(curl -sk \
-              -H "Authorization: Bearer ${{ secrets.TRUENAS_API_KEY }}" \
-              "${{ secrets.TRUENAS_API_URL }}/api/v2.0/sharing/nfs/id/$ID")
+            echo "Processing NFS share ID: $ID"
+
+            # Get current share configuration using JSON-RPC over WebSocket
+            GET_PAYLOAD=$(jq -n \
+              --argjson id "$ID" \
+              '{
+                "jsonrpc": "2.0",
+                "method": "sharing.nfs.get_instance",
+                "params": [$id],
+                "id": "nfs-get-'$ID'"
+              }')
+            
+            echo "Getting config for share $ID"
+            SHARE_RESPONSE=$(echo "$GET_PAYLOAD" | websocat -n1 -H="Authorization: Bearer ${{ secrets.TRUENAS_API_KEY }}" "$WS_URL" 2>&1)
             
             # Validate the share configuration
-            if ! echo "$SHARE_CONFIG" | jq -e . >/dev/null 2>&1; then
+            if ! echo "$SHARE_RESPONSE" | jq -e . >/dev/null 2>&1; then
               echo "Error: Invalid JSON response for share $ID"
-              echo "Response: $SHARE_CONFIG"
+              echo "Response: $SHARE_RESPONSE"
               exit 1
             fi
+            
+            # Check for JSON-RPC error
+            if echo "$SHARE_RESPONSE" | jq -e '.error' >/dev/null 2>&1; then
+              echo "JSON-RPC Error getting share $ID:"
+              echo "$SHARE_RESPONSE" | jq '.error'
+              exit 1
+            fi
+            
+            # Extract share config from result
+            SHARE_CONFIG=$(echo "$SHARE_RESPONSE" | jq -r '.result')
 
             # Extract path from config (handles both 'path' and 'paths' fields)
             PATHS=$(echo "$SHARE_CONFIG" | jq -r 'if has("paths") then .paths[] else .path end')
@@ -193,8 +246,8 @@ jobs:
             
             echo "Updating NFS share ID: $ID with IPs: $HOSTS_JSON"
             
-            # Create properly formatted JSON payload
-            PAYLOAD=$(jq -n \
+            # Create update data payload
+            UPDATE_DATA=$(jq -n \
               --arg path "$PATHS" \
               --argjson hosts "$HOSTS_JSON" \
               '{
@@ -203,22 +256,32 @@ jobs:
                 "enabled": true
               }')
 
-            # Make the API request
+            # Create JSON-RPC update request
+            UPDATE_PAYLOAD=$(jq -n \
+              --argjson id "$ID" \
+              --argjson data "$UPDATE_DATA" \
+              '{
+                "jsonrpc": "2.0",
+                "method": "sharing.nfs.update",
+                "params": [$id, $data],
+                "id": "nfs-update-'$ID'"
+              }')
+
+            # Make the JSON-RPC API request over WebSocket
+            echo "Sending update request for share $ID"
+            UPDATE_RESPONSE=$(echo "$UPDATE_PAYLOAD" | websocat -n1 -H="Authorization: Bearer ${{ secrets.TRUENAS_API_KEY }}" "$WS_URL" 2>&1)
             
-            RESPONSE=$(curl -sk -w "\n%{http_code}" \
-              -X PUT \
-              -H "Content-Type: application/json" \
-              -H "Authorization: Bearer ${{ secrets.TRUENAS_API_KEY }}" \
-              -d "$PAYLOAD" \
-              "${{ secrets.TRUENAS_API_URL }}/api/v2.0/sharing/nfs/id/$ID")
+            # Validate response
+            if ! echo "$UPDATE_RESPONSE" | jq -e . >/dev/null 2>&1; then
+              echo "Error: Invalid JSON response updating share $ID"
+              echo "Response: $UPDATE_RESPONSE"
+              exit 1
+            fi
             
-            HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
-            BODY=$(echo "$RESPONSE" | sed '$d')
-            
-            if [[ "$HTTP_CODE" != "200" ]]; then
-              echo "Error updating NFS share $ID"
-              echo "HTTP Code: $HTTP_CODE"
-              echo "Response: $BODY"
+            # Check for JSON-RPC error
+            if echo "$UPDATE_RESPONSE" | jq -e '.error' >/dev/null 2>&1; then
+              echo "JSON-RPC Error updating share $ID:"
+              echo "$UPDATE_RESPONSE" | jq '.error'
               exit 1
             fi
 
