@@ -38,8 +38,10 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y jq curl
-          # Install websocat for WebSocket communication
+          sudo apt-get install -y jq curl python3 python3-pip
+          # Install Python websocket client
+          pip3 install websockets
+          # Install websocat for WebSocket communication (backup)
           wget -qO /tmp/websocat https://github.com/vi/websocat/releases/download/v1.13.0/websocat.x86_64-unknown-linux-musl
           chmod +x /tmp/websocat
           sudo mv /tmp/websocat /usr/local/bin/websocat
@@ -127,6 +129,53 @@ jobs:
           echo "Combined IPs: $ALL_IPS"
           echo "ips=$ALL_IPS" >> $GITHUB_OUTPUT
 
+      - name: Create TrueNAS WebSocket helper script
+        run: |
+          cat > /tmp/truenas_ws.py << 'PYEOF'
+          #!/usr/bin/env python3
+          import asyncio
+          import websockets
+          import json
+          import sys
+
+          async def truenas_call(url, token, method, params):
+              """Call TrueNAS API via WebSocket with proper authentication"""
+              try:
+                  async with websockets.connect(url, extra_headers={"Authorization": f"Bearer {token}"}) as websocket:
+                      # Send JSON-RPC request
+                      request = {
+                          "jsonrpc": "2.0",
+                          "method": method,
+                          "params": params,
+                          "id": "api-call-1"
+                      }
+                      
+                      await websocket.send(json.dumps(request))
+                      
+                      # Receive response
+                      response = await websocket.recv()
+                      return response
+                      
+              except Exception as e:
+                  print(f"Error: {e}", file=sys.stderr)
+                  return json.dumps({"error": str(e)})
+
+          if __name__ == "__main__":
+              if len(sys.argv) < 4:
+                  print("Usage: truenas_ws.py <ws_url> <token> <method> [params_json]", file=sys.stderr)
+                  sys.exit(1)
+              
+              url = sys.argv[1]
+              token = sys.argv[2]
+              method = sys.argv[3]
+              params = json.loads(sys.argv[4]) if len(sys.argv) > 4 else []
+              
+              response = asyncio.run(truenas_call(url, token, method, params))
+              print(response)
+          PYEOF
+          
+          chmod +x /tmp/truenas_ws.py
+
       - name: Get all NFS share IDs from TrueNAS
         id: get_share_ids
         run: |
@@ -137,42 +186,12 @@ jobs:
           WS_URL="${WS_URL/https:/wss:}"
           WS_URL="${WS_URL}/websocket"
           
-          # Create JSON-RPC request
-          JSON_PAYLOAD=$(jq -n \
-            '{
-              "jsonrpc": "2.0",
-              "method": "sharing.nfs.query",
-              "params": [],
-              "id": "nfs-query-1"
-            }')
+          API_KEY="${{ secrets.TRUENAS_API_KEY }}"
           
           echo "Connecting to WebSocket: $WS_URL"
-          echo "Sending: $JSON_PAYLOAD"
           
-          # TrueNAS WebSocket authentication uses token in URL query parameter
-          API_KEY="${{ secrets.TRUENAS_API_KEY }}"
-          if [[ "$WS_URL" == *"?"* ]]; then
-            AUTH_WS_URL="${WS_URL}&token=${API_KEY}"
-          else
-            AUTH_WS_URL="${WS_URL}?token=${API_KEY}"
-          fi
-          
-          # Send request over WebSocket and get response
-          RESPONSE=$(echo "$JSON_PAYLOAD" | websocat -n1 "$AUTH_WS_URL" 2>&1)
-          
-          # Check if websocat connection failed or response is empty
-          if [[ -z "$RESPONSE" ]]; then
-            echo "Error: Empty response from WebSocket"
-            echo "Connection URL: ${WS_URL}?token=***"
-            exit 1
-          fi
-          
-          if [[ "$RESPONSE" == *"error"* ]] && [[ "$RESPONSE" != *"jsonrpc"* ]]; then
-            echo "WebSocket connection error"
-            echo "Failed to connect to: $WS_URL"
-            echo "Error: $RESPONSE"
-            exit 1
-          fi
+          # Call TrueNAS API using Python helper
+          RESPONSE=$(python3 /tmp/truenas_ws.py "$WS_URL" "$API_KEY" "sharing.nfs.query" "[]" 2>&1)
           
           echo "Response received"
           
@@ -208,13 +227,7 @@ jobs:
           WS_URL="${WS_URL/https:/wss:}"
           WS_URL="${WS_URL}/websocket"
           
-          # TrueNAS WebSocket authentication uses token in URL query parameter
           API_KEY="${{ secrets.TRUENAS_API_KEY }}"
-          if [[ "$WS_URL" == *"?"* ]]; then
-            AUTH_WS_URL="${WS_URL}&token=${API_KEY}"
-          else
-            AUTH_WS_URL="${WS_URL}?token=${API_KEY}"
-          fi
           
           # Parse comma-separated lists into arrays
           IFS=',' read -ra IDS <<< "${{ steps.get_share_ids.outputs.share_ids }}"
@@ -226,30 +239,9 @@ jobs:
 
             echo "Processing NFS share ID: $ID"
 
-            # Get current share configuration using JSON-RPC over WebSocket
-            GET_PAYLOAD=$(jq -n \
-              --argjson id "$ID" \
-              '{
-                "jsonrpc": "2.0",
-                "method": "sharing.nfs.get_instance",
-                "params": [$id],
-                "id": "nfs-get-'$ID'"
-              }')
-            
+            # Get current share configuration using Python helper
             echo "Getting config for share $ID"
-            SHARE_RESPONSE=$(echo "$GET_PAYLOAD" | websocat -n1 "$AUTH_WS_URL" 2>&1)
-            
-            # Check if websocat connection failed or response is empty
-            if [[ -z "$SHARE_RESPONSE" ]]; then
-              echo "Error: Empty response from WebSocket for share $ID"
-              exit 1
-            fi
-            
-            if [[ "$SHARE_RESPONSE" == *"error"* ]] && [[ "$SHARE_RESPONSE" != *"jsonrpc"* ]]; then
-              echo "WebSocket connection error for share $ID"
-              echo "Error: $SHARE_RESPONSE"
-              exit 1
-            fi
+            SHARE_RESPONSE=$(python3 /tmp/truenas_ws.py "$WS_URL" "$API_KEY" "sharing.nfs.get_instance" "[${ID}]" 2>&1)
             
             # Validate the share configuration
             if ! echo "$SHARE_RESPONSE" | jq -e . >/dev/null 2>&1; then
@@ -298,32 +290,12 @@ jobs:
                 "enabled": true
               }')
 
-            # Create JSON-RPC update request
-            UPDATE_PAYLOAD=$(jq -n \
-              --argjson id "$ID" \
-              --argjson data "$UPDATE_DATA" \
-              '{
-                "jsonrpc": "2.0",
-                "method": "sharing.nfs.update",
-                "params": [$id, $data],
-                "id": "nfs-update-'$ID'"
-              }')
-
-            # Make the JSON-RPC API request over WebSocket
+            # Call update via Python helper
+            # Prepare params as JSON array: [id, update_data]
+            UPDATE_PARAMS=$(jq -n --argjson id "$ID" --argjson data "$UPDATE_DATA" '[$id, $data]')
+            
             echo "Sending update request for share $ID"
-            UPDATE_RESPONSE=$(echo "$UPDATE_PAYLOAD" | websocat -n1 "$AUTH_WS_URL" 2>&1)
-            
-            # Check if websocat connection failed or response is empty
-            if [[ -z "$UPDATE_RESPONSE" ]]; then
-              echo "Error: Empty response from WebSocket updating share $ID"
-              exit 1
-            fi
-            
-            if [[ "$UPDATE_RESPONSE" == *"error"* ]] && [[ "$UPDATE_RESPONSE" != *"jsonrpc"* ]]; then
-              echo "WebSocket connection error updating share $ID"
-              echo "Error: $UPDATE_RESPONSE"
-              exit 1
-            fi
+            UPDATE_RESPONSE=$(python3 /tmp/truenas_ws.py "$WS_URL" "$API_KEY" "sharing.nfs.update" "$UPDATE_PARAMS" 2>&1)
             
             # Validate response
             if ! echo "$UPDATE_RESPONSE" | jq -e . >/dev/null 2>&1; then
