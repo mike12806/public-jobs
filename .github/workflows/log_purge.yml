@@ -164,8 +164,16 @@ jobs:
             exit 0
           fi
           
+          # Validate MIN_VAL is a valid number (integer, float, or scientific notation)
+          if ! [[ "${MIN_VAL}" =~ ^-?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$ ]]; then
+            echo "❌ Invalid MIN_VAL format: ${MIN_VAL}"
+            exit 1
+          fi
+          
           # Compute bucket boundaries in bash (UTC), requires GNU date
-          start_sec=$(( ${MIN_VAL%.*} / 1000 ))
+          # Use awk to handle scientific notation (e.g., 1.7330112E+12) that ES may return
+          # Pass MIN_VAL as an awk variable to avoid command injection
+          start_sec=$(awk -v val="${MIN_VAL}" 'BEGIN {printf "%d", val / 1000}')
           echo "Found oldest log to delete: $(date -u -d @${start_sec} +%Y-%m-%dT%H:%M:%SZ)"
           
           # Ensure start is in the past
