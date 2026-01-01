@@ -11,22 +11,22 @@ on:
       bucket_days:
         description: 'Size of each time bucket (smaller = more parallel tasks)'
         required: false
-        default: '0.125'
+        default: '1'
         type: string
       max_parallel:
         description: 'Max concurrent deletion tasks (adjust based on cluster capacity)'
         required: false
-        default: '6'
+        default: '2'
         type: string
       slices:
         description: 'ES slices per delete-by-query (higher = more internal parallelism, use "auto" for ES to decide)'
         required: false
-        default: 'auto'
+        default: '1'
         type: string
       max_buckets:
         description: 'Maximum number of time buckets to create'
         required: false
-        default: '168'
+        default: '30'
         type: string
   schedule:
     - cron: '0 */6 * * *'  # Every 6 hours (at 00:00, 06:00, 12:00, and 18:00 UTC)
@@ -49,8 +49,8 @@ jobs:
       ES_INDEX: ks-logstash-log*
       TS_FIELD: '@timestamp'
       RETENTION_DAYS: ${{ inputs.retention_days || '7' }}
-      BUCKET_DAYS: ${{ inputs.bucket_days || '0.042' }}
-      MAX_BUCKETS: ${{ inputs.max_buckets || '60' }}
+      BUCKET_DAYS: ${{ inputs.bucket_days || '1' }}
+      MAX_BUCKETS: ${{ inputs.max_buckets || '30' }}
     outputs:
       buckets: ${{ steps.plan.outputs.buckets }}
       has_work: ${{ steps.plan.outputs.has_work }}
@@ -233,7 +233,7 @@ jobs:
     timeout-minutes: 360
     strategy:
       fail-fast: false
-      max-parallel: ${{ fromJson(inputs.max_parallel || '6') }}
+      max-parallel: ${{ fromJson(inputs.max_parallel || '2') }}
       matrix:
         bucket: ${{ fromJson(needs.plan-buckets.outputs.buckets) }}
     env:
@@ -245,7 +245,7 @@ jobs:
       TIMEOUT: '30m'
       MAX_DOCS: ''               # optional cap per bucket
       POLL_BUDGET_SEC: '19800'   # 330 minutes per bucket (5.5 hours, leaves 30min buffer)
-      SLICES: ${{ inputs.slices || 'auto' }}
+      SLICES: ${{ inputs.slices || '1' }}
       REQUESTS_PER_SECOND: '-1'  # unlimited for maximum speed
       START: ${{ matrix.bucket.start }}
       END: ${{ matrix.bucket.end }}
@@ -398,9 +398,9 @@ jobs:
           echo ""
           echo "Configuration:"
           echo "  • Retention:      ${{ inputs.retention_days || '7' }} days"
-          echo "  • Bucket size:    ${{ inputs.bucket_days || '0.042' }} days"
-          echo "  • Max parallel:   ${{ inputs.max_parallel || '6' }} tasks"
-          echo "  • ES slices:      ${{ inputs.slices || 'auto' }} per task"
+          echo "  • Bucket size:    ${{ inputs.bucket_days || '1' }} days"
+          echo "  • Max parallel:   ${{ inputs.max_parallel || '2' }} tasks"
+          echo "  • ES slices:      ${{ inputs.slices || '1' }} per task"
           echo "  • Total buckets:  ${{ needs.plan-buckets.outputs.total_buckets }}"
           echo "  • Total docs:     ${{ needs.plan-buckets.outputs.total_docs }}"
           echo ""
