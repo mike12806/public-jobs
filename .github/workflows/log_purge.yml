@@ -411,3 +411,88 @@ jobs:
           echo "  • Reduce bucket_days for more parallelism (min ~7 days)"
           echo "  • Increase slices (max = shard count) for higher throughput"
           echo "  • Consider ES ILM for order-of-magnitude improvements"
+
+  force-merge:
+    needs: [plan-buckets, purge-old-logs]
+    if: needs.plan-buckets.outputs.has_work == 'true' && needs.purge-old-logs.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      ES_BASE_URL: ${{ secrets.ES_BASE_URL }}
+      ES_USER: ${{ secrets.ES_USER }}
+      ES_PASSWORD: ${{ secrets.ES_PASSWORD }}
+      ES_INDEX: ks-logstash-log*
+
+    steps:
+      - name: Checkout gh_hdc
+        uses: actions/checkout@v6
+        with:
+          repository: mike12806/gh_hdc
+          token: ${{ secrets.GH_HDC_PAT }}
+          path: gh_hdc
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          hostname: github-runner-log-purge-merge
+          version: latest
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq curl
+
+      - name: Force merge to reclaim disk space
+        run: |
+          set -euo pipefail
+          echo "Starting force merge on ${ES_INDEX} to reclaim disk space..."
+          
+          # Get pre-merge segment count and disk usage
+          echo "Pre-merge index stats:"
+          PRE_STATS=$(curl -sS -u "${ES_USER}:${ES_PASSWORD}" "${ES_BASE_URL}/_cat/indices/${ES_INDEX}?h=index,docs.count,store.size&format=json")
+          echo "${PRE_STATS}" | jq -r '.[] | "  \(.index): \(.["docs.count"]) docs, \(.["store.size"]) storage"'
+          
+          # Get list of indices to merge one at a time (less intensive)
+          INDICES=$(echo "${PRE_STATS}" | jq -r '.[].index')
+          
+          echo ""
+          echo "Processing indices sequentially to reduce cluster load..."
+          
+          for INDEX in ${INDICES}; do
+            echo ""
+            echo "Force merging index: ${INDEX}"
+            
+            # Using only_expunge_deletes=true is much less intensive than max_num_segments=1
+            # It only merges segments that contain deleted documents
+            MERGE_RESP=$(curl -sS -u "${ES_USER}:${ES_PASSWORD}" -X POST \
+              "${ES_BASE_URL}/${INDEX}/_forcemerge?only_expunge_deletes=true")
+            
+            # Check for errors
+            if echo "${MERGE_RESP}" | jq -e '.error' > /dev/null 2>&1; then
+              echo "⚠️  Force merge failed for ${INDEX}:"
+              echo "${MERGE_RESP}" | jq .
+              # Continue with other indices instead of failing completely
+              continue
+            fi
+            
+            echo "✓ Force merge completed for ${INDEX}"
+            
+            # Small delay between indices to reduce cluster pressure
+            sleep 5
+          done
+          
+          # Get post-merge stats
+          echo ""
+          echo "Post-merge index stats:"
+          POST_STATS=$(curl -sS -u "${ES_USER}:${ES_PASSWORD}" "${ES_BASE_URL}/_cat/indices/${ES_INDEX}?h=index,docs.count,store.size&format=json")
+          echo "${POST_STATS}" | jq -r '.[] | "  \(.index): \(.["docs.count"]) docs, \(.["store.size"]) storage"'
+
+      - name: Force merge summary
+        if: always()
+        run: |
+          echo "=== Force Merge Summary ==="
+          echo "Index pattern: ${ES_INDEX}"
+          echo "Force merge completed to reclaim disk space from deleted documents"
