@@ -100,7 +100,7 @@ jobs:
               echo "  ✅ WAL archiving is working"
             fi
             
-            # Check last backup time
+            # Check last backup time using backup events (works with barman-cloud plugin)
             SCHEDULED_BACKUPS=$(kubectl -n cloudnative-pg get scheduledbackup -o json | jq -r ".items[] | select(.spec.cluster.name==\"$CLUSTER\") | .metadata.name")
             
             if [ -z "$SCHEDULED_BACKUPS" ]; then
@@ -109,22 +109,32 @@ jobs:
               for SCHED_BACKUP in $SCHEDULED_BACKUPS; do
                 echo "  📅 Checking scheduled backup: $SCHED_BACKUP"
                 
-                # Get last successful backup time from cluster status
-                LAST_BACKUP_TIME=$(kubectl -n cloudnative-pg get clusters.postgresql.cnpg.io $CLUSTER -o jsonpath='{.status.lastSuccessfulBackup}')
-                LAST_FAILED_BACKUP=$(kubectl -n cloudnative-pg get clusters.postgresql.cnpg.io $CLUSTER -o jsonpath='{.status.lastFailedBackup}')
+                # Get the most recent completed backup event for this cluster
+                # This works with both traditional and barman-cloud plugin backups
+                LAST_COMPLETED_EVENT=$(kubectl -n cloudnative-pg get events \
+                  --field-selector involvedObject.kind=Backup,reason=Completed \
+                  -o json | jq -r "[.items[] | select(.involvedObject.name | startswith(\"${SCHED_BACKUP}-\"))] | sort_by(.lastTimestamp) | last")
                 
-                if [ -z "$LAST_BACKUP_TIME" ]; then
-                  echo "    ❌ No successful backups found for cluster"
-                  FAILED_CHECKS="${FAILED_CHECKS}${CLUSTER}: No successful backups found\n"
+                if [ "$LAST_COMPLETED_EVENT" == "null" ] || [ -z "$LAST_COMPLETED_EVENT" ]; then
+                  echo "    ❌ No successful backup events found for scheduled backup"
+                  FAILED_CHECKS="${FAILED_CHECKS}${CLUSTER}: No successful backup events found\n"
                   ALL_PASSED=false
                   continue
                 fi
                 
-                echo "    Latest successful backup: $LAST_BACKUP_TIME"
+                LAST_BACKUP_TIME=$(echo "$LAST_COMPLETED_EVENT" | jq -r '.lastTimestamp')
+                BACKUP_NAME=$(echo "$LAST_COMPLETED_EVENT" | jq -r '.involvedObject.name')
                 
-                # Check if there was a failed backup after the successful one
-                if [ -n "$LAST_FAILED_BACKUP" ]; then
-                  echo "    ⚠️  Last failed backup: $LAST_FAILED_BACKUP"
+                echo "    Latest successful backup: $BACKUP_NAME at $LAST_BACKUP_TIME"
+                
+                # Check for failed backup events after the successful one
+                LAST_FAILED_EVENT=$(kubectl -n cloudnative-pg get events \
+                  --field-selector involvedObject.kind=Backup \
+                  -o json | jq -r "[.items[] | select(.involvedObject.name | startswith(\"${SCHED_BACKUP}-\")) | select(.reason == \"Failed\" or .reason == \"Error\")] | sort_by(.lastTimestamp) | last")
+                
+                if [ "$LAST_FAILED_EVENT" != "null" ] && [ -n "$LAST_FAILED_EVENT" ]; then
+                  LAST_FAILED_TIME=$(echo "$LAST_FAILED_EVENT" | jq -r '.lastTimestamp')
+                  echo "    ⚠️  Last failed backup event: $LAST_FAILED_TIME"
                 fi
                 
                 # Check backup age
