@@ -1,0 +1,67 @@
+name: Restart Cattle Cluster Agent Daily
+
+on:
+  schedule:
+    - cron: '0 5 * * *'  # Run daily at 5:00 AM UTC
+  workflow_dispatch:  # Allow manual trigger
+
+concurrency:
+  group: cattle-cluster-agent-restart
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  restart-cattle-agent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout gh_hdc
+        uses: actions/checkout@v6
+        with:
+          repository: mike12806/gh_hdc
+          token: ${{ secrets.GH_HDC_PAT }}
+          path: gh_hdc
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          hostname: github-runner-cattle-agent-restart
+          version: latest
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'latest'
+      
+      - name: Set up kubeconfig
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBECONFIG }}" | base64 -d > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+
+      - name: Restart cattle-cluster-agent deployment
+        run: |
+          echo "🔄 Restarting cattle-cluster-agent deployment..."
+          kubectl rollout restart deployment cattle-cluster-agent -n cattle-system
+          
+          echo "⏳ Waiting for rollout to complete..."
+          kubectl rollout status deployment cattle-cluster-agent -n cattle-system --timeout=5m
+          
+          if [ $? -eq 0 ]; then
+            echo "✅ cattle-cluster-agent deployment restarted successfully"
+          else
+            echo "❌ Failed to restart cattle-cluster-agent deployment"
+            exit 1
+          fi
+
+      - name: Verify deployment status
+        run: |
+          echo "📊 Checking deployment status..."
+          kubectl get deployment cattle-cluster-agent -n cattle-system
+          kubectl get pods -n cattle-system -l app=cattle-cluster-agent
