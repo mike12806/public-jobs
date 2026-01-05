@@ -51,9 +51,7 @@ jobs:
           kubectl rollout restart deployment cattle-cluster-agent -n cattle-system
           
           echo "⏳ Waiting for rollout to complete..."
-          kubectl rollout status deployment cattle-cluster-agent -n cattle-system --timeout=5m
-          
-          if [ $? -eq 0 ]; then
+          if kubectl rollout status deployment cattle-cluster-agent -n cattle-system --timeout=5m; then
             echo "✅ cattle-cluster-agent deployment restarted successfully"
           else
             echo "❌ Failed to restart cattle-cluster-agent deployment"
