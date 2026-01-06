@@ -58,6 +58,9 @@ jobs:
           mkdir -p github_backup gitea_backup
           echo "$ENCRYPTION_KEY" > encryption_key.txt
 
+      - name: Increase Git buffer size
+        run: git config --global http.postBuffer 524288000
+
       - name: Mirror all GitHub repos
         run: |
           cd github_backup
@@ -68,6 +71,9 @@ jobs:
                 url_auth=$(echo "$url" | sed "s|https://|https://${PRIVATE_GIT_USERNAME}:${PRIVATE_GITHUB_TOKEN}@|")
                 git clone --mirror "$url_auth"
               done
+
+      - name: Increase Git buffer size
+        run: git config --global http.postBuffer 524288000
 
       - name: Mirror all Gitea repos
         run: |
