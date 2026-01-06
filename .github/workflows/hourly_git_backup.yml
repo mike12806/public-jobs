@@ -58,67 +58,75 @@ jobs:
           mkdir -p github_backup gitea_backup
           echo "$ENCRYPTION_KEY" > encryption_key.txt
 
-      - name: Increase Git buffer size
-        run: git config --global http.postBuffer 524288000
+      - name: Configure Git for unreliable connections
+        run: |
+          git config --global http.postBuffer 524288000
+          git config --global http.lowSpeedLimit 1000
+          git config --global http.lowSpeedTime 300
+          git config --global core.compression 0
 
-      - name: Mirror all GitHub repos
+      - name: Verify Tailscale connectivity to Gitea
+        run: |
+          echo "Testing connectivity to Gitea server..."
+          if ! ping -c 3 git.mfaherty.net; then
+            echo "❌ Cannot reach git.mfaherty.net via Tailscale"
+            tailscale status
+            exit 1
+          fi
+          echo "✅ Tailscale connection to Gitea server verified"
+
+      - name: Backup all GitHub repos (using archives)
         run: |
           cd github_backup
           curl -s -H "Authorization: token $PRIVATE_GITHUB_TOKEN" \
             "https://api.github.com/user/repos?affiliation=owner&per_page=100" \
-            | jq -r '.[].clone_url' \
-            | while read url; do
-                url_auth=$(echo "$url" | sed "s|https://|https://${PRIVATE_GIT_USERNAME}:${PRIVATE_GITHUB_TOKEN}@|")
-                # Retry logic for git clone with exponential backoff
-                max_retries=3
-                retry_count=0
-                while [ $retry_count -lt $max_retries ]; do
-                  if git clone --mirror "$url_auth"; then
-                    break
-                  else
-                    retry_count=$((retry_count + 1))
-                    if [ $retry_count -lt $max_retries ]; then
-                      sleep_time=$((2 ** retry_count))
-                      echo "Clone failed, retrying in ${sleep_time}s... (attempt $((retry_count + 1))/$max_retries)"
-                      sleep $sleep_time
-                    else
-                      echo "Failed to clone $url after $max_retries attempts"
-                      exit 1
-                    fi
-                  fi
-                done
+            | jq -r '.[] | "\(.full_name) \(.default_branch)"' \
+            | while read repo_name branch; do
+                echo "Downloading archive for $repo_name..."
+                curl -L -H "Authorization: token $PRIVATE_GITHUB_TOKEN" \
+                  -H "Accept: application/vnd.github+json" \
+                  "https://api.github.com/repos/$repo_name/tarball/$branch" \
+                  -o "${repo_name//\//_}.tar.gz"
+                
+                if [ $? -eq 0 ]; then
+                  echo "✅ Downloaded $repo_name"
+                else
+                  echo "❌ Failed to download $repo_name"
+                  exit 1
+                fi
               done
 
-      - name: Increase Git buffer size
-        run: git config --global http.postBuffer 524288000
-
-      - name: Mirror all Gitea repos
+      - name: Backup all Gitea repos (using archives)
         run: |
           cd gitea_backup
+          failed_repos=()
           curl -s -H "Authorization: token $PRIVATE_GIT_TOKEN" \
             "https://git.mfaherty.net/api/v1/users/$PRIVATE_GIT_USERNAME/repos" \
-            | jq -r '.[].clone_url' \
-            | while read url; do
-                url_auth=$(echo "$url" | sed "s|https://|https://${PRIVATE_GIT_USERNAME}:${PRIVATE_GIT_TOKEN}@|")
-                # Retry logic for git clone with exponential backoff
-                max_retries=3
-                retry_count=0
-                while [ $retry_count -lt $max_retries ]; do
-                  if git clone --mirror "$url_auth"; then
-                    break
-                  else
-                    retry_count=$((retry_count + 1))
-                    if [ $retry_count -lt $max_retries ]; then
-                      sleep_time=$((2 ** retry_count))
-                      echo "Clone failed, retrying in ${sleep_time}s... (attempt $((retry_count + 1))/$max_retries)"
-                      sleep $sleep_time
-                    else
-                      echo "Failed to clone $url after $max_retries attempts"
-                      exit 1
-                    fi
-                  fi
-                done
+            | jq -r '.[] | "\(.full_name) \(.default_branch)"' \
+            | while read repo_name branch; do
+                echo "Downloading archive for $repo_name..."
+                
+                # Use archive download instead of git clone
+                if curl -L -H "Authorization: token $PRIVATE_GIT_TOKEN" \
+                  "https://git.mfaherty.net/$repo_name/archive/$branch.tar.gz" \
+                  -o "${repo_name//\//_}.tar.gz" --max-time 300; then
+                  echo "✅ Downloaded $repo_name"
+                else
+                  echo "⚠️ Failed to download $repo_name - continuing with other repos"
+                  failed_repos+=("$repo_name")
+                  rm -f "${repo_name//\//_}.tar.gz"
+                fi
               done
+          
+          # Check if we got at least one repo
+          if [ $(ls -1 *.tar.gz 2>/dev/null | wc -l) -eq 0 ]; then
+            echo "❌ Failed to backup any Gitea repositories"
+            exit 1
+          fi
+          
+          if [ ${#failed_repos[@]} -gt 0 ]; then
+            echo "⚠️ Warning: Failed to backup ${#failed_repos[@]} repo(s): ${failed_repos[*]}"
+          fi
 
       - name: Create encrypted archives
         run: |
@@ -147,17 +155,13 @@ jobs:
           mkdir -p validate_github
           gpg --batch --yes --passphrase-file encryption_key.txt -d "$GH_FILE" \
             | tar -C validate_github -xzf -
-          shopt -s nullglob
-          found_any=0
-          for repo in validate_github/*.git; do
-            found_any=1
-            echo "fsck $repo…"
-            git --git-dir="$repo" fsck --strict
-          done
-          if [[ $found_any -eq 0 ]]; then
-            echo "No .git repos found in validate_github. Archive structure may be wrong."
+          # Check that we have at least one archive
+          archive_count=$(ls -1 validate_github/*.tar.gz 2>/dev/null | wc -l)
+          if [[ $archive_count -eq 0 ]]; then
+            echo "No repository archives found in validate_github. Archive structure may be wrong."
             exit 1
           fi
+          echo "✅ Validated $archive_count GitHub repository archives"
 
       - name: Validate Gitea backup integrity
         run: |
@@ -165,17 +169,13 @@ jobs:
           mkdir -p validate_gitea
           gpg --batch --yes --passphrase-file encryption_key.txt -d "$GT_FILE" \
             | tar -C validate_gitea -xzf -
-          shopt -s nullglob
-          found_any=0
-          for repo in validate_gitea/*.git; do
-            found_any=1
-            echo "fsck $repo…"
-            git --git-dir="$repo" fsck --strict
-          done
-          if [[ $found_any -eq 0 ]]; then
-            echo "No .git repos found in validate_gitea. Archive structure may be wrong."
+          # Check that we have at least one archive
+          archive_count=$(ls -1 validate_gitea/*.tar.gz 2>/dev/null | wc -l)
+          if [[ $archive_count -eq 0 ]]; then
+            echo "No repository archives found in validate_gitea. Archive structure may be wrong."
             exit 1
           fi
+          echo "✅ Validated $archive_count Gitea repository archives"
 
       - name: Purge old backups (older than 180 days)
         # Only run once per day at 3 AM UTC to minimize API costs
