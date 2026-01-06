@@ -69,7 +69,24 @@ jobs:
             | jq -r '.[].clone_url' \
             | while read url; do
                 url_auth=$(echo "$url" | sed "s|https://|https://${PRIVATE_GIT_USERNAME}:${PRIVATE_GITHUB_TOKEN}@|")
-                git clone --mirror "$url_auth"
+                # Retry logic for git clone with exponential backoff
+                max_retries=3
+                retry_count=0
+                while [ $retry_count -lt $max_retries ]; do
+                  if git clone --mirror "$url_auth"; then
+                    break
+                  else
+                    retry_count=$((retry_count + 1))
+                    if [ $retry_count -lt $max_retries ]; then
+                      sleep_time=$((2 ** retry_count))
+                      echo "Clone failed, retrying in ${sleep_time}s... (attempt $((retry_count + 1))/$max_retries)"
+                      sleep $sleep_time
+                    else
+                      echo "Failed to clone $url after $max_retries attempts"
+                      exit 1
+                    fi
+                  fi
+                done
               done
 
       - name: Increase Git buffer size
@@ -83,7 +100,24 @@ jobs:
             | jq -r '.[].clone_url' \
             | while read url; do
                 url_auth=$(echo "$url" | sed "s|https://|https://${PRIVATE_GIT_USERNAME}:${PRIVATE_GIT_TOKEN}@|")
-                git clone --mirror "$url_auth"
+                # Retry logic for git clone with exponential backoff
+                max_retries=3
+                retry_count=0
+                while [ $retry_count -lt $max_retries ]; do
+                  if git clone --mirror "$url_auth"; then
+                    break
+                  else
+                    retry_count=$((retry_count + 1))
+                    if [ $retry_count -lt $max_retries ]; then
+                      sleep_time=$((2 ** retry_count))
+                      echo "Clone failed, retrying in ${sleep_time}s... (attempt $((retry_count + 1))/$max_retries)"
+                      sleep $sleep_time
+                    else
+                      echo "Failed to clone $url after $max_retries attempts"
+                      exit 1
+                    fi
+                  fi
+                done
               done
 
       - name: Create encrypted archives
