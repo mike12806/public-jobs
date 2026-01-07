@@ -82,10 +82,45 @@ jobs:
       - name: Sanity check endpoint & index
         run: |
           set -euo pipefail
+          
+          # Resilient curl wrapper with retry logic and exponential backoff
+          curl_with_retry() {
+            local max_attempts=5
+            local timeout=30
+            local attempt=1
+            local backoff=2
+            
+            while [ $attempt -le $max_attempts ]; do
+              if [ $attempt -gt 1 ]; then
+                local wait_time=$((backoff ** (attempt - 1)))
+                echo "  Retry attempt $attempt/$max_attempts after ${wait_time}s delay..." >&2
+                sleep $wait_time
+              fi
+              
+              # Run curl with connection timeout and max time limit
+              # --retry-connrefused: retry on connection refused
+              # --retry-delay: initial delay between retries
+              # --max-time: maximum time for the entire operation
+              if curl -sS --connect-timeout 10 --max-time $timeout \
+                   --retry 3 --retry-delay 1 --retry-connrefused \
+                   "$@"; then
+                return 0
+              fi
+              
+              local exit_code=$?
+              if [ $attempt -eq $max_attempts ]; then
+                echo "  ❌ Failed after $max_attempts attempts" >&2
+                return $exit_code
+              fi
+              
+              attempt=$((attempt + 1))
+            done
+          }
+          
           echo "Checking index pattern: ${ES_INDEX}"
           
           # Get list of matching indices
-          INDICES_RESP=$(curl -sS -u "${ES_USER}:${ES_PASSWORD}" "${ES_BASE_URL}/_cat/indices/${ES_INDEX}?h=index,docs.count&format=json")
+          INDICES_RESP=$(curl_with_retry -u "${ES_USER}:${ES_PASSWORD}" "${ES_BASE_URL}/_cat/indices/${ES_INDEX}?h=index,docs.count&format=json")
           echo "Matching indices:"
           echo "${INDICES_RESP}" | jq -r '.[] | "\(.index): \(.["docs.count"]) documents"'
           
@@ -106,6 +141,38 @@ jobs:
         id: plan
         run: |
           set -euo pipefail
+          
+          # Resilient curl wrapper with retry logic and exponential backoff
+          curl_with_retry() {
+            local max_attempts=5
+            local timeout=30
+            local attempt=1
+            local backoff=2
+            
+            while [ $attempt -le $max_attempts ]; do
+              if [ $attempt -gt 1 ]; then
+                local wait_time=$((backoff ** (attempt - 1)))
+                echo "  Retry attempt $attempt/$max_attempts after ${wait_time}s delay..." >&2
+                sleep $wait_time
+              fi
+              
+              # Run curl with connection timeout and max time limit
+              if curl -sS --connect-timeout 10 --max-time $timeout \
+                   --retry 3 --retry-delay 1 --retry-connrefused \
+                   "$@"; then
+                return 0
+              fi
+              
+              local exit_code=$?
+              if [ $attempt -eq $max_attempts ]; then
+                echo "  ❌ Failed after $max_attempts attempts" >&2
+                return $exit_code
+              fi
+              
+              attempt=$((attempt + 1))
+            done
+          }
+          
           # Calculate cutoff: now - retention_days (delete logs older than this)
           now_sec=$(date +%s)
           retention_sec=$(awk "BEGIN {print ${RETENTION_DAYS} * 86400}")
@@ -120,7 +187,7 @@ jobs:
           echo "Current time: ${now_iso}"
           
           COUNT_BODY=$(printf '{"query":{"range":{"%s":{"lt":"%s"}}}}' "${TS_FIELD}" "${cutoff_iso}")
-          COUNT_RESP=$(curl -sS -u "${ES_USER}:${ES_PASSWORD}" -H 'Content-Type: application/json' -X POST \
+          COUNT_RESP=$(curl_with_retry -u "${ES_USER}:${ES_PASSWORD}" -H 'Content-Type: application/json' -X POST \
             "${ES_BASE_URL}/${ES_INDEX}/_count" -d "${COUNT_BODY}")
           
           # Check for Elasticsearch errors in count response
@@ -144,7 +211,7 @@ jobs:
           # Find the actual oldest timestamp of logs to be deleted (for planning buckets)
           SRCH_BODY=$(jq -n --arg f "${TS_FIELD}" --arg c "${cutoff_iso}" \
             '{size:0, query:{range:{($f):{lt:$c}}}, aggs:{min_ts:{min:{field:($f)}}}}')
-          SRCH_RESP=$(curl -sS -u "${ES_USER}:${ES_PASSWORD}" -H 'Content-Type: application/json' -X POST \
+          SRCH_RESP=$(curl_with_retry -u "${ES_USER}:${ES_PASSWORD}" -H 'Content-Type: application/json' -X POST \
             "${ES_BASE_URL}/${ES_INDEX}/_search" -d "${SRCH_BODY}")
           
           # Check for Elasticsearch errors
@@ -275,13 +342,77 @@ jobs:
       - name: Sanity check endpoint & index
         run: |
           set -euo pipefail
-          curl -fsS -u "${ES_USER}:${ES_PASSWORD}" "${ES_BASE_URL}/_cat/indices/${ES_INDEX}" >/dev/null
+          
+          # Resilient curl wrapper with retry logic and exponential backoff
+          curl_with_retry() {
+            local max_attempts=5
+            local timeout=30
+            local attempt=1
+            local backoff=2
+            
+            while [ $attempt -le $max_attempts ]; do
+              if [ $attempt -gt 1 ]; then
+                local wait_time=$((backoff ** (attempt - 1)))
+                echo "  Retry attempt $attempt/$max_attempts after ${wait_time}s delay..." >&2
+                sleep $wait_time
+              fi
+              
+              # Run curl with connection timeout and max time limit
+              if curl -fsS --connect-timeout 10 --max-time $timeout \
+                   --retry 3 --retry-delay 1 --retry-connrefused \
+                   "$@"; then
+                return 0
+              fi
+              
+              local exit_code=$?
+              if [ $attempt -eq $max_attempts ]; then
+                echo "  ❌ Failed after $max_attempts attempts" >&2
+                return $exit_code
+              fi
+              
+              attempt=$((attempt + 1))
+            done
+          }
+          
+          curl_with_retry -u "${ES_USER}:${ES_PASSWORD}" "${ES_BASE_URL}/_cat/indices/${ES_INDEX}" >/dev/null
           echo "Index reachable"
 
       - name: Start async delete-by-query (bucket)
         id: start_delete
         run: |
           set -euo pipefail
+          
+          # Resilient curl wrapper with retry logic and exponential backoff
+          curl_with_retry() {
+            local max_attempts=5
+            local timeout=60
+            local attempt=1
+            local backoff=2
+            
+            while [ $attempt -le $max_attempts ]; do
+              if [ $attempt -gt 1 ]; then
+                local wait_time=$((backoff ** (attempt - 1)))
+                echo "  Retry attempt $attempt/$max_attempts after ${wait_time}s delay..." >&2
+                sleep $wait_time
+              fi
+              
+              # Run curl with connection timeout and max time limit
+              if curl -sS --connect-timeout 10 --max-time $timeout \
+                   --retry 3 --retry-delay 1 --retry-connrefused \
+                   "$@"; then
+                return 0
+              fi
+              
+              local exit_code=$?
+              if [ $attempt -eq $max_attempts ]; then
+                echo "  ❌ Failed after $max_attempts attempts" >&2
+                return $exit_code
+              fi
+              
+              attempt=$((attempt + 1))
+            done
+          }
+          
           # Use bucket time range for deletion
           # Note: Buckets are already constrained to be < cutoff (which is < now)
           # Adding explicit NOW check as safety constraint against clock skew
@@ -307,7 +438,7 @@ jobs:
             BODY="${QUERY}"
           fi
 
-          RESP=$(curl -sS -u "${ES_USER}:${ES_PASSWORD}" -H 'Content-Type: application/json' \
+          RESP=$(curl_with_retry -u "${ES_USER}:${ES_PASSWORD}" -H 'Content-Type: application/json' \
             -X POST "${ES_BASE_URL}/${ES_INDEX}/_delete_by_query?conflicts=proceed&refresh=false&slices=${SLICES}&wait_for_completion=false&timeout=${TIMEOUT}&requests_per_second=${REQUESTS_PER_SECOND}" \
             -d "${BODY}")
 
@@ -323,6 +454,38 @@ jobs:
         id: poll
         run: |
           set -euo pipefail
+          
+          # Resilient curl wrapper with retry logic and exponential backoff
+          curl_with_retry() {
+            local max_attempts=5
+            local timeout=30
+            local attempt=1
+            local backoff=2
+            
+            while [ $attempt -le $max_attempts ]; do
+              if [ $attempt -gt 1 ]; then
+                local wait_time=$((backoff ** (attempt - 1)))
+                echo "  Retry attempt $attempt/$max_attempts after ${wait_time}s delay..." >&2
+                sleep $wait_time
+              fi
+              
+              # Run curl with connection timeout and max time limit
+              if curl -sS --connect-timeout 10 --max-time $timeout \
+                   --retry 3 --retry-delay 1 --retry-connrefused \
+                   "$@"; then
+                return 0
+              fi
+              
+              local exit_code=$?
+              if [ $attempt -eq $max_attempts ]; then
+                echo "  ❌ Failed after $max_attempts attempts" >&2
+                return $exit_code
+              fi
+              
+              attempt=$((attempt + 1))
+            done
+          }
+          
           TASK_ID="${{ steps.start_delete.outputs.task_id }}"
           START_SEC=${SECONDS}
           SLEEP=30
@@ -334,7 +497,7 @@ jobs:
               exit 1
             fi
 
-            RESP=$(curl -sS -u "${ES_USER}:${ES_PASSWORD}" -H 'Content-Type: application/json' -X GET "${ES_BASE_URL}/_tasks/${TASK_ID}")
+            RESP=$(curl_with_retry -u "${ES_USER}:${ES_PASSWORD}" -H 'Content-Type: application/json' -X GET "${ES_BASE_URL}/_tasks/${TASK_ID}")
             COMPLETED=$(echo "${RESP}" | jq -r '.completed // false')
 
             if [ "${COMPLETED}" = "true" ]; then
@@ -448,11 +611,43 @@ jobs:
       - name: Force merge to reclaim disk space
         run: |
           set -euo pipefail
+          
+          # Resilient curl wrapper with retry logic and exponential backoff
+          curl_with_retry() {
+            local max_attempts=5
+            local timeout=120
+            local attempt=1
+            local backoff=2
+            
+            while [ $attempt -le $max_attempts ]; do
+              if [ $attempt -gt 1 ]; then
+                local wait_time=$((backoff ** (attempt - 1)))
+                echo "  Retry attempt $attempt/$max_attempts after ${wait_time}s delay..." >&2
+                sleep $wait_time
+              fi
+              
+              # Run curl with connection timeout and max time limit
+              if curl -sS --connect-timeout 10 --max-time $timeout \
+                   --retry 3 --retry-delay 1 --retry-connrefused \
+                   "$@"; then
+                return 0
+              fi
+              
+              local exit_code=$?
+              if [ $attempt -eq $max_attempts ]; then
+                echo "  ❌ Failed after $max_attempts attempts" >&2
+                return $exit_code
+              fi
+              
+              attempt=$((attempt + 1))
+            done
+          }
+          
           echo "Starting force merge on ${ES_INDEX} to reclaim disk space..."
           
           # Get pre-merge segment count and disk usage
           echo "Pre-merge index stats:"
-          PRE_STATS=$(curl -sS -u "${ES_USER}:${ES_PASSWORD}" "${ES_BASE_URL}/_cat/indices/${ES_INDEX}?h=index,docs.count,store.size&format=json")
+          PRE_STATS=$(curl_with_retry -u "${ES_USER}:${ES_PASSWORD}" "${ES_BASE_URL}/_cat/indices/${ES_INDEX}?h=index,docs.count,store.size&format=json")
           echo "${PRE_STATS}" | jq -r '.[] | "  \(.index): \(.["docs.count"]) docs, \(.["store.size"]) storage"'
           
           # Get list of indices to merge one at a time (less intensive)
@@ -467,7 +662,7 @@ jobs:
             
             # Using only_expunge_deletes=true is much less intensive than max_num_segments=1
             # It only merges segments that contain deleted documents
-            MERGE_RESP=$(curl -sS -u "${ES_USER}:${ES_PASSWORD}" -X POST \
+            MERGE_RESP=$(curl_with_retry -u "${ES_USER}:${ES_PASSWORD}" -X POST \
               "${ES_BASE_URL}/${INDEX}/_forcemerge?only_expunge_deletes=true")
             
             # Check for errors
@@ -487,7 +682,7 @@ jobs:
           # Get post-merge stats
           echo ""
           echo "Post-merge index stats:"
-          POST_STATS=$(curl -sS -u "${ES_USER}:${ES_PASSWORD}" "${ES_BASE_URL}/_cat/indices/${ES_INDEX}?h=index,docs.count,store.size&format=json")
+          POST_STATS=$(curl_with_retry -u "${ES_USER}:${ES_PASSWORD}" "${ES_BASE_URL}/_cat/indices/${ES_INDEX}?h=index,docs.count,store.size&format=json")
           echo "${POST_STATS}" | jq -r '.[] | "  \(.index): \(.["docs.count"]) docs, \(.["store.size"]) storage"'
 
       - name: Force merge summary
