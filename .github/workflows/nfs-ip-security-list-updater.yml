@@ -52,7 +52,9 @@ jobs:
       - name: Set up kubeconfig
         run: |
           mkdir -p $HOME/.kube
-          echo "${{ secrets.KUBECONFIG }}" | base64 -d > $HOME/.kube/config
+          base64 -d > $HOME/.kube/config << 'EOF'
+          ${{ secrets.KUBECONFIG }}
+          EOF
           chmod 600 $HOME/.kube/config
           # Verify kubectl can connect to the cluster
           kubectl cluster-info
