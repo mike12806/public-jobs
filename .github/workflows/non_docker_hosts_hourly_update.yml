@@ -25,6 +25,11 @@ jobs:
           token: ${{ secrets.GH_HDC_PAT }}
           path: gh_hdc
 
+      - name: Prefer IPv4 over IPv6
+        run: |
+          # Force IPv4 preference to avoid Tailscale IPv6 connectivity issues
+          echo 'precedence ::ffff:0:0/96 100' | sudo tee -a /etc/gai.conf
+
       - name: Connect to Tailscale
         uses: tailscale/github-action@v4
         with:
@@ -33,6 +38,43 @@ jobs:
           tags: tag:ci
           hostname: github-runner-non-docker-hosts
           version: latest
+
+      - name: Debug connectivity to subnets
+        env:
+          UDM_PASSWORD: ${{ secrets.UDM_SSH_PASSWORD }}
+        run: |
+          echo "=== Testing connectivity to 192.168.1.1 (UDM) ==="
+          
+          # Test ping to UDM
+          echo "Ping test to UDM (IPv4):"
+          ping -4 -c 3 192.168.1.1 || echo "Ping to UDM failed"
+          
+          # Test SSH port on UDM
+          echo "SSH port test to UDM:"
+          nc -zv -w 5 192.168.1.1 22 || echo "Port 22 unreachable on UDM"
+          
+          # Try SSH to UDM (non-interactive command)
+          echo "SSH test to UDM:"
+          sshpass -p "${UDM_PASSWORD}" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 root@192.168.1.1 'echo "SSH to UDM successful"; uname -a' || echo "SSH to UDM failed"
+          
+          echo ""
+          echo "=== Testing connectivity to 192.168.5.22 (Bastion) ==="
+          
+          # Test ping to bastion
+          echo "Ping test to bastion (IPv4):"
+          ping -4 -c 3 192.168.5.22 || echo "Ping to bastion failed"
+          
+          # Test SSH port on bastion
+          echo "SSH port test to bastion:"
+          nc -zv -w 5 192.168.5.22 22 || echo "Port 22 unreachable on bastion"
+          
+          echo ""
+          echo "=== Tailscale Status ==="
+          tailscale status | head -20
+          
+          echo ""
+          echo "=== Tailscale Routes ==="
+          tailscale status --json | jq -r '.Peer[] | select(.AllowedIPs) | {hostname: .HostName, routes: .AllowedIPs}' || echo "No routes found"
 
       - name: Cache pipx and ansible
         uses: actions/cache@v5

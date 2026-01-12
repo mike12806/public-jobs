@@ -28,6 +28,9 @@ jobs:
           token: ${{ secrets.GH_HDC_PAT }}
           path: gh_hdc
 
+      - name: Prefer IPv4 for Tailscale
+        run: echo 'precedence ::ffff:0:0/96 100' | sudo tee -a /etc/gai.conf
+
       - name: Connect to Tailscale
         uses: tailscale/github-action@v4
         with:
