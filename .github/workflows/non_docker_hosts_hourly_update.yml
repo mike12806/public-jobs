@@ -25,6 +25,11 @@ jobs:
           token: ${{ secrets.GH_HDC_PAT }}
           path: gh_hdc
 
+      - name: Prefer IPv4 over IPv6
+        run: |
+          # Force IPv4 preference to avoid Tailscale IPv6 connectivity issues
+          echo 'precedence ::ffff:0:0/96 100' | sudo tee -a /etc/gai.conf
+
       - name: Connect to Tailscale
         uses: tailscale/github-action@v4
         with:
@@ -33,6 +38,30 @@ jobs:
           tags: tag:ci
           hostname: github-runner-non-docker-hosts
           version: latest
+
+      - name: Debug connectivity to 192.168.5.22
+        run: |
+          echo "Testing connectivity to 192.168.5.22..."
+          
+          # Test DNS resolution
+          echo "DNS resolution:"
+          nslookup 192.168.5.22 || echo "DNS lookup N/A for IP"
+          
+          # Test ping (IPv4)
+          echo "Ping test (IPv4):"
+          ping -4 -c 3 192.168.5.22 || echo "Ping failed"
+          
+          # Test SSH port
+          echo "SSH port test:"
+          nc -zv -w 5 192.168.5.22 22 || echo "Port 22 unreachable"
+          
+          # Show Tailscale status
+          echo "Tailscale status:"
+          tailscale status | head -20
+          
+          # Show routes
+          echo "Tailscale routes:"
+          tailscale status --json | jq -r '.Peer[] | select(.AllowedIPs) | {hostname: .HostName, routes: .AllowedIPs}' || echo "No routes found"
 
       - name: Cache pipx and ansible
         uses: actions/cache@v5
