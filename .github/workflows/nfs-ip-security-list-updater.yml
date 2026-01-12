@@ -172,6 +172,34 @@ jobs:
           
           chmod +x /tmp/truenas_api.py
 
+      - name: Debug connectivity to TrueNAS
+        run: |
+          echo "Testing connectivity to TrueNAS..."
+          
+          # Extract hostname from URL
+          TRUENAS_HOST=$(echo "${{ secrets.TRUENAS_API_URL }}" | sed -E 's|https?://([^/:]+).*|\1|')
+          echo "TrueNAS hostname: $TRUENAS_HOST"
+          
+          # Test DNS resolution
+          echo "DNS resolution:"
+          nslookup "$TRUENAS_HOST" || dig "$TRUENAS_HOST" || echo "DNS lookup failed"
+          
+          # Test ping
+          echo "Ping test:"
+          ping -c 2 "$TRUENAS_HOST" || echo "Ping failed (may be blocked)"
+          
+          # Test HTTPS connectivity
+          echo "HTTPS connectivity test:"
+          curl -sk -o /dev/null -w "HTTP Status: %{http_code}, Time: %{time_total}s\n" --connect-timeout 10 "${{ secrets.TRUENAS_API_URL }}" || echo "HTTPS test failed"
+          
+          # Test WebSocket endpoint reachability (via HTTPS first)
+          echo "WebSocket endpoint test (via curl):"
+          curl -sk -o /dev/null -w "HTTP Status: %{http_code}\n" --connect-timeout 10 "${{ secrets.TRUENAS_API_URL }}/api/current" || echo "WS endpoint test failed"
+          
+          # Show Tailscale status
+          echo "Tailscale status:"
+          tailscale status | head -20
+
       - name: Get all NFS share IDs from TrueNAS
         id: get_share_ids
         run: |
