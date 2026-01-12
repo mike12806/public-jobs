@@ -26,11 +26,6 @@ jobs:
           path: gh_hdc
           fetch-depth: 0
 
-      - name: Prefer IPv4 over IPv6
-        run: |
-          # Force IPv4 preference to avoid Tailscale IPv6 connectivity issues
-          echo 'precedence ::ffff:0:0/96 100' | sudo tee -a /etc/gai.conf
-
       - name: Connect to Tailscale
         uses: tailscale/github-action@v4
         with:
@@ -133,6 +128,12 @@ jobs:
           
           echo "Combined IPs: $ALL_IPS"
           echo "ips=$ALL_IPS" >> $GITHUB_OUTPUT
+
+      - name: Prefer IPv4 over IPv6
+        run: |
+          # Force IPv4 preference to avoid Tailscale IPv6 connectivity issues
+          # This is set here (after package installation) to avoid issues with package repos
+          echo 'precedence ::ffff:0:0/96 100' | sudo tee -a /etc/gai.conf
 
       - name: Create TrueNAS API helper script
         run: |
