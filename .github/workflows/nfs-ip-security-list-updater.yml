@@ -106,7 +106,7 @@ jobs:
               file_ips=$(extract_ips "$file")
               if [[ -n "$file_ips" ]]; then
                 # Count IPs without logging them
-                IP_COUNT=$(echo "$file_ips" | wc -l)
+                IP_COUNT=$(echo "$file_ips" | grep -c .)
                 echo "Found $IP_COUNT IPs in $file"
                 INVENTORY_IPS+="$file_ips"$'\n'
               else
@@ -121,8 +121,8 @@ jobs:
           INVENTORY_IPS=$(echo "$INVENTORY_IPS" | sort -u | grep -v '^$')
 
           # Count IPs without logging them
-          KUBE_IP_COUNT=$(echo "$KUBE_IPS" | grep -v '^$' | wc -l)
-          INVENTORY_IP_COUNT=$(echo "$INVENTORY_IPS" | grep -v '^$' | wc -l)
+          KUBE_IP_COUNT=$(echo "$KUBE_IPS" | grep -c . || echo 0)
+          INVENTORY_IP_COUNT=$(echo "$INVENTORY_IPS" | grep -c . || echo 0)
           echo "Kubernetes IP count: $KUBE_IP_COUNT"
           echo "Inventory IP count: $INVENTORY_IP_COUNT"
           
@@ -130,7 +130,11 @@ jobs:
           ALL_IPS=$(echo -e "${KUBE_IPS}\n${INVENTORY_IPS}" | grep -v '^[[:space:]]*$' | sort -u | tr '\n' ',' | sed 's/,$//')
           
           # Count IPs without logging them
-          IP_COUNT=$(echo "$ALL_IPS" | tr ',' '\n' | wc -l)
+          if [[ -z "$ALL_IPS" ]]; then
+            IP_COUNT=0
+          else
+            IP_COUNT=$(echo "$ALL_IPS" | tr ',' '\n' | grep -c .)
+          fi
           echo "Combined IP count: $IP_COUNT"
           echo "ips=$ALL_IPS" >> $GITHUB_OUTPUT
 
