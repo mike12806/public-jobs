@@ -99,13 +99,15 @@ jobs:
             echo "Processing file: $file"
             if [[ -f "$file" ]]; then
               echo "Found file: $file"
-              echo "File contents:"
-              cat "$file" || echo "Failed to read file"
+              # Count lines in file without displaying contents
+              LINE_COUNT=$(wc -l < "$file")
+              echo "File has $LINE_COUNT lines"
               
               file_ips=$(extract_ips "$file")
               if [[ -n "$file_ips" ]]; then
-                echo "IPs found in $file:"
-                echo "$file_ips"
+                # Count IPs without logging them
+                IP_COUNT=$(echo "$file_ips" | wc -l)
+                echo "Found $IP_COUNT IPs in $file"
                 INVENTORY_IPS+="$file_ips"$'\n'
               else
                 echo "No IPs found in $file"
@@ -118,15 +120,18 @@ jobs:
           # Clean up and deduplicate inventory IPs
           INVENTORY_IPS=$(echo "$INVENTORY_IPS" | sort -u | grep -v '^$')
 
-          echo "Kubernetes IPs:"
-          echo "$KUBE_IPS"
-          echo "Inventory IPs:"
-          echo "$INVENTORY_IPS"
+          # Count IPs without logging them
+          KUBE_IP_COUNT=$(echo "$KUBE_IPS" | grep -v '^$' | wc -l)
+          INVENTORY_IP_COUNT=$(echo "$INVENTORY_IPS" | grep -v '^$' | wc -l)
+          echo "Kubernetes IP count: $KUBE_IP_COUNT"
+          echo "Inventory IP count: $INVENTORY_IP_COUNT"
           
           # Combine, filter empty values, and deduplicate all IPs
           ALL_IPS=$(echo -e "${KUBE_IPS}\n${INVENTORY_IPS}" | grep -v '^[[:space:]]*$' | sort -u | tr '\n' ',' | sed 's/,$//')
           
-          echo "Combined IPs: $ALL_IPS"
+          # Count IPs without logging them
+          IP_COUNT=$(echo "$ALL_IPS" | tr ',' '\n' | wc -l)
+          echo "Combined IP count: $IP_COUNT"
           echo "ips=$ALL_IPS" >> $GITHUB_OUTPUT
 
       - name: Prefer IPv4 over IPv6
@@ -276,7 +281,9 @@ jobs:
             HOSTS_JSON=${HOSTS_JSON%,}
             HOSTS_JSON+="]"
             
-            echo "Updating NFS share ID: $ID with IPs: $HOSTS_JSON"
+            # Count IPs without logging them
+            IP_COUNT=$(echo "$HOSTS_JSON" | jq '. | length')
+            echo "Updating NFS share ID: $ID with $IP_COUNT IPs"
             
             # Create update data payload
             UPDATE_DATA=$(jq -n \
