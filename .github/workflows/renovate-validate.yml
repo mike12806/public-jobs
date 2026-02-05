@@ -8,6 +8,7 @@ on:
       - 'renovate.json5'
       - '.renovaterc.json'
       - '.renovaterc'
+      - '.github/workflows/renovate-validate.yml'
 
 jobs:
   validate:
@@ -21,11 +22,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: 'lts/*'
-
       - name: Validate Renovate config
         run: |
           # Find all potential Renovate config files
@@ -36,10 +32,10 @@ jobs:
             -name ".renovaterc" \
           \))
 
-          # Validate each config file using npx
+          # Validate each config file
           for config in $config_files; do
             echo "Validating $config..."
-            npx --yes --package=renovate renovate-config-validator "$config"
+            npx --yes -p renovate@latest renovate-config-validator "$config"
             if [ $? -ne 0 ]; then
               echo "Error: Invalid Renovate configuration in $config"
               exit 1
