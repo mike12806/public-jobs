@@ -39,7 +39,7 @@ jobs:
           # Validate each config file using npx
           for config in $config_files; do
             echo "Validating $config..."
-            npx --yes --package=renovate renovate-config-validator "$config"
+            npx --yes --package=renovate@latest renovate-config-validator "$config"
             if [ $? -ne 0 ]; then
               echo "Error: Invalid Renovate configuration in $config"
               exit 1
