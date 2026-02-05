@@ -3,6 +3,11 @@ name: renovate-config-validation
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+    paths:
+      - 'renovate.json'
+      - 'renovate.json5'
+      - '.renovaterc.json'
+      - '.renovaterc'
 
 jobs:
   validate:
