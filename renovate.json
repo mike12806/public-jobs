@@ -71,36 +71,36 @@
     }
   ],
   "argocd": {
-    "fileMatch": [
+    "managerFilePatterns": [
       "/kubernetes/apps/.*\\.ya?ml$/"
     ]
   },
   "helm-values": {
-    "fileMatch": [
+    "managerFilePatterns": [
       "/(^|/)values\\.ya?ml$/"
     ]
   },
   "kubernetes": {
-    "fileMatch": [
+    "managerFilePatterns": [
       "/deployment.yaml$/",
       "/deployment.yml$/"
     ]
   },
   "docker-compose": {
-    "fileMatch": [
+    "managerFilePatterns": [
       "/docker-compose.yaml$/",
       "/docker-compose.yml$/"
     ]
   },
   "github-actions": {
-    "fileMatch": [
+    "managerFilePatterns": [
       "/^\\.github/workflows/[^/]+\\.ya?ml$/"
     ]
   },
   "customManagers": [
     {
       "customType": "regex",
-      "fileMatch": [
+      "managerFilePatterns": [
         "/kubernetes/cloudnative-pg/databases/.*\\.ya?ml$/"
       ],
       "matchStrings": [
@@ -111,7 +111,7 @@
     },
     {
       "customType": "regex",
-      "fileMatch": [
+      "managerFilePatterns": [
         "/\\.ya?ml$/"
       ],
       "matchStrings": [
