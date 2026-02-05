@@ -71,37 +71,37 @@
     }
   ],
   "argocd": {
-    "fileMatch": [
-      "kubernetes/apps/.*\\.ya?ml$"
+    "managerFilePatterns": [
+      "/kubernetes/apps/.*\\.ya?ml$/"
     ]
   },
   "helm-values": {
-    "fileMatch": [
-      "(^|/)values\\.ya?ml$"
+    "managerFilePatterns": [
+      "/(^|/)values\\.ya?ml$/"
     ]
   },
   "kubernetes": {
-    "fileMatch": [
-      "deployment.yaml$",
-      "deployment.yml$"
+    "managerFilePatterns": [
+      "/deployment.yaml$/",
+      "/deployment.yml$/"
     ]
   },
   "docker-compose": {
-    "fileMatch": [
-      "docker-compose.yaml$",
-      "docker-compose.yml$"
+    "managerFilePatterns": [
+      "/docker-compose.yaml$/",
+      "/docker-compose.yml$/"
     ]
   },
   "github-actions": {
-    "fileMatch": [
-      "^\\.github/workflows/[^/]+\\.ya?ml$"
+    "managerFilePatterns": [
+      "/^\\.github/workflows/[^/]+\\.ya?ml$/"
     ]
   },
   "customManagers": [
     {
       "customType": "regex",
-      "fileMatch": [
-        "kubernetes/cloudnative-pg/databases/.*\\.ya?ml$"
+      "managerFilePatterns": [
+        "/kubernetes/cloudnative-pg/databases/.*\\.ya?ml$/"
       ],
       "matchStrings": [
         "imageName:\\s*(?<depName>[^:]+):(?<currentValue>.+?)\\n"
@@ -111,8 +111,8 @@
     },
     {
       "customType": "regex",
-      "fileMatch": [
-        "\\.ya?ml$"
+      "managerFilePatterns": [
+        "/\\.ya?ml$/"
       ],
       "matchStrings": [
         "image:\\s*tag:\\s*(?<currentValue>.*?)\\n"
