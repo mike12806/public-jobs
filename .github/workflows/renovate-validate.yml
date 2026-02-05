@@ -28,7 +28,7 @@ jobs:
 
       - name: Validate Renovate config
         run: |
-          # Find all potential Renovate config files
+          # Find all potential Renovate files
           config_files=$(find . -type f \( \
             -name "renovate.json" -o \
             -name "renovate.json5" -o \
