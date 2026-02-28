@@ -53,9 +53,14 @@ jobs:
           echo "$HOME/.local/bin" >> $GITHUB_PATH
 
       - name: Write SSH Private Key to File
+        env:
+          SSH_KEY: ${{ secrets.MIKEYSSHKEYLINODE }}
         run: |
-          echo "${{ secrets.MIKEYSSHKEYLINODE }}" | sed 's/\\n/\n/g' > /tmp/mike_ssh_key
+          printf '%s\n' "$SSH_KEY" > /tmp/mike_ssh_key
           chmod 600 /tmp/mike_ssh_key
+          # Debug: show key format (first line only, safe to display)
+          echo "Key starts with: $(head -1 /tmp/mike_ssh_key)"
+          echo "Key has $(wc -l < /tmp/mike_ssh_key) lines"
 
       - name: Write SSH Public Key to File
         run: |
