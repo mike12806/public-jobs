@@ -1,4 +1,4 @@
-name: Hourly Mac Pihole Update Check
+name: Hourly Linode Pihole Update Check
 
 on:
   schedule:
@@ -6,7 +6,7 @@ on:
   workflow_dispatch:  # Allows manual triggering from Gitea Actions UI
 
 concurrency:
-  group: pihole_mac_hourly_update
+  group: pihole_linode_hourly_update
   cancel-in-progress: true
 
 permissions:
@@ -60,20 +60,8 @@ jobs:
           chmod 600 /tmp/mike_ssh_key
           echo "Key has $(wc -l < /tmp/mike_ssh_key) lines"
 
-      - name: Setup Tailscale SSH wrapper for Mac
-        working-directory: gh_hdc/ansible
+      - name: Test connectivity to Linodes
         run: |
-          chmod +x inventory/tailscale_ssh_wrapper.sh
-          # Make wrapper accessible via PATH
-          sudo cp inventory/tailscale_ssh_wrapper.sh /usr/local/bin/tailscale_ssh_wrapper.sh
-          sudo chmod +x /usr/local/bin/tailscale_ssh_wrapper.sh
-
-      - name: Test connectivity to hosts
-        working-directory: gh_hdc/ansible
-        run: |
-          echo "Testing Tailscale SSH to Mac..."
-          tailscale ssh michaelfaherty@michaels-mac-mini "echo 'Tailscale SSH to Mac: OK'" || echo "Tailscale SSH to Mac: FAILED"
-          echo "Testing regular SSH to Linodes..."
           for host in 192.168.9.3 192.168.9.7 100.126.20.101; do
             ssh -i /tmp/mike_ssh_key -o StrictHostKeyChecking=no -o ConnectTimeout=10 root@$host "echo 'SSH to $host: OK'" 2>&1 || echo "SSH to $host: FAILED"
           done
