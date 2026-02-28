@@ -63,11 +63,30 @@ jobs:
           echo "${{ secrets.MIKESSHKEYLINODEPUB }}" | sed 's/\\n/\n/g' >> ~/.ssh/authorized_keys
           chmod 600 ~/.ssh/authorized_keys
 
+      - name: Test connectivity to Mac hosts
+        working-directory: gh_hdc/ansible
+        run: |
+          echo "Extracting hosts from inventory..."
+          grep -E "^[a-zA-Z0-9]" inventory/pihole_mac_hosts | grep -v "^\[" | while read host; do
+            echo "Testing connectivity to: $host"
+            if tailscale ping --timeout=10s "$host" 2>&1; then
+              echo "✅ Tailscale ping succeeded for $host"
+            else
+              echo "❌ Tailscale ping FAILED for $host"
+            fi
+            # Test SSH port
+            if nc -z -w 10 "$host" 22 2>&1; then
+              echo "✅ SSH port 22 is open on $host"
+            else
+              echo "❌ SSH port 22 is NOT reachable on $host"
+            fi
+          done
+
       - name: Run Ansible Playbook
         working-directory: gh_hdc/ansible  # Correct path
         env:
           ANSIBLE_SSH_PASS: ${{ secrets.ANSIBLE_SSH_PASSWORD_1 }}
-          ANSIBLE_PYTHON_INTERPRETER: /usr/bin/python3
+          ANSIBLE_PYTHON_INTERPRETER: auto
           ANSIBLE_GATHERING: smart
           ANSIBLE_TIMEOUT: 30
           ANSIBLE_STDOUT_CALLBACK: ansible.builtin.default
@@ -77,7 +96,7 @@ jobs:
           pipx run --spec ansible ansible-playbook playbooks/playbook_pihole_mac_update.yaml \
             -i inventory/pihole_mac_hosts \
             --private-key=/tmp/mike_ssh_key \
-            --extra-vars "ansible_ssh_pass=${ANSIBLE_SSH_PASS} ansible_ssh_common_args='-o StrictHostKeyChecking=no'"
+            --extra-vars "ansible_ssh_pass=${ANSIBLE_SSH_PASS} ansible_ssh_common_args='-o StrictHostKeyChecking=no -o ConnectTimeout=30 -o ServerAliveInterval=15 -o ServerAliveCountMax=3'"
 
       - name: Cleanup
         if: always()
