@@ -58,33 +58,24 @@ jobs:
         run: |
           printf '%s\n' "$SSH_KEY" > /tmp/mike_ssh_key
           chmod 600 /tmp/mike_ssh_key
-          # Debug: show key format (first line only, safe to display)
-          echo "Key starts with: $(head -1 /tmp/mike_ssh_key)"
           echo "Key has $(wc -l < /tmp/mike_ssh_key) lines"
 
-      - name: Write SSH Public Key to File
-        run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.MIKESSHKEYLINODEPUB }}" | sed 's/\\n/\n/g' >> ~/.ssh/authorized_keys
-          chmod 600 ~/.ssh/authorized_keys
-
-      - name: Test connectivity to Mac hosts
+      - name: Setup Tailscale SSH wrapper for Mac
         working-directory: gh_hdc/ansible
         run: |
-          echo "Extracting hosts from inventory..."
-          grep -E "^[a-zA-Z0-9]" inventory/pihole_mac_hosts | grep -v "^\[" | while read host; do
-            echo "Testing connectivity to: $host"
-            if tailscale ping --timeout=10s "$host" 2>&1; then
-              echo "✅ Tailscale ping succeeded for $host"
-            else
-              echo "❌ Tailscale ping FAILED for $host"
-            fi
-            # Test SSH port
-            if nc -z -w 10 "$host" 22 2>&1; then
-              echo "✅ SSH port 22 is open on $host"
-            else
-              echo "❌ SSH port 22 is NOT reachable on $host"
-            fi
+          chmod +x inventory/tailscale_ssh_wrapper.sh
+          # Make wrapper accessible via PATH
+          sudo cp inventory/tailscale_ssh_wrapper.sh /usr/local/bin/tailscale_ssh_wrapper.sh
+          sudo chmod +x /usr/local/bin/tailscale_ssh_wrapper.sh
+
+      - name: Test connectivity to hosts
+        working-directory: gh_hdc/ansible
+        run: |
+          echo "Testing Tailscale SSH to Mac..."
+          tailscale ssh michaelfaherty@michaels-mac-mini "echo 'Tailscale SSH to Mac: OK'" || echo "Tailscale SSH to Mac: FAILED"
+          echo "Testing regular SSH to Linodes..."
+          for host in 192.168.9.3 192.168.9.7 100.126.20.101; do
+            ssh -i /tmp/mike_ssh_key -o StrictHostKeyChecking=no -o ConnectTimeout=10 root@$host "echo 'SSH to $host: OK'" 2>&1 || echo "SSH to $host: FAILED"
           done
 
       - name: Run Ansible Playbook
@@ -107,5 +98,4 @@ jobs:
         if: always()
         run: |
           rm -f /tmp/mike_ssh_key
-          rm -rf ~/.ssh/authorized_keys
-          rm -rf ~/.ssh
+
