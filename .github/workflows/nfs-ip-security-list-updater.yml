@@ -45,7 +45,7 @@ jobs:
           python3 -c "import truenas_api_client; print(f'truenas_api_client installed successfully')"
 
       - name: Setup kubectl
-        uses: azure/setup-kubectl@v4
+        uses: azure/setup-kubectl@v5
         with:
           version: 'latest'
 
