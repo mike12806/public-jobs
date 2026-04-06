@@ -68,16 +68,6 @@ jobs:
           git config --global http.lowSpeedTime 300
           git config --global core.compression 0
 
-      - name: Verify Tailscale connectivity to Gitea
-        run: |
-          echo "Testing connectivity to Gitea server..."
-          if ! ping -c 3 git.mfaherty.net; then
-            echo "❌ Cannot reach git.mfaherty.net via Tailscale"
-            tailscale status
-            exit 1
-          fi
-          echo "✅ Tailscale connection to Gitea server verified"
-
       - name: Backup all GitHub repos (using archives)
         run: |
           cd github_backup
