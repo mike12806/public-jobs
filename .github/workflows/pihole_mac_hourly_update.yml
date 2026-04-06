@@ -60,12 +60,6 @@ jobs:
           chmod 600 /tmp/mike_ssh_key
           echo "Key has $(wc -l < /tmp/mike_ssh_key) lines"
 
-      - name: Test connectivity to Linodes
-        run: |
-          for host in 192.168.9.3 192.168.9.7 100.126.20.101; do
-            ssh -i /tmp/mike_ssh_key -o StrictHostKeyChecking=no -o ConnectTimeout=10 root@$host "echo 'SSH to $host: OK'" 2>&1 || echo "SSH to $host: FAILED"
-          done
-
       - name: Run Ansible Playbook
         working-directory: gh_hdc/ansible  # Correct path
         env:
