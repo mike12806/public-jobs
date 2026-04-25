@@ -20,7 +20,7 @@
   "platformAutomerge": true,
   "respectLatest": true,
   "ignoreTests": true,
-  "minimumReleaseAge": null,
+  "minimumReleaseAge": "3 days",
   "rebaseWhen": "auto",
   "packageRules": [
     {
