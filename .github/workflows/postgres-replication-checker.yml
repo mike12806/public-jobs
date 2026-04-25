@@ -2,7 +2,7 @@ name: Check PostgreSQL Replication
 
 on:
   schedule:
-    - cron: '37 * * * *'  # Run every hour at minute 37
+    - cron: '37 7 * * 3'  # Run weekly on Wednesday at 7:37 AM UTC
   workflow_dispatch:  # Allow manual trigger
 
 concurrency:
