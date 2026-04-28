@@ -40,7 +40,7 @@ permissions:
 
 jobs:
   plan-buckets:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
       ES_BASE_URL: ${{ secrets.ES_BASE_URL }}
@@ -59,14 +59,14 @@ jobs:
 
     steps:
       - name: Checkout gh_hdc
-        uses: actions/checkout@v6
+        uses: actions/checkout@1d96c772d19495a3b5c8dda2ff7a2fb3ba3dbf24  # v6.1.0
         with:
           repository: mike12806/gh_hdc
           token: ${{ secrets.GH_HDC_PAT }}
           path: gh_hdc
 
       - name: Connect to Tailscale
-        uses: tailscale/github-action@v4
+        uses: tailscale/github-action@51ca60e9cd01b00e9c2ee780705f97d4d3b8c4d5  # v4.0.0
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
@@ -77,7 +77,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y jq curl
+          sudo apt-get install -y jq=1.7.1-3 curl=8.5.0-2ubuntu10
 
       - name: Sanity check endpoint & index
         run: |
@@ -296,7 +296,7 @@ jobs:
   purge-old-logs:
     needs: plan-buckets
     if: needs.plan-buckets.outputs.has_work == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 360
     strategy:
       fail-fast: false
@@ -319,14 +319,14 @@ jobs:
 
     steps:
       - name: Checkout gh_hdc
-        uses: actions/checkout@v6
+        uses: actions/checkout@1d96c772d19495a3b5c8dda2ff7a2fb3ba3dbf24  # v6.1.0
         with:
           repository: mike12806/gh_hdc
           token: ${{ secrets.GH_HDC_PAT }}
           path: gh_hdc
 
       - name: Connect to Tailscale
-        uses: tailscale/github-action@v4
+        uses: tailscale/github-action@51ca60e9cd01b00e9c2ee780705f97d4d3b8c4d5  # v4.0.0
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
@@ -337,7 +337,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y curl
+          sudo apt-get install -y curl=8.5.0-2ubuntu10
 
       - name: Sanity check endpoint & index
         run: |
@@ -550,7 +550,7 @@ jobs:
   report-summary:
     needs: [plan-buckets, purge-old-logs]
     if: always() && needs.plan-buckets.outputs.has_work == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Aggregate performance metrics
@@ -578,7 +578,7 @@ jobs:
   force-merge:
     needs: [plan-buckets, purge-old-logs]
     if: needs.plan-buckets.outputs.has_work == 'true' && needs.purge-old-logs.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
       ES_BASE_URL: ${{ secrets.ES_BASE_URL }}
@@ -588,14 +588,14 @@ jobs:
 
     steps:
       - name: Checkout gh_hdc
-        uses: actions/checkout@v6
+        uses: actions/checkout@1d96c772d19495a3b5c8dda2ff7a2fb3ba3dbf24  # v6.1.0
         with:
           repository: mike12806/gh_hdc
           token: ${{ secrets.GH_HDC_PAT }}
           path: gh_hdc
 
       - name: Connect to Tailscale
-        uses: tailscale/github-action@v4
+        uses: tailscale/github-action@51ca60e9cd01b00e9c2ee780705f97d4d3b8c4d5  # v4.0.0
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
@@ -606,7 +606,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y jq curl
+          sudo apt-get install -y jq=1.7.1-3 curl=8.5.0-2ubuntu10
 
       - name: Force merge to reclaim disk space
         run: |

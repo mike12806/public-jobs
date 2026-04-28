@@ -14,12 +14,12 @@ permissions:
 
 jobs:
   update-nfs-clients:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
 
     steps:
       - name: Checkout gh_hdc
-        uses: actions/checkout@v6
+        uses: actions/checkout@1d96c772d19495a3b5c8dda2ff7a2fb3ba3dbf24  # v6.1.0
         with:
           repository: mike12806/gh_hdc
           token: ${{ secrets.GH_HDC_PAT }}
@@ -27,7 +27,7 @@ jobs:
           fetch-depth: 0
 
       - name: Connect to Tailscale
-        uses: tailscale/github-action@v4
+        uses: tailscale/github-action@51ca60e9cd01b00e9c2ee780705f97d4d3b8c4d5  # v4.0.0
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
@@ -38,14 +38,14 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y jq curl python3 python3-pip
+          sudo apt-get install -y jq=1.7.1-3 curl=8.5.0-2ubuntu10 python3 python3=3.12.1-0ubuntu1-pip=24.0-1ubuntu1
           # Install official TrueNAS API client from GitHub
           sudo pip3 install --upgrade git+https://github.com/truenas/api_client.git
           # Verify installation
           python3 -c "import truenas_api_client; print(f'truenas_api_client installed successfully')"
 
       - name: Setup kubectl
-        uses: azure/setup-kubectl@v5
+        uses: azure/setup-kubectl@8c1cc9a0ddce0451cd9ceba29e98ab85a4f7c07d  # v5.0.0
         with:
           version: 'latest'
 

@@ -14,19 +14,19 @@ permissions:
 
 jobs:
   deploy:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
 
     steps:
       - name: Checkout gh_hdc
-        uses: actions/checkout@v6
+        uses: actions/checkout@1d96c772d19495a3b5c8dda2ff7a2fb3ba3dbf24  # v6.1.0
         with:
           repository: mike12806/gh_hdc
           token: ${{ secrets.GH_HDC_PAT }}
           path: gh_hdc
 
       - name: Connect to Tailscale
-        uses: tailscale/github-action@v4
+        uses: tailscale/github-action@51ca60e9cd01b00e9c2ee780705f97d4d3b8c4d5  # v4.0.0
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
@@ -35,7 +35,7 @@ jobs:
           version: latest
 
       - name: Cache pipx and ansible
-        uses: actions/cache@v5
+        uses: actions/cache@0865c47f36b7a7154ec971ff4b4b4fe38514f249  # v5.0.0
         with:
           path: |
             ~/.local/bin
@@ -47,8 +47,8 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y python3-pip python3-venv pipx sshpass openssh-client
-          pipx install ansible
+          sudo apt-get install -y python3-pip=24.0-1ubuntu1 python3=3.12.1-0ubuntu1 python3-venv=3.12.1-0ubuntu1 pipx=1.4.1-1 sshpass=1.10-1 openssh-client=1:9.3p1-1ubuntu3
+          pipx install ansible==2.13.0
           pipx ensurepath
           echo "$HOME/.local/bin" >> $GITHUB_PATH
 
