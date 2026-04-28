@@ -7,14 +7,14 @@ on:
 jobs:
   validate:
     name: validate-renovate-config
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       pull-requests: read
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
       - name: Validate Renovate config
         run: |
@@ -29,7 +29,7 @@ jobs:
           # Validate each config file
           for config in $config_files; do
             echo "Validating $config..."
-            npx --yes -p renovate@latest renovate-config-validator "$config"
+            npx --yes -p renovate@43 renovate-config-validator "$config"
             if [ $? -ne 0 ]; then
               echo "Error: Invalid Renovate configuration in $config"
               exit 1

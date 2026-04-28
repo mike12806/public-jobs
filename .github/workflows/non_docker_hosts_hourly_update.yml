@@ -14,12 +14,12 @@ permissions:
 
 jobs:
   deploy:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
 
     steps:
       - name: Checkout gh_hdc
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           repository: mike12806/gh_hdc
           token: ${{ secrets.GH_HDC_PAT }}
@@ -31,7 +31,7 @@ jobs:
           echo 'precedence ::ffff:0:0/96 100' | sudo tee -a /etc/gai.conf
 
       - name: Connect to Tailscale
-        uses: tailscale/github-action@v4
+        uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8  # v4.1.2
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
@@ -40,7 +40,7 @@ jobs:
           version: latest
 
       - name: Cache pipx and ansible
-        uses: actions/cache@v5
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
         with:
           path: |
             ~/.local/bin
@@ -52,8 +52,8 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y python3-pip python3-venv pipx sshpass openssh-client
-          pipx install ansible
+          sudo apt-get install -y python3-pip=24.0-1ubuntu1 python3=3.12.1-0ubuntu1 python3-venv=3.12.1-0ubuntu1 pipx=1.4.1-1 sshpass=1.10-1 openssh-client=1:9.3p1-1ubuntu3
+          pipx install ansible==2.13.0
           pipx ensurepath
           echo "$HOME/.local/bin" >> $GITHUB_PATH
 

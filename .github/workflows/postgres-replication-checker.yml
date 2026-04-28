@@ -14,19 +14,19 @@ permissions:
 
 jobs:
   check-replication:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
 
     steps:
       - name: Checkout gh_hdc
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           repository: mike12806/gh_hdc
           token: ${{ secrets.GH_HDC_PAT }}
           path: gh_hdc
 
       - name: Connect to Tailscale
-        uses: tailscale/github-action@v4
+        uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8  # v4.1.2
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
@@ -37,7 +37,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y postgresql-client
+          sudo apt-get install -y postgresql-client=16+251
 
       - name: Check PostgreSQL Replication Status
         id: check_replication
@@ -235,7 +235,7 @@ jobs:
 
       - name: Send email on failure
         if: steps.check_replication.outputs.status == 'FAIL'
-        uses: dawidd6/action-send-mail@v16
+        uses: dawidd6/action-send-mail@d38f3f7cd391cdebfe0d38efc3998b935e951c4f  # v16
         with:
           server_address: ${{ secrets.SMTP_SERVER }}
           server_port: ${{ secrets.SMTP_PORT }}
