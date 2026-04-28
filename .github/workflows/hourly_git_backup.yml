@@ -51,10 +51,12 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y git=1:2.53.0-0ppa1~ubuntu24.04.1 jq=1.7.1-3ubuntu0.24.04.1 gpg=2.4.4-2ubuntu17.4 curl=8.5.0-2ubuntu10.8
-          curl -fsSL -L https://github.com/Backblaze/B2_Command_Line_Tool/releases/download/v4.6.0/b2-linux -o /tmp/b2
-          sudo install -m 0755 /tmp/b2 /usr/local/bin/b2
-          rm /tmp/b2
+          sudo apt-get install -y git jq gpg curl
+          if ! command -v b2 &>/dev/null; then
+            curl -fsSL -L https://github.com/Backblaze/B2_Command_Line_Tool/releases/download/v4.6.0/b2-linux -o /tmp/b2
+            sudo install -m 0755 /tmp/b2 /usr/local/bin/b2
+            rm /tmp/b2
+          fi
 
       - name: Prepare workspace
         run: |
