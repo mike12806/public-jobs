@@ -19,7 +19,7 @@ jobs:
 
     steps:
       - name: Checkout gh_hdc
-        uses: actions/checkout@1d96c772d19495a3b5c8dda2ff7a2fb3ba3dbf24  # v6.1.0
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           repository: mike12806/gh_hdc
           token: ${{ secrets.GH_HDC_PAT }}
@@ -27,7 +27,7 @@ jobs:
           fetch-depth: 0
 
       - name: Connect to Tailscale
-        uses: tailscale/github-action@51ca60e9cd01b00e9c2ee780705f97d4d3b8c4d5  # v4.0.0
+        uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8  # v4.1.2
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
@@ -45,7 +45,7 @@ jobs:
           python3 -c "import truenas_api_client; print(f'truenas_api_client installed successfully')"
 
       - name: Setup kubectl
-        uses: azure/setup-kubectl@8c1cc9a0ddce0451cd9ceba29e98ab85a4f7c07d  # v5.0.0
+        uses: azure/setup-kubectl@829323503d1be3d00ca8346e5391ca0b07a9ab0d  # v5.1.0
         with:
           version: 'latest'
 

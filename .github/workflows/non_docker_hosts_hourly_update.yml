@@ -19,7 +19,7 @@ jobs:
 
     steps:
       - name: Checkout gh_hdc
-        uses: actions/checkout@1d96c772d19495a3b5c8dda2ff7a2fb3ba3dbf24  # v6.1.0
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           repository: mike12806/gh_hdc
           token: ${{ secrets.GH_HDC_PAT }}
@@ -31,7 +31,7 @@ jobs:
           echo 'precedence ::ffff:0:0/96 100' | sudo tee -a /etc/gai.conf
 
       - name: Connect to Tailscale
-        uses: tailscale/github-action@51ca60e9cd01b00e9c2ee780705f97d4d3b8c4d5  # v4.0.0
+        uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8  # v4.1.2
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
@@ -40,7 +40,7 @@ jobs:
           version: latest
 
       - name: Cache pipx and ansible
-        uses: actions/cache@0865c47f36b7a7154ec971ff4b4b4fe38514f249  # v5.0.0
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
         with:
           path: |
             ~/.local/bin

@@ -19,7 +19,7 @@ jobs:
 
     steps:
       - name: Connect to Tailscale
-        uses: tailscale/github-action@51ca60e9cd01b00e9c2ee780705f97d4d3b8c4d5  # v4.0.0
+        uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8  # v4.1.2
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
