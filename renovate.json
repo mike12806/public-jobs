@@ -3,6 +3,7 @@
   "extends": [
     "config:recommended"
   ],
+  "internalChecksFilter": "strict",
   "enabledManagers": [
     "docker-compose",
     "helm-values",
