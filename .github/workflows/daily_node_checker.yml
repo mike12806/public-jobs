@@ -5,8 +5,8 @@ permissions:
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '15 10 * * *'  # 6:15 AM Eastern Time (10:15 UTC)
+  # schedule:
+  #   - cron: '15 10 * * *'  # 6:15 AM Eastern Time (10:15 UTC)
 
 jobs:
   check-k8s-nodes:

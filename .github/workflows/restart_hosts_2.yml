@@ -1,8 +1,8 @@
 name: Restart Hosts 2 Group (If Needed)
 
 on:
-  schedule:
-    - cron: '45 7 * * 6' # Adjusted to run on Saturday at 07:45 UTC
+  # schedule:
+  #   - cron: '45 7 * * 6' # Adjusted to run on Saturday at 07:45 UTC
   workflow_dispatch:  # Allows manual triggering
 
 concurrency:

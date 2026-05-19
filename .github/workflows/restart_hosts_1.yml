@@ -1,8 +1,8 @@
 name: Restart Hosts 1 Group (If Needed)
 
 on:
-  schedule:
-    - cron: '45 7 * * 5' # Adjusted to run on Friday at 07:45 UTC
+  # schedule:
+  #   - cron: '45 7 * * 5' # Adjusted to run on Friday at 07:45 UTC
   workflow_dispatch:  # This allows manual triggering from Github Actions UI
 
 concurrency:
