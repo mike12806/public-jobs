@@ -1,8 +1,8 @@
 name: Check CloudNativePG Backups and WAL Archiving
 
 on:
-  # schedule:
-  #   - cron: '15 * * * *'  # Run every hour at minute 15
+  schedule:
+    - cron: '15 * * * *'  # Run every hour at minute 15
   workflow_dispatch:  # Allow manual trigger
 
 concurrency:

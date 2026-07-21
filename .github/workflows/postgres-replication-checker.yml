@@ -1,8 +1,8 @@
 name: Check PostgreSQL Replication
 
 on:
-  # schedule:
-  #   - cron: '37 * * * *'  # Run every hour at minute 37
+  schedule:
+    - cron: '37 * * * *'  # Run every hour at minute 37
   workflow_dispatch:  # Allow manual trigger
 
 concurrency:
