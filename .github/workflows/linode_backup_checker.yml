@@ -1,8 +1,8 @@
 name: Linode Backup Check
 
 on:
-  # schedule:
-  #   - cron: "0 6,18 * * *"  # Runs twice daily at 6:00 AM and 6:00 PM UTC
+  schedule:
+    - cron: "0 6,18 * * *"  # Runs twice daily at 6:00 AM and 6:00 PM UTC
   workflow_dispatch:  # Allows manual triggering from the GitHub Actions UI
 
 concurrency:

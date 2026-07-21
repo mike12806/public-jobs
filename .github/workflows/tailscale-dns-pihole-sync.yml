@@ -2,8 +2,8 @@ name: Sync Tailscale DNS to Pi-hole
 
 on:
   workflow_dispatch:
-  # schedule:
-  #   - cron: '*/15 * * * *'  # every 15 minutes
+  schedule:
+    - cron: '*/15 * * * *'  # every 15 minutes
 
 concurrency:
   group: tailscale-dns-pihole-sync

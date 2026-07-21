@@ -28,8 +28,8 @@ on:
         required: false
         default: '30'
         type: string
-  # schedule:
-  #   - cron: '0 */6 * * *'  # Every 6 hours (at 00:00, 06:00, 12:00, and 18:00 UTC)
+  schedule:
+    - cron: '0 */6 * * *'  # Every 6 hours (at 00:00, 06:00, 12:00, and 18:00 UTC)
 
 concurrency:
   group: log-purge

@@ -2,8 +2,8 @@ name: Update TrueNAS NFS Client IPs
 
 on:
   workflow_dispatch:
-  # schedule:
-  #   - cron: '*/15 * * * *'  # every 15 minutes
+  schedule:
+    - cron: '*/15 * * * *'  # every 15 minutes
 
 concurrency:
   group: nfs-ip-security-list-updater
