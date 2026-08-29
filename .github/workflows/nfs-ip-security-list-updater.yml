@@ -39,16 +39,29 @@ jobs:
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq curl python3 python3-pip
-          # Install official TrueNAS API client from GitHub
-          sudo pip3 install --upgrade git+https://github.com/truenas/api_client.git
-          # Pin websocket-client: 1.9.1 (released 2026-08-29) added an unguarded
-          # `self.sock.close_frame` read to WebSocketApp.close(). The run_forever
-          # thread clears self.sock in teardown() at the same time, so every clean
-          # shutdown races and raises:
+          # Both pins below are kept current by Renovate (see the
+          # truenas-api-client / websocket-client custom managers in renovate.json).
+          # Edit only the value on the assignment line; the surrounding shape is
+          # what those managers match on.
+
+          # TrueNAS api_client is not published on PyPI, so it is installed from git
+          # and pinned to an exact commit on the default branch. Renovate tracks that
+          # branch via the git-refs datasource and opens a PR when it moves, which
+          # keeps upstream changes reviewable instead of landing silently mid-cron.
+          TRUENAS_API_CLIENT_REF="8d7e37383717aea15ce46167cfcd92325acbcd8a"
+
+          # websocket-client 1.9.1 (2026-08-29) added an unguarded `self.sock.close_frame`
+          # read to WebSocketApp.close(). The run_forever thread clears self.sock in
+          # teardown() at the same time, so every clean shutdown raced and raised:
           #   'NoneType' object has no attribute 'close_frame'
-          # api_client depends on websocket-client unpinned, so this must be pinned
-          # here. Drop the pin once upstream ships a fix.
-          sudo pip3 install 'websocket-client==1.9.0'
+          # api_client depends on websocket-client with no version ceiling, so the
+          # version is pinned here. Safe to move past 1.9.1 once upstream fixes it.
+          WEBSOCKET_CLIENT_VERSION="1.9.0"
+
+          sudo pip3 install --upgrade \
+            "git+https://github.com/truenas/api_client.git@${TRUENAS_API_CLIENT_REF}" \
+            "websocket-client==${WEBSOCKET_CLIENT_VERSION}"
+
           # Verify installation
           python3 -c "import truenas_api_client; print('truenas_api_client installed successfully')"
           python3 -c "import websocket; print(f'websocket-client {websocket.__version__}')"

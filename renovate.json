@@ -9,7 +9,8 @@
     "helm-values",
     "kubernetes",
     "argocd",
-    "github-actions"
+    "github-actions",
+    "custom.regex"
   ],
   "registryAliases": {
     "harbor.mfaherty.net/dockerhub-proxy": "docker.io",
@@ -121,6 +122,32 @@
       "datasourceTemplate": "docker",
       "depNameTemplate": "immich",
       "versioningTemplate": "semver"
+    },
+    {
+      "customType": "regex",
+      "description": "TrueNAS api_client commit pin in the NFS updater workflow (not on PyPI, installed from git)",
+      "managerFilePatterns": [
+        ".github/workflows/nfs-ip-security-list-updater.yml"
+      ],
+      "matchStrings": [
+        "TRUENAS_API_CLIENT_REF=\"(?<currentDigest>[0-9a-f]{40})\""
+      ],
+      "currentValueTemplate": "main",
+      "depNameTemplate": "truenas/api_client",
+      "packageNameTemplate": "https://github.com/truenas/api_client",
+      "datasourceTemplate": "git-refs"
+    },
+    {
+      "customType": "regex",
+      "description": "websocket-client version pin in the NFS updater workflow",
+      "managerFilePatterns": [
+        ".github/workflows/nfs-ip-security-list-updater.yml"
+      ],
+      "matchStrings": [
+        "WEBSOCKET_CLIENT_VERSION=\"(?<currentValue>[^\"]+)\""
+      ],
+      "depNameTemplate": "websocket-client",
+      "datasourceTemplate": "pypi"
     }
   ]
 }
