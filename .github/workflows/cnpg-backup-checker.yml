@@ -184,10 +184,16 @@ jobs:
             echo "error<<EOF" >> $GITHUB_OUTPUT
             echo -e "$FAILED_CHECKS" >> $GITHUB_OUTPUT
             echo "EOF" >> $GITHUB_OUTPUT
+            # Fail the run so it shows red. Outputs are already written above,
+            # and the email step below runs on failure via always().
+            exit 1
           fi
 
       - name: Send email on failure
-        if: steps.check_cnpg.outputs.status == 'FAIL'
+        # always() is required: without it this step is skipped as soon as the
+        # check step exits non-zero. Keyed on the step conclusion so a hard
+        # failure (e.g. the cluster being unreachable) also sends mail.
+        if: always() && steps.check_cnpg.conclusion == 'failure'
         uses: dawidd6/action-send-mail@94de994a9f6fffee200243214e17002e2920bb59  # v18
         with:
           server_address: ${{ secrets.SMTP_SERVER }}
@@ -199,7 +205,7 @@ jobs:
             CloudNativePG health check failed.
             
             Failures detected:
-            ${{ steps.check_cnpg.outputs.error }}
+            ${{ steps.check_cnpg.outputs.error || 'The check step failed before it could report results - see the workflow run for details.' }}
             
             Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           to: ${{ secrets.EMAIL_TO }}
