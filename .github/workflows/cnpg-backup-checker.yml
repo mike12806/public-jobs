@@ -102,58 +102,72 @@ jobs:
               echo "  ✅ WAL archiving is working"
             fi
             
-            # Check last backup time using backup events (works with barman-cloud plugin)
+            # Check last backup status using the Backup CRs.
+            # NOTE: this deliberately does NOT use kubectl events. Events have a
+            # 1h TTL on this cluster, so with daily backups the "Completed" event
+            # has expired for ~23 of this job's 24 hourly runs. Backup CRs persist.
             SCHEDULED_BACKUPS=$(kubectl -n cloudnative-pg get scheduledbackup -o json | jq -r ".items[] | select(.spec.cluster.name==\"$CLUSTER\") | .metadata.name")
-            
+
             if [ -z "$SCHEDULED_BACKUPS" ]; then
               echo "  ⚠️  No scheduled backup found for this cluster"
+            fi
+
+            ALL_BACKUPS=$(kubectl -n cloudnative-pg get backups.postgresql.cnpg.io -o json)
+
+            # Most recent successfully completed backup for this cluster
+            LAST_COMPLETED=$(echo "$ALL_BACKUPS" | jq -r --arg c "$CLUSTER" '
+              [ .items[]
+                | select(.spec.cluster.name == $c)
+                | select(.status.phase == "completed")
+                | select(.status.stoppedAt != null) ]
+              | sort_by(.status.stoppedAt) | last // empty')
+
+            if [ -z "$LAST_COMPLETED" ]; then
+              echo "    ❌ No completed backups found for this cluster"
+              FAILED_CHECKS="${FAILED_CHECKS}${CLUSTER}: No completed backups found\n"
+              ALL_PASSED=false
             else
-              for SCHED_BACKUP in $SCHEDULED_BACKUPS; do
-                echo "  📅 Checking scheduled backup: $SCHED_BACKUP"
-                
-                # Get the most recent completed backup event for this cluster
-                # This works with both traditional and barman-cloud plugin backups
-                LAST_COMPLETED_EVENT=$(kubectl -n cloudnative-pg get events \
-                  --field-selector involvedObject.kind=Backup,reason=Completed \
-                  -o json | jq -r "[.items[] | select(.involvedObject.name | startswith(\"${SCHED_BACKUP}-\"))] | sort_by(.lastTimestamp) | last")
-                
-                if [ "$LAST_COMPLETED_EVENT" == "null" ] || [ -z "$LAST_COMPLETED_EVENT" ]; then
-                  echo "    ❌ No successful backup events found for scheduled backup"
-                  FAILED_CHECKS="${FAILED_CHECKS}${CLUSTER}: No successful backup events found\n"
-                  ALL_PASSED=false
-                  continue
-                fi
-                
-                LAST_BACKUP_TIME=$(echo "$LAST_COMPLETED_EVENT" | jq -r '.lastTimestamp')
-                BACKUP_NAME=$(echo "$LAST_COMPLETED_EVENT" | jq -r '.involvedObject.name')
-                
-                echo "    Latest successful backup: $BACKUP_NAME at $LAST_BACKUP_TIME"
-                
-                # Check for failed backup events after the successful one
-                LAST_FAILED_EVENT=$(kubectl -n cloudnative-pg get events \
-                  --field-selector involvedObject.kind=Backup \
-                  -o json | jq -r "[.items[] | select(.involvedObject.name | startswith(\"${SCHED_BACKUP}-\")) | select(.reason == \"Failed\" or .reason == \"Error\")] | sort_by(.lastTimestamp) | last")
-                
-                if [ "$LAST_FAILED_EVENT" != "null" ] && [ -n "$LAST_FAILED_EVENT" ]; then
-                  LAST_FAILED_TIME=$(echo "$LAST_FAILED_EVENT" | jq -r '.lastTimestamp')
-                  echo "    ⚠️  Last failed backup event: $LAST_FAILED_TIME"
-                fi
-                
-                # Check backup age
-                BACKUP_TIMESTAMP=$(date -d "$LAST_BACKUP_TIME" +%s 2>/dev/null || echo "0")
-                CURRENT_TIMESTAMP=$(date +%s)
-                AGE_HOURS=$(( ($CURRENT_TIMESTAMP - $BACKUP_TIMESTAMP) / 3600 ))
-                
-                echo "    Backup age: ${AGE_HOURS} hours"
-                
-                if [ $AGE_HOURS -gt 48 ]; then
-                  echo "    ❌ Backup is older than 48 hours"
-                  FAILED_CHECKS="${FAILED_CHECKS}${CLUSTER}: Latest backup is ${AGE_HOURS} hours old (threshold: 48 hours)\n"
-                  ALL_PASSED=false
-                else
-                  echo "    ✅ Backup is recent (< 48 hours)"
-                fi
-              done
+              LAST_BACKUP_TIME=$(echo "$LAST_COMPLETED" | jq -r '.status.stoppedAt')
+              BACKUP_NAME=$(echo "$LAST_COMPLETED" | jq -r '.metadata.name')
+
+              echo "    Latest successful backup: $BACKUP_NAME at $LAST_BACKUP_TIME"
+
+              # Any failed backups since that success mean backups are broken now
+              FAILED_SINCE=$(echo "$ALL_BACKUPS" | jq -r --arg c "$CLUSTER" --arg since "$LAST_BACKUP_TIME" '
+                [ .items[]
+                  | select(.spec.cluster.name == $c)
+                  | select(.status.phase == "failed")
+                  | select(.metadata.creationTimestamp > $since) ]
+                | length')
+
+              if [ "$FAILED_SINCE" -gt 0 ]; then
+                LAST_ERROR=$(echo "$ALL_BACKUPS" | jq -r --arg c "$CLUSTER" --arg since "$LAST_BACKUP_TIME" '
+                  [ .items[]
+                    | select(.spec.cluster.name == $c)
+                    | select(.status.phase == "failed")
+                    | select(.metadata.creationTimestamp > $since) ]
+                  | sort_by(.metadata.creationTimestamp) | last
+                  | "\(.metadata.name): \(.status.error // "unknown error")"')
+                echo "    ❌ ${FAILED_SINCE} failed backup(s) since the last success"
+                echo "       Most recent: $LAST_ERROR"
+                FAILED_CHECKS="${FAILED_CHECKS}${CLUSTER}: ${FAILED_SINCE} failed backup(s) since last success - ${LAST_ERROR}\n"
+                ALL_PASSED=false
+              fi
+
+              # Check backup age
+              BACKUP_TIMESTAMP=$(date -d "$LAST_BACKUP_TIME" +%s 2>/dev/null || echo "0")
+              CURRENT_TIMESTAMP=$(date +%s)
+              AGE_HOURS=$(( ($CURRENT_TIMESTAMP - $BACKUP_TIMESTAMP) / 3600 ))
+
+              echo "    Backup age: ${AGE_HOURS} hours"
+
+              if [ $AGE_HOURS -gt 48 ]; then
+                echo "    ❌ Backup is older than 48 hours"
+                FAILED_CHECKS="${FAILED_CHECKS}${CLUSTER}: Latest backup is ${AGE_HOURS} hours old (threshold: 48 hours)\n"
+                ALL_PASSED=false
+              else
+                echo "    ✅ Backup is recent (< 48 hours)"
+              fi
             fi
             
             echo "─────────────────────────────────────"
