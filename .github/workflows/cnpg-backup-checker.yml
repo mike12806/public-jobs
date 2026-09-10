@@ -194,7 +194,7 @@ jobs:
         # check step exits non-zero. Keyed on the step conclusion so a hard
         # failure (e.g. the cluster being unreachable) also sends mail.
         if: always() && steps.check_cnpg.conclusion == 'failure'
-        uses: dawidd6/action-send-mail@94de994a9f6fffee200243214e17002e2920bb59  # v18
+        uses: dawidd6/action-send-mail@d35571df1982970871070b5e02f01d3b6095cb74  # v19
         with:
           server_address: ${{ secrets.SMTP_SERVER }}
           server_port: ${{ secrets.SMTP_PORT }}
