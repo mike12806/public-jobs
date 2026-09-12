@@ -8,9 +8,11 @@ Per node, in sequence:
   1. skip unless /var/run/reboot-required exists on the host
   2. cordon + drain (a failed drain aborts the run; it is never forced past)
   3. reboot, escalating only on failure:
-       a. systemctl reboot in-guest   (graceful, clean unmount)
-       b. qm shutdown  via Proxmox    (ACPI)
-       c. qm stop + qm start          (hard power cycle -- last resort)
+       a. systemctl reboot in-guest      (graceful, clean unmount)
+       b. Proxmox /status/reboot         (ACPI; shuts down AND restarts)
+       c. Proxmox stop + start           (hard power cycle -- last resort)
+     A rung "succeeds" only if the node goes NotReady AND returns Ready. A guest
+     hung during shutdown fails that test and escalates, which is the point.
   4. wait for a *clean* return: Ready + Longhorn engine + CSI registered
   5. uncordon, then wait for Longhorn to be fully healthy before the next node
 
@@ -37,13 +39,19 @@ from datetime import datetime, timezone
 
 # --- tunables -----------------------------------------------------------------
 DRAIN_TIMEOUT = 900          # 15m; generous, Longhorn detach can be slow
-GRACEFUL_DOWN_WAIT = 300     # 5m for in-guest reboot to take the node down
-ACPI_DOWN_WAIT = 300         # 5m more after qm shutdown
-HARD_DOWN_WAIT = 120         # after qm stop
+GRACEFUL_WAIT = 420          # 7m for an in-guest reboot to go down AND return
+ACPI_WAIT = 420              # 7m for a hypervisor ACPI reboot to do the same
+HARD_STOP_WAIT = 180         # 3m for the VM to actually reach 'stopped'
 RETURN_TIMEOUT = 900         # 15m to come back fully healthy
 SETTLE_TIMEOUT = 3600        # 60m for Longhorn to finish rebuilding
 POLL = 15
-DEBUG_IMAGE = "busybox:1.37"
+KUBECTL_RETRIES = 3          # ride out API blips (kube-vip failover, etc.)
+KUBECTL_RETRY_DELAY = 10
+# Pulled on every host read; use the local proxy so Docker Hub rate limits or
+# an outage cannot break the run. Override with REBOOTCTL_IMAGE.
+DEBUG_IMAGE = os.environ.get(
+    "REBOOTCTL_IMAGE", "harbor.mfaherty.net/dockerhub-proxy/library/busybox:1.37"
+)
 
 
 class Abort(Exception):
@@ -55,13 +63,35 @@ def log(msg: str) -> None:
 
 
 # --- kubectl ------------------------------------------------------------------
-def kubectl(*args: str, check: bool = True, timeout: int = 120) -> str:
-    proc = subprocess.run(
-        ["kubectl", *args], capture_output=True, text=True, timeout=timeout
-    )
-    if check and proc.returncode != 0:
-        raise Abort(f"kubectl {' '.join(args)} failed: {proc.stderr.strip()}")
-    return proc.stdout
+def kubectl(*args: str, check: bool = True, timeout: int = 120,
+            retries: int = KUBECTL_RETRIES) -> str:
+    """Run kubectl, riding out transient API failures.
+
+    Rebooting a control-plane node blips the API (kube-vip failover), and a
+    single hiccup should not abort an overnight run. Mutating verbs are still
+    safe to retry here: cordon/uncordon/drain are idempotent.
+    """
+    last = ""
+    for attempt in range(1, retries + 1):
+        try:
+            proc = subprocess.run(
+                ["kubectl", *args], capture_output=True, text=True, timeout=timeout
+            )
+        except subprocess.TimeoutExpired:
+            last = f"timed out after {timeout}s"
+        else:
+            if proc.returncode == 0:
+                return proc.stdout
+            last = proc.stderr.strip()
+            if not check:
+                return proc.stdout
+        if attempt < retries:
+            log(f"      kubectl {args[0]} failed ({last[:80]}); "
+                f"retry {attempt}/{retries - 1}")
+            time.sleep(KUBECTL_RETRY_DELAY)
+    if check:
+        raise Abort(f"kubectl {' '.join(args)} failed after {retries} tries: {last}")
+    return ""
 
 
 def kubectl_json(*args: str) -> dict:
@@ -165,12 +195,33 @@ def reboot_reason(node: str) -> str:
 
 
 # --- Longhorn -----------------------------------------------------------------
+def longhorn_installed() -> bool:
+    out = kubectl("get", "crd", "volumes.longhorn.io", check=False, timeout=30)
+    return "volumes.longhorn.io" in out
+
+
 def longhorn_state() -> tuple[int, int, int]:
-    """(degraded, rebuilding, faulted). Longhorn absent -> all zero."""
+    """(degraded, rebuilding, faulted).
+
+    Raises Abort if Longhorn is installed but cannot be queried. Returning
+    "healthy" on a failed query would fail OPEN: every gate in this script
+    trusts these numbers, so an API blip during a reboot would green-light the
+    next node -- the exact failure this workflow exists to prevent.
+
+    A cluster with no Longhorn at all legitimately has nothing to gate on.
+    """
+    if not longhorn_installed():
+        return (0, 0, 0)
+
     try:
         vols = kubectl_json("get", "volumes.longhorn.io", "-n", "longhorn-system")
-    except Abort:
-        return (0, 0, 0)
+        engines = kubectl_json("get", "engines.longhorn.io", "-n", "longhorn-system")
+    except Abort as exc:
+        raise Abort(
+            f"Longhorn is installed but its state could not be read ({exc}). "
+            "Refusing to treat unknown storage health as healthy."
+        )
+
     degraded = faulted = 0
     for v in vols.get("items", []):
         r = v.get("status", {}).get("robustness")
@@ -178,14 +229,11 @@ def longhorn_state() -> tuple[int, int, int]:
             degraded += 1
         elif r == "faulted":
             faulted += 1
-    rebuilding = 0
-    try:
-        engines = kubectl_json("get", "engines.longhorn.io", "-n", "longhorn-system")
-        for e in engines.get("items", []):
-            if e.get("status", {}).get("rebuildStatus"):
-                rebuilding += 1
-    except Abort:
-        pass
+
+    rebuilding = sum(
+        1 for e in engines.get("items", [])
+        if e.get("status", {}).get("rebuildStatus")
+    )
     return (degraded, rebuilding, faulted)
 
 
@@ -349,20 +397,47 @@ def assert_identity(node: str, vm: VmRef) -> None:
 
 
 # --- per-node reboot ----------------------------------------------------------
-def wait_down(node: str, vm: VmRef, seconds: int) -> bool:
+def vm_status(vm: VmRef) -> str | None:
+    """Proxmox's view of the VM: 'running', 'stopped', or None if unknown."""
+    try:
+        st = vm.host.call(
+            f"/nodes/{vm.host.pve_node}/qemu/{vm.vmid}/status/current"
+        ) or {}
+        return st.get("status")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def wait_back(node: str, vm: VmRef, seconds: int) -> bool:
+    """Did the node go away and come back Ready?
+
+    This, not "did it go down", is the right success test for a reboot rung.
+    An in-guest `systemctl reboot` never stops the QEMU process, so Proxmox
+    reports 'running' the whole time -- waiting for 'stopped' would hang on a
+    perfectly successful reboot. Conversely, NotReady alone means nothing: a
+    guest hung during shutdown goes NotReady in seconds and stays there, which
+    is precisely the case the next rung exists for.
+
+    Requiring down-then-up makes a stuck node fail this check and escalate,
+    which is the whole point of the ladder.
+    """
     deadline = time.time() + seconds
+    saw_down = False
     while time.time() < deadline:
         if not node_ready(node):
-            try:
-                st = vm.host.call(
-                    f"/nodes/{vm.host.pve_node}/qemu/{vm.vmid}/status/current"
-                ) or {}
-                if st.get("status") == "stopped":
-                    return True
-            except Exception:  # noqa: BLE001
-                pass
-            return True  # NotReady is enough to consider it going down
+            if not saw_down:
+                log("      node went NotReady (rebooting)")
+            saw_down = True
+        elif saw_down:
+            log("      node returned Ready")
+            return True
         time.sleep(POLL)
+
+    if saw_down:
+        log(f"      STUCK: NotReady for {seconds}s without returning "
+            f"(Proxmox says: {vm_status(vm)})")
+    else:
+        log(f"      node never went down after {seconds}s -- reboot did not take")
     return False
 
 
@@ -371,14 +446,31 @@ def wait_clean_return(node: str, timeout: int) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
         if node_ready(node):
-            pods = kubectl(
-                "get", "pods", "-n", "longhorn-system", "--field-selector",
-                f"spec.nodeName={node}", "--no-headers", check=False, timeout=30,
+            # Ask for readiness explicitly rather than pattern-matching "2/2" in
+            # the table, which silently breaks if the DaemonSet changes shape.
+            out = kubectl(
+                "get", "pods", "-n", "longhorn-system",
+                "--field-selector", f"spec.nodeName={node}",
+                "-o", 'jsonpath={range .items[*]}{.metadata.name}{"\t"}'
+                      '{.status.phase}{"\t"}'
+                      '{.status.containerStatuses[*].ready}{"\n"}{end}',
+                check=False, timeout=30,
             )
-            has_im = any("instance-manager" in l and "Running" in l
-                         for l in pods.splitlines())
-            has_csi = any("csi-plugin" in l and "Running" in l and "2/2" in l
-                          for l in pods.splitlines())
+
+            def _ready(substr: str) -> bool:
+                for line in out.splitlines():
+                    parts = line.split("\t")
+                    if len(parts) < 3 or substr not in parts[0]:
+                        continue
+                    states = parts[2].split()
+                    if parts[1] == "Running" and states and all(
+                        s == "true" for s in states
+                    ):
+                        return True
+                return False
+
+            has_im = _ready("instance-manager")
+            has_csi = _ready("longhorn-csi-plugin")
             if has_im and has_csi:
                 log(f"    {node} returned clean (Ready + Longhorn engine + CSI)")
                 return
@@ -397,20 +489,38 @@ def reboot_node(node: str, vm: VmRef, dry_run: bool) -> None:
     # Rung 1 -- graceful, in-guest. Clean unmount of Longhorn replicas.
     log("    rung 1/3: systemctl reboot (in-guest)")
     run_on_host(node, "nsenter -t 1 -m -u -i -n -p -- systemctl reboot", timeout=60)
-    if wait_down(node, vm, GRACEFUL_DOWN_WAIT):
+    if wait_back(node, vm, GRACEFUL_WAIT):
         return
 
-    # Rung 2 -- ACPI via the hypervisor. Guest still chooses how to stop.
-    log("    rung 2/3: qm shutdown (ACPI)")
-    vm.host.call(f"{base}/status/shutdown", method="POST")
-    if wait_down(node, vm, ACPI_DOWN_WAIT):
-        return
+    # Rung 2 -- ACPI reboot via the hypervisor. Use /status/reboot, not
+    # /status/shutdown: shutdown leaves the VM powered off and nothing would
+    # start it again.
+    log("    rung 2/3: Proxmox ACPI reboot")
+    try:
+        vm.host.call(f"{base}/status/reboot", method="POST")
+    except Exception as exc:  # noqa: BLE001
+        log(f"      ACPI reboot call failed ({exc}); escalating")
+    else:
+        if wait_back(node, vm, ACPI_WAIT):
+            return
 
-    # Rung 3 -- hard power cycle. Unclean; only because the node is stuck.
-    log("    rung 3/3: qm stop + start (HARD power cycle)")
-    assert_identity(node, vm)
+    # Rung 3 -- hard power cycle. Unclean, so only for a node that is stuck.
+    log("    rung 3/3: HARD power cycle (qm stop + start)")
+    assert_identity(node, vm)  # re-verify identity right before destroying state
     vm.host.call(f"{base}/status/stop", method="POST")
-    time.sleep(HARD_DOWN_WAIT)
+
+    deadline = time.time() + HARD_STOP_WAIT
+    while time.time() < deadline:
+        if vm_status(vm) == "stopped":
+            break
+        time.sleep(5)
+    else:
+        raise Abort(
+            f"{node}: VM {vm.host.name}:{vm.vmid} did not reach 'stopped' within "
+            f"{HARD_STOP_WAIT}s; refusing to start it in an unknown state"
+        )
+
+    log("      VM stopped; starting")
     vm.host.call(f"{base}/status/start", method="POST")
 
 
