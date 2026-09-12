@@ -1,0 +1,132 @@
+name: Kubernetes Rolling Node Reboot
+
+# Replaces kured. Reboots only nodes that actually need it, one at a time,
+# waiting for Longhorn to be fully healthy between nodes, and aborting rather
+# than continuing if anything fails to come back cleanly.
+#
+# Required secrets:
+#   KUBECONFIG         base64-encoded kubeconfig (same as the other k8s jobs)
+#   PVE_TOKEN_ID  / PVE_SECRET    credentials for https://pve.mfaherty.net
+#   PVE2_TOKEN_ID / PVE2_SECRET   credentials for https://pve2.mfaherty.net
+#   ... through PVE7_TOKEN_ID / PVE7_SECRET
+#                      token_id looks like "ci@pve!reboot". The token needs
+#                      VM.Audit + VM.PowerMgmt on the k8s node VMs only.
+#                      Do NOT use root@pam.
+#                      A host with no secrets is skipped; its k8s nodes then
+#                      have no hypervisor and are never touched.
+#   TS_OAUTH_CLIENT_ID / TS_OAUTH_SECRET   Tailscale access
+#   SMTP_* / EMAIL_*                       failure notification
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Report what would happen without changing anything"
+        type: boolean
+        default: true
+      deadline_utc:
+        description: "Stop starting new nodes after this UTC time (HH:MM)"
+        type: string
+        default: "09:00"
+  schedule:
+    # 01:30 Eastern. Long window before the deadline stops new nodes.
+    - cron: "30 5 * * *"
+
+concurrency:
+  group: kubernetes_rolling_reboot
+  cancel-in-progress: false # never interrupt a node mid-reboot
+
+jobs:
+  rolling-reboot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout public-jobs
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@780049a30b6ff5c378a9e7b389d15ece7a204888 # v4.1.3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          hostname: github-runner-k8s-rolling-reboot
+          version: latest
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@829323503d1be3d00ca8346e5391ca0b07a9ab0d # v5.1.0
+        with:
+          version: "latest"
+
+      - name: Set up kubeconfig
+        run: |
+          mkdir -p "$HOME/.kube"
+          base64 -d > "$HOME/.kube/config" << 'EOF'
+          ${{ secrets.KUBECONFIG }}
+          EOF
+          chmod 600 "$HOME/.kube/config"
+          kubectl cluster-info || { echo "cannot reach cluster"; exit 1; }
+
+      - name: Rolling reboot
+        env:
+          PVE_DOMAIN: mfaherty.net
+          PVE_HOST_COUNT: "7"
+          PVE_TOKEN_ID: ${{ secrets.PVE_TOKEN_ID }}
+          PVE_SECRET: ${{ secrets.PVE_SECRET }}
+          PVE2_TOKEN_ID: ${{ secrets.PVE2_TOKEN_ID }}
+          PVE2_SECRET: ${{ secrets.PVE2_SECRET }}
+          PVE3_TOKEN_ID: ${{ secrets.PVE3_TOKEN_ID }}
+          PVE3_SECRET: ${{ secrets.PVE3_SECRET }}
+          PVE4_TOKEN_ID: ${{ secrets.PVE4_TOKEN_ID }}
+          PVE4_SECRET: ${{ secrets.PVE4_SECRET }}
+          PVE5_TOKEN_ID: ${{ secrets.PVE5_TOKEN_ID }}
+          PVE5_SECRET: ${{ secrets.PVE5_SECRET }}
+          PVE6_TOKEN_ID: ${{ secrets.PVE6_TOKEN_ID }}
+          PVE6_SECRET: ${{ secrets.PVE6_SECRET }}
+          PVE7_TOKEN_ID: ${{ secrets.PVE7_TOKEN_ID }}
+          PVE7_SECRET: ${{ secrets.PVE7_SECRET }}
+          # Scheduled runs are live; manual runs default to dry-run.
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
+          REBOOT_DEADLINE_UTC: ${{ github.event_name == 'workflow_dispatch' && inputs.deadline_utc || '09:00' }}
+        run: python3 scripts/k8s_rolling_reboot.py
+
+      - name: Report cluster state
+        if: always()
+        run: |
+          echo "### Node state" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          kubectl get nodes 2>&1 >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "### Longhorn volumes by robustness" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          kubectl get volumes.longhorn.io -n longhorn-system \
+            -o jsonpath='{range .items[*]}{.status.robustness}{"\n"}{end}' 2>/dev/null \
+            | sort | uniq -c >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Email on failure
+        if: failure()
+        uses: dawidd6/action-send-mail@ca8dbb4d4f91ca7f75e7f2feea5339e76ce70c90 # v20
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "[k8s] Rolling reboot ABORTED - cluster needs attention"
+          to: ${{ secrets.EMAIL_TO }}
+          from: ${{ secrets.EMAIL_FROM }}
+          body: |
+            The nightly Kubernetes rolling reboot aborted.
+
+            Remaining nodes were deliberately left untouched, so the cluster
+            should still be serving - but a node may be cordoned or mid-reboot.
+
+            Check node and Longhorn state before the next run:
+              kubectl get nodes
+              kubectl get volumes.longhorn.io -n longhorn-system
+
+            Run log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
