@@ -1,0 +1,195 @@
+name: Diagnose Kubernetes API Access
+
+# Manual only. Answers the one question the cluster cannot answer for us: what
+# is the CI kubeconfig pointing at, and who is on the other end of it.
+#
+# Since 2026-09-12 21:45 UTC every kubectl job in this repo gets HTTP 401
+# ("the server has asked for the client to provide credentials") in ~200ms,
+# while SSH and HTTP jobs over the same tailnet keep working and node-local
+# kubectl on the k3s servers is fine. That leaves two candidates: a CI
+# credential the API server no longer accepts, or something in front of the
+# API server answering the 401 before k3s ever sees the request. GitHub
+# secrets are write-only, so the only place to look is from inside a run.
+#
+# THIS REPOSITORY IS PUBLIC, so:
+#   - nothing here decodes, extracts or re-assembles the credential. kubectl
+#     and openssl read the kubeconfig themselves; no key, cert or token is
+#     unpacked out of it. `kubectl config view` redacts secret fields, and
+#     `--v=8` masks the Authorization header.
+#   - the endpoint host is registered as a log mask before any command can
+#     print it, and is identified by the first 8 hex of its SHA-256. Hash a
+#     candidate locally to match it:
+#       printf '%s' k8s.example.net | sha256sum | cut -c1-8
+#
+# What it does print is non-secret and decisive: the response line, headers and
+# body of the 401. kube-apiserver answers with a JSON Status object and
+# WWW-Authenticate: Basic realm="kubernetes-master"; a proxy, ingress or
+# Tailscale API-server proxy answers differently. That shape says whether k3s
+# is even hearing these requests.
+
+permissions:
+  contents: read
+
+concurrency:
+  group: k8s-access-diagnostics
+  cancel-in-progress: true
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+
+    steps:
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@780049a30b6ff5c378a9e7b389d15ece7a204888  # v4.1.3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          hostname: github-runner-k8s-diagnostics
+          version: latest
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@829323503d1be3d00ca8346e5391ca0b07a9ab0d  # v5.1.0
+        with:
+          version: 'latest'
+
+      - name: Set up kubeconfig
+        run: |
+          mkdir -p $HOME/.kube
+          base64 -d > $HOME/.kube/config << 'EOF'
+          ${{ secrets.KUBECONFIG }}
+          EOF
+          chmod 600 $HOME/.kube/config
+
+          if ! python3 -c "import yaml; yaml.safe_load(open('$HOME/.kube/config'))" 2>/dev/null; then
+            echo "ERROR: kubeconfig is not valid YAML"
+            exit 1
+          fi
+
+      - name: Report
+        run: |
+          set -uo pipefail
+          export KUBECONFIG=$HOME/.kube/config
+
+          # The server URL is configuration, not a credential, but it names
+          # internal topology -- mask the host before anything can print it.
+          SERVER=$(kubectl config view -o jsonpath='{.clusters[0].cluster.server}')
+          HOST=$(printf '%s' "$SERVER" | sed -E 's#^[a-z]+://##; s#[:/].*$##')
+          PORT=$(printf '%s' "$SERVER" | sed -nE 's#^[a-z]+://[^:/]+:([0-9]+).*$#\1#p')
+          PORT=${PORT:-443}
+          # A Rancher-style endpoint carries its cluster id in the path
+          # (/k8s/clusters/c-m-xxxxx), so keep the prefix for the probes below
+          # and mask it too -- it identifies the cluster just as the host does.
+          PREFIX=$(printf '%s' "$SERVER" | sed -E 's#^[a-z]+://[^/]+##')
+          echo "::add-mask::$HOST"
+          if [ -n "$PREFIX" ] && [ "$PREFIX" != "/" ]; then
+            echo "::add-mask::$PREFIX"
+          fi
+
+          sha8() { printf '%s' "$1" | sha256sum | cut -c1-8; }
+
+          classify() {
+            case "$1" in
+              100.6[4-9].*|100.[7-9][0-9].*|100.1[0-1][0-9].*|100.12[0-7].*) echo "100.64/10 tailnet CGNAT" ;;
+              10.*)       echo "10/8 private (subnet-routed or LAN)" ;;
+              192.168.*)  echo "192.168/16 private (subnet-routed or LAN)" ;;
+              172.1[6-9].*|172.2[0-9].*|172.3[0-1].*) echo "172.16/12 private" ;;
+              127.*)      echo "loopback" ;;
+              *)          echo "PUBLIC address" ;;
+            esac
+          }
+
+          echo "=============================================================="
+          echo "1. WHAT THE CI KUBECONFIG SAYS  (secret fields redacted by kubectl)"
+          echo "=============================================================="
+          kubectl config view | sed "s/$HOST/(masked-host)/g" | sed 's/^/  /'
+          echo
+          echo "  endpoint host sha256[0:8] : $(sha8 "$HOST")   port: $PORT"
+          if [ -n "$PREFIX" ] && [ "$PREFIX" != "/" ]; then
+            echo "  endpoint has a PATH PREFIX  : yes -- a proxied endpoint (Rancher-style), not a bare apiserver"
+          else
+            echo "  endpoint has a path prefix  : no"
+          fi
+          case "$HOST" in
+            *.ts.net)
+              echo "  endpoint shape            : MagicDNS name (*.ts.net) -- a TAILSCALE-FRONTED endpoint."
+              echo "                              Auth there is tailnet identity + ACL grants, not the kubeconfig cert." ;;
+            [0-9]*.[0-9]*.[0-9]*.[0-9]*)
+              echo "  endpoint shape            : literal IPv4, $(classify "$HOST")" ;;
+            *)
+              echo "  endpoint shape            : DNS name, $(printf '%s' "$HOST" | awk -F. '{print NF}') labels, .${HOST##*.} TLD" ;;
+          esac
+
+          echo
+          echo "=============================================================="
+          echo "2. NAME RESOLUTION AND PATH"
+          echo "=============================================================="
+          addrs=$(getent ahostsv4 "$HOST" 2>/dev/null | awk '{print $1}' | sort -u)
+          if [ -n "$addrs" ]; then
+            echo "  resolves to $(printf '%s\n' "$addrs" | grep -c .) address(es):"
+            printf '%s\n' "$addrs" | while read -r a; do
+              echo "    - sha256[0:8] $(sha8 "$a")  $(classify "$a")"
+            done
+            first=$(printf '%s\n' "$addrs" | head -1)
+            echo "  route to the first address:"
+            ip route get "$first" 2>&1 | sed "s/$first/(masked-ip)/g" | sed 's/^/    /'
+          else
+            echo "  DNS: NO RESOLUTION for the endpoint host"
+          fi
+          echo "  tailscale ping:"
+          timeout 20 tailscale ping -c 2 --timeout 5s "$HOST" 2>&1 | sed 's/^/    /'
+
+          echo
+          echo "=============================================================="
+          echo "3. WHO IS ON THE OTHER END (TLS)"
+          echo "=============================================================="
+          # k3s names its CAs k3s-<kind>-ca@<epoch>, so the epoch in the issuer
+          # CN says when that CA was minted. An issuer epoch that does not match
+          # the cluster's means this endpoint is not the PKI we think it is.
+          if timeout 20 openssl s_client -connect "$HOST:$PORT" -servername "$HOST" </dev/null 2>/dev/null \
+               | openssl x509 -noout -subject -issuer -dates -serial -fingerprint -sha256 2>/dev/null \
+               | sed "s/$HOST/(masked-host)/g" | sed 's/^/  /'; then :; else
+            echo "  TLS handshake FAILED -- nothing listening, or not speaking TLS"
+          fi
+
+          echo
+          echo "=============================================================="
+          echo "4. WHO ANSWERS THE 401  (no credentials sent)"
+          echo "=============================================================="
+          # Every apiserver 401s an anonymous GET /version when anonymous auth is
+          # off. The point is not the code, it is the SHAPE of the reply.
+          curl -sS -k -m 15 -D /tmp/h -o /tmp/b "https://$HOST:$PORT${PREFIX%/}/version" 2>&1 | sed 's/^/  /'
+          echo "  --- response headers ---"
+          sed "s/$HOST/(masked-host)/g" /tmp/h 2>/dev/null | head -20 | sed 's/^/  /' || echo "  (none)"
+          echo "  --- body, first 400 bytes ---"
+          head -c 400 /tmp/b 2>/dev/null | sed "s/$HOST/(masked-host)/g" | sed 's/^/  /'
+          echo
+
+          echo
+          echo "=============================================================="
+          echo "5. THE SAME REQUEST, AS CI MAKES IT"
+          echo "=============================================================="
+          # kubectl reads the kubeconfig itself and masks the Authorization
+          # header in its own trace, so this shows the real request and the real
+          # response without anything unpacking the credential.
+          kubectl get --raw='/version' --v=8 2>&1 \
+            | sed "s/$HOST/(masked-host)/g" \
+            | grep -viE 'bearer [a-z0-9]' \
+            | head -60 | sed 's/^/  /'
+
+          echo
+          echo "=============================================================="
+          echo "6. IDENTITY, IF THE SERVER WILL SAY"
+          echo "=============================================================="
+          kubectl auth whoami 2>&1 | sed "s/$HOST/(masked-host)/g" | head -10 | sed 's/^/  /'
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -f /tmp/h /tmp/b
+          rm -f $HOME/.kube/config
+          rm -rf $HOME/.kube
