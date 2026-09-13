@@ -85,6 +85,12 @@ jobs:
           # (/k8s/clusters/c-m-xxxxx), so keep the prefix for the probes below
           # and mask it too -- it identifies the cluster just as the host does.
           PREFIX=$(printf '%s' "$SERVER" | sed -E 's#^[a-z]+://[^/]+##')
+          # An empty mask value masks nothing, so refuse to continue rather
+          # than print an unmasked endpoint into a public log further down.
+          if [ -z "$HOST" ]; then
+            echo "::error::could not read a server host out of the kubeconfig; refusing to run unmasked"
+            exit 1
+          fi
           echo "::add-mask::$HOST"
           if [ -n "$PREFIX" ] && [ "$PREFIX" != "/" ]; then
             echo "::add-mask::$PREFIX"
@@ -104,9 +110,29 @@ jobs:
           }
 
           echo "=============================================================="
-          echo "1. WHAT THE CI KUBECONFIG SAYS  (secret fields redacted by kubectl)"
+          echo "1. WHAT THE CI KUBECONFIG SAYS  (field names and shapes only)"
           echo "=============================================================="
-          kubectl config view | sed "s/$HOST/(masked-host)/g" | sed 's/^/  /'
+          # Deliberately NOT `kubectl config view`. That redacts certs, keys,
+          # tokens and passwords, but it prints an exec credential plugin's
+          # args and env verbatim -- and those can carry a token. Emit only key
+          # names, counts and booleans, so no value from the user block can
+          # reach the log whatever auth style the kubeconfig uses.
+          python3 - << 'PY' | sed 's/^/  /'
+          import os, yaml
+          cfg = yaml.safe_load(open(os.path.expanduser("~/.kube/config")))
+          ctx = next(c["context"] for c in cfg["contexts"] if c["name"] == cfg.get("current-context"))
+          cluster = next(c["cluster"] for c in cfg["clusters"] if c["name"] == ctx["cluster"])
+          user = next(u["user"] for u in cfg["users"] if u["name"] == ctx["user"])
+          print("auth method(s) in the user block :", ", ".join(sorted(user.keys())) or "(none)")
+          if "exec" in user:
+              print("exec credential plugin           : command =", user["exec"].get("command"),
+                    "  (args and env NOT printed)")
+          print("insecure-skip-tls-verify         :", cluster.get("insecure-skip-tls-verify", False))
+          print("certificate-authority-data       :", "present" if "certificate-authority-data" in cluster else "absent")
+          print("clusters / users / contexts      :",
+                len(cfg.get("clusters", [])), "/", len(cfg.get("users", [])), "/", len(cfg.get("contexts", [])))
+          print("default namespace                :", ctx.get("namespace", "(default)"))
+          PY
           echo
           echo "  endpoint host sha256[0:8] : $(sha8 "$HOST")   port: $PORT"
           if [ -n "$PREFIX" ] && [ "$PREFIX" != "/" ]; then
@@ -135,13 +161,33 @@ jobs:
               echo "    - sha256[0:8] $(sha8 "$a")  $(classify "$a")"
             done
             first=$(printf '%s\n' "$addrs" | head -1)
-            echo "  route to the first address:"
-            ip route get "$first" 2>&1 | sed "s/$first/(masked-ip)/g" | sed 's/^/    /'
+            # Interface only. The full route line carries the destination and
+            # the runner's own tailnet source address; the diagnostic value is
+            # entirely in which device the traffic leaves by.
+            echo "  egress interface for the first address: $(ip route get "$first" 2>/dev/null | sed -nE 's/.* dev ([^ ]+).*/\1/p' | head -1 || echo unknown)"
           else
             echo "  DNS: NO RESOLUTION for the endpoint host"
           fi
-          echo "  tailscale ping:"
-          timeout 20 tailscale ping -c 2 --timeout 5s "$HOST" 2>&1 | sed 's/^/    /'
+          # Summarised, not echoed: raw `tailscale ping` output names the peer
+          # node and its 100.64/10 address, which is tailnet topology this
+          # public log has no business carrying.
+          ping_out=$(timeout 20 tailscale ping -c 2 --timeout 5s "$HOST" 2>&1)
+          if printf '%s' "$ping_out" | grep -q '^pong'; then
+            via=$(printf '%s' "$ping_out" | sed -nE 's/.* via ([^ ]+).*/\1/p' | head -1)
+            rtt=$(printf '%s' "$ping_out" | sed -nE 's/.* in ([0-9]+m?s).*/\1/p' | head -1)
+            # A direct path reports the peer's endpoint as host:port -- report
+            # only that it was direct, never the address itself. A DERP region
+            # name is not topology, so it can be named.
+            case "$via" in
+              DERP*) echo "  tailscale ping: PONG via $via relay in ${rtt:-?}" ;;
+              "")    echo "  tailscale ping: PONG in ${rtt:-?}, path unknown" ;;
+              *)     echo "  tailscale ping: PONG via a DIRECT path in ${rtt:-?}" ;;
+            esac
+          elif printf '%s' "$ping_out" | grep -qi 'no matching peer\|not found\|is not a tailscale'; then
+            echo "  tailscale ping: endpoint is NOT a tailnet peer (reached via subnet route or plain routing)"
+          else
+            echo "  tailscale ping: no pong within the timeout"
+          fi
 
           echo
           echo "=============================================================="
