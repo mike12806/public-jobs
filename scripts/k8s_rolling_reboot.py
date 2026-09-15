@@ -150,8 +150,8 @@ def kubectl(*args: str, check: bool = True, timeout: int = 120,
     return ""
 
 
-def kubectl_json(*args: str) -> dict:
-    return json.loads(kubectl(*args, "-o", "json"))
+def kubectl_json(*args: str, **kw) -> dict:
+    return json.loads(kubectl(*args, "-o", "json", **kw))
 
 
 def node_ready(name: str) -> bool:
@@ -525,33 +525,50 @@ def wait_back(node: str, vm: VmRef, seconds: int,
     return False
 
 
+def longhorn_pods_on(node: str) -> list[tuple[str, str, list[str]]]:
+    """(name, phase, container readiness) for every longhorn-system pod on node.
+
+    Built from JSON rather than a jsonpath template. The template this replaced
+    embedded \t and \n, which Python turned into literal control characters
+    inside the jsonpath before kubectl ever saw them -- and it ran with
+    check=False, so if kubectl rejected it the result was empty output, which
+    reads exactly like "no storage pods here". A gate cannot be allowed to fail
+    silently into its own negative.
+    """
+    data = kubectl_json("get", "pods", "-n", "longhorn-system",
+                        "--field-selector", f"spec.nodeName={node}", timeout=30)
+    pods = []
+    for item in data.get("items", []):
+        pods.append((
+            item.get("metadata", {}).get("name", ""),
+            item.get("status", {}).get("phase", ""),
+            [str(c.get("ready")) for c in
+             item.get("status", {}).get("containerStatuses", [])],
+        ))
+    return pods
+
+
 def wait_clean_return(node: str, timeout: int) -> None:
     """Ready is not enough -- CSI registers ~60s later and mounts fail in the gap."""
     deadline = time.time() + timeout
+    said = False
     while time.time() < deadline:
         if node_ready(node):
-            # Ask for readiness explicitly rather than pattern-matching "2/2" in
-            # the table, which silently breaks if the DaemonSet changes shape.
-            out = kubectl(
-                "get", "pods", "-n", "longhorn-system",
-                "--field-selector", f"spec.nodeName={node}",
-                "-o", 'jsonpath={range .items[*]}{.metadata.name}{"\t"}'
-                      '{.status.phase}{"\t"}'
-                      '{.status.containerStatuses[*].ready}{"\n"}{end}',
-                check=False, timeout=30,
-            )
+            try:
+                pods = longhorn_pods_on(node)
+            except Abort as exc:
+                # Loudly, not as a False. An unreadable cluster is not an
+                # unhealthy node, and the two must not look the same here.
+                log(f"    cannot read storage pods on {node}: {exc}")
+                time.sleep(POLL)
+                continue
 
             def _ready(substr: str) -> bool:
-                for line in out.splitlines():
-                    parts = line.split("\t")
-                    if len(parts) < 3 or substr not in parts[0]:
-                        continue
-                    states = parts[2].split()
-                    if parts[1] == "Running" and states and all(
-                        s == "true" for s in states
-                    ):
-                        return True
-                return False
+                return any(
+                    substr in name and phase == "Running"
+                    and states and all(s == "True" for s in states)
+                    for name, phase, states in pods
+                )
 
             has_im = _ready("instance-manager")
             has_csi = _ready("longhorn-csi-plugin")
@@ -559,6 +576,17 @@ def wait_clean_return(node: str, timeout: int) -> None:
                 log(f"    {node} returned clean (Ready + Longhorn engine + CSI)")
                 return
             log(f"    {node} Ready; waiting for storage (engine={has_im} csi={has_csi})")
+            if not said:
+                # Say once what is actually on the node. "engine=False csi=False"
+                # on its own cannot distinguish a pod that is missing from one
+                # that is Pending, crash-looping, or simply not ready yet.
+                said = True
+                if pods:
+                    for name, phase, states in pods:
+                        log(f"      {name}: {phase} ready={','.join(states) or '-'}")
+                else:
+                    log(f"      no longhorn-system pods on {node} at all -- "
+                        f"nothing is being scheduled back onto it")
         time.sleep(POLL)
     raise Abort(f"{node} did not return healthy within {timeout}s")
 
