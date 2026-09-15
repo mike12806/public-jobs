@@ -56,8 +56,8 @@ concurrency:
 
 jobs:
   rolling-reboot:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 240
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
 
     steps:
       - name: Checkout public-jobs
