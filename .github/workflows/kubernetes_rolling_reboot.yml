@@ -47,8 +47,10 @@ on:
         type: string
         default: ""
   schedule:
-    # 01:30 Eastern. Long window before the deadline stops new nodes.
-    - cron: "30 5 * * *"
+    # 01:00 Eastern while EDT is in effect; cron has no timezone, so this drifts
+    # to 00:00 Eastern over the winter. Either way it leaves a long window
+    # before the 09:00 UTC deadline stops new nodes being started.
+    - cron: "0 5 * * *"
 
 concurrency:
   group: kubernetes_rolling_reboot
