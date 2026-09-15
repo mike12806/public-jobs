@@ -16,6 +16,17 @@ name: Kubernetes Rolling Node Reboot
 #                      have no hypervisor and are never touched.
 #   TS_OAUTH_CLIENT_ID / TS_OAUTH_SECRET   Tailscale access
 #   SMTP_* / EMAIL_*                       failure notification
+#
+# To rehearse the whole path without waiting for a kernel update, dispatch it
+# manually with force_reboot_nodes set. Two combinations worth knowing:
+#   dry_run ON  + force_reboot_nodes "all"   report only; touches nothing
+#   dry_run OFF + force_reboot_nodes "all"   LIVE: every node is cordoned,
+#                                            drained and rebooted in turn,
+#                                            workers first, control-plane last,
+#                                            waiting for Longhorn to be fully
+#                                            healthy between each one
+# Only the /var/run/reboot-required check is skipped. Every health gate still
+# applies, and the run still aborts rather than continuing past a failure.
 
 permissions:
   contents: read
@@ -28,11 +39,11 @@ on:
         type: boolean
         default: true
       deadline_utc:
-        description: "Stop starting new nodes after this UTC time (HH:MM). Blank = no deadline (needed for a daytime test run)"
+        description: "Stop starting new nodes at or after this UTC time (HH:MM). Blank = run to completion. The nightly schedule always uses 09:00 regardless of this field"
         type: string
-        default: "09:00"
+        default: ""
       force_reboot_nodes:
-        description: "TESTING ONLY: pretend these nodes need a reboot. Space/comma-separated node names, or 'all'. Blank = honour the real sentinel"
+        description: "Pretend these nodes need a reboot: space/comma-separated node names, or 'all'. Blank = honour the real sentinel. Combine with dry_run OFF to force a live reboot"
         type: string
         default: ""
   schedule:
@@ -95,7 +106,11 @@ jobs:
           PVE7_SECRET: ${{ secrets.PVE7_SECRET }}
           # Scheduled runs are live; manual runs default to dry-run.
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
-          REBOOT_DEADLINE_UTC: ${{ github.event_name == 'workflow_dispatch' && inputs.deadline_utc || '09:00' }}
+          # Inverted on purpose: `event == dispatch && inputs.x || default` is
+          # the usual idiom, but it cannot express "manual run, no deadline" --
+          # a blank input is falsy, so it would fall through to the default and
+          # silently reimpose 09:00. Branch on the schedule instead.
+          REBOOT_DEADLINE_UTC: ${{ github.event_name == 'schedule' && '09:00' || inputs.deadline_utc }}
           # Deliberately bound to the manual input only: a scheduled run can
           # never fake the sentinel, it reboots what genuinely needs rebooting.
           FORCE_REBOOT_NODES: ${{ github.event_name == 'workflow_dispatch' && inputs.force_reboot_nodes || '' }}
