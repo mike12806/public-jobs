@@ -6,13 +6,17 @@ early leaving the cluster up -- never "keep going and hope".
 
 Per node, in sequence:
   1. skip unless /var/run/reboot-required exists on the host
-  2. cordon + drain (a failed drain aborts the run; it is never forced past)
+  2. cordon + drain: a short polite pass, then one deleting pass for pods a
+     PodDisruptionBudget will never release. A drain that fails even then
+     aborts the run.
   3. reboot, escalating only on failure:
        a. systemctl reboot in-guest      (graceful, clean unmount)
        b. Proxmox /status/reboot         (ACPI; shuts down AND restarts)
        c. Proxmox stop + start           (hard power cycle -- last resort)
      A rung "succeeds" only if the node goes NotReady AND returns Ready. A guest
-     hung during shutdown fails that test and escalates, which is the point.
+     hung during shutdown fails that test and escalates, which is the point. A
+     rung that never takes the node down at all is escalated early rather than
+     sitting out its whole window.
   4. wait for a *clean* return: Ready + Longhorn engine + CSI registered
   5. uncordon, then wait for Longhorn to be fully healthy before the next node
 
@@ -43,13 +47,23 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 # --- tunables -----------------------------------------------------------------
-DRAIN_TIMEOUT = 900          # 15m; generous, Longhorn detach can be slow
+DRAIN_TIMEOUT = 300          # 5m of polite eviction; a PDB refusal never clears
+DRAIN_FORCE_TIMEOUT = 300    # 5m more, deleting rather than evicting
+DOWN_WAIT = 150              # 2.5m for a reboot to take the node NotReady at all
 GRACEFUL_WAIT = 420          # 7m for an in-guest reboot to go down AND return
 ACPI_WAIT = 420              # 7m for a hypervisor ACPI reboot to do the same
 HARD_STOP_WAIT = 180         # 3m for the VM to actually reach 'stopped'
 RETURN_TIMEOUT = 900         # 15m to come back fully healthy
 SETTLE_TIMEOUT = 3600        # 60m for Longhorn to finish rebuilding
 POLL = 15
+# Worst case for one node, if every wait below runs to its limit.
+NODE_WORST_CASE = (DRAIN_TIMEOUT + DRAIN_FORCE_TIMEOUT + GRACEFUL_WAIT + ACPI_WAIT
+                   + HARD_STOP_WAIT + RETURN_TIMEOUT + SETTLE_TIMEOUT)
+# GitHub caps a job at 360 minutes and kills it mid-step, which here could mean
+# a node left cordoned or half-rebooted with no failure email (a cancelled job
+# skips if: failure()). So stop starting nodes while there is still room for one
+# to go badly. Default leaves 30m of the 360m job for the run to wind down.
+RUN_BUDGET = int(os.environ.get("REBOOT_RUN_BUDGET_MIN", "330")) * 60
 KUBECTL_RETRIES = 3          # ride out API blips (kube-vip failover, etc.)
 KUBECTL_RETRY_DELAY = 10
 # Pulled on every host read; use the local proxy so Docker Hub rate limits or
@@ -435,7 +449,8 @@ def vm_status(vm: VmRef) -> str | None:
         return None
 
 
-def wait_back(node: str, vm: VmRef, seconds: int) -> bool:
+def wait_back(node: str, vm: VmRef, seconds: int,
+              down_wait: int = DOWN_WAIT) -> bool:
     """Did the node go away and come back Ready?
 
     This, not "did it go down", is the right success test for a reboot rung.
@@ -447,8 +462,18 @@ def wait_back(node: str, vm: VmRef, seconds: int) -> bool:
 
     Requiring down-then-up makes a stuck node fail this check and escalate,
     which is the whole point of the ladder.
+
+    The two failure modes deserve different patience, though. A node that went
+    down and has not come back may still be booting, so it gets the full
+    window. A node that never went down at all has already told us the reboot
+    did not land -- a reboot that is going to work takes the node NotReady
+    within a minute or so -- and waiting out the rest of the window only delays
+    the rung that would have fixed it. So give "did it go down" its own short
+    deadline and escalate the moment it passes.
     """
-    deadline = time.time() + seconds
+    start = time.time()
+    deadline = start + seconds
+    down_deadline = start + down_wait
     saw_down = False
     while time.time() < deadline:
         if not node_ready(node):
@@ -458,6 +483,10 @@ def wait_back(node: str, vm: VmRef, seconds: int) -> bool:
         elif saw_down:
             log("      node returned Ready")
             return True
+        elif time.time() >= down_deadline:
+            log(f"      node never went down after {down_wait}s -- reboot did "
+                f"not take; escalating without waiting out the full {seconds}s")
+            return False
         time.sleep(POLL)
 
     if saw_down:
@@ -504,6 +533,38 @@ def wait_clean_return(node: str, timeout: int) -> None:
             log(f"    {node} Ready; waiting for storage (engine={has_im} csi={has_csi})")
         time.sleep(POLL)
     raise Abort(f"{node} did not return healthy within {timeout}s")
+
+
+def drain_node(node: str) -> None:
+    """Evict what leaves politely, then delete what will not.
+
+    --ignore-daemonsets covers the DaemonSet pods every node here runs: they are
+    never evicted and never block. What actually stalls this drain is a
+    PodDisruptionBudget -- Longhorn keeps one per instance-manager -- and that
+    is a refused eviction, not a slow one, so a longer timeout buys nothing but
+    dead time. --force does not help either; it covers pods with no controller,
+    not pods a budget is protecting. Deleting instead of evicting is what gets
+    past a PDB, so do that on the second pass.
+
+    This is not a bypass of the health gates. Preflight still refuses to start
+    on a degraded cluster, the identity assertion still runs, and Longhorn must
+    be fully settled before the next node is touched.
+    """
+    common = ("--ignore-daemonsets", "--delete-emptydir-data")
+    try:
+        # retries=1: kubectl()'s default would run the whole timeout three times
+        # over before reporting a stall.
+        kubectl("drain", node, *common, f"--timeout={DRAIN_TIMEOUT}s",
+                timeout=DRAIN_TIMEOUT + 60, retries=1)
+        return
+    except (Abort, subprocess.TimeoutExpired) as exc:
+        log(f"      eviction unfinished after {DRAIN_TIMEOUT}s "
+            f"({str(exc)[:160]})")
+
+    log("      forcing: deleting the pods eviction will not release")
+    kubectl("drain", node, *common, "--force", "--disable-eviction",
+            f"--timeout={DRAIN_FORCE_TIMEOUT}s",
+            timeout=DRAIN_FORCE_TIMEOUT + 60, retries=1)
 
 
 def reboot_node(node: str, vm: VmRef, dry_run: bool) -> None:
@@ -573,8 +634,7 @@ def process_node(node: str, vm: VmRef, dry_run: bool, forced: bool = False) -> N
     log("    cordon + drain")
     kubectl("cordon", node)
     try:
-        kubectl("drain", node, "--ignore-daemonsets", "--delete-emptydir-data",
-                f"--timeout={DRAIN_TIMEOUT}s", timeout=DRAIN_TIMEOUT + 60)
+        drain_node(node)
     except (Abort, subprocess.TimeoutExpired) as exc:
         kubectl("uncordon", node, check=False)
         raise Abort(f"drain of {node} failed ({exc}); uncordoned, stopping run")
@@ -641,6 +701,7 @@ def main() -> int:
                          "reading the host sentinel ('all' for every mapped node)")
     args = ap.parse_args()
 
+    started = time.time()
     dry_run = args.dry_run or os.environ.get("DRY_RUN", "").lower() == "true"
     if dry_run:
         log("DRY RUN -- no changes will be made")
@@ -711,6 +772,13 @@ def main() -> int:
                     log(f"Deadline {args.deadline} UTC reached -- stopping before "
                         f"{name}. Remaining: {candidates[candidates.index(name):]}")
                     break
+            left = RUN_BUDGET - (time.time() - started)
+            if not dry_run and left < NODE_WORST_CASE:
+                log(f"Only {left / 60:.0f}m of the run budget left and {name} "
+                    f"could need {NODE_WORST_CASE / 60:.0f}m -- stopping here "
+                    f"rather than being killed mid-node. Remaining: "
+                    f"{candidates[candidates.index(name):]}")
+                break
             process_node(name, plan.vms[name], dry_run,
                          forced=force_all or name in force_names)
 
