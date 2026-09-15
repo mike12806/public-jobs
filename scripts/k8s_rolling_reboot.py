@@ -68,8 +68,16 @@ DOWN_WAIT = 150              # 2.5m for a reboot to take the node NotReady at al
 GRACEFUL_WAIT = 420          # 7m for an in-guest reboot to go down AND return
 HARD_STOP_WAIT = 180         # 3m for the VM to actually reach 'stopped'
 RETURN_TIMEOUT = 900         # 15m to come back fully healthy
-SETTLE_TIMEOUT = 1800        # 30m for Longhorn to finish rebuilding. One node
-                             # cannot be allowed an hour when there are 11.
+SETTLE_TIMEOUT = 3600        # 60m for Longhorn to finish rebuilding. Half an
+                             # hour was not enough: a large volume rebuilding
+                             # across a busy cluster routinely runs past it, and
+                             # aborting there leaves the run unfinished for a
+                             # rebuild that was progressing fine. This is a
+                             # ceiling, not a cost -- the wait returns the
+                             # moment the volumes are safe, and the run budget
+                             # below caps it when the job is short on time, so
+                             # one slow node spends the tail of the run rather
+                             # than the whole job.
 REPLICA_FLOOR = 2            # healthy copies that must survive the next node
                              # going down. Two, not three: it keeps every volume
                              # one-failure-tolerant at all times, which is the
@@ -1135,7 +1143,12 @@ def main() -> int:
         # healthy" has to be true when it is printed.
         if not dry_run:
             log("All nodes done; waiting for Longhorn to finish rebuilding")
-            wait_longhorn_settled(SETTLE_TIMEOUT)
+            # Capped like every other wait: at an hour, this one can outlast the
+            # job's own 360m limit, and being killed here means no failure mail
+            # (a cancelled job skips if: failure()) even though every node is
+            # already back and uncordoned.
+            wait_longhorn_settled(SETTLE_TIMEOUT,
+                                  budget_left=RUN_BUDGET - (time.time() - started))
         log("Run complete. Cluster healthy.")
         return 0
 
