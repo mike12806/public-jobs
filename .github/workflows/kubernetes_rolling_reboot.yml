@@ -47,9 +47,11 @@ on:
         type: string
         default: ""
   schedule:
-    # 01:00 Eastern while EDT is in effect; cron has no timezone, so this drifts
-    # to 00:00 Eastern over the winter. Either way it leaves a long window
-    # before the 09:00 UTC deadline stops new nodes being started.
+    # 05:00 UTC: 01:00 Eastern under EDT, 00:00 Eastern under EST. Cron carries
+    # no timezone and both of those are fine for this job, so it is left to
+    # drift with DST rather than split into two month-gated schedules. Either
+    # way it leaves a long window before the 09:00 UTC deadline stops new
+    # nodes being started.
     - cron: "0 5 * * *"
 
 concurrency:
