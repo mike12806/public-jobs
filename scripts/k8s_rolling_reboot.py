@@ -224,7 +224,7 @@ def reboot_reason(node: str) -> str:
 # --- Longhorn -----------------------------------------------------------------
 def longhorn_installed() -> bool:
     try:
-        crds = kubectl_json("get", "crd", timeout=30)
+        crds = kubectl_json("get", "crd")
     except Abort:
         return False
 
