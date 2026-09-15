@@ -548,10 +548,19 @@ def longhorn_pods_on(node: str) -> list[tuple[str, str, list[str]]]:
     return pods
 
 
-def wait_clean_return(node: str, timeout: int) -> None:
-    """Ready is not enough -- CSI registers ~60s later and mounts fail in the gap."""
+def wait_for_storage(node: str, require: tuple[str, ...], timeout: int) -> None:
+    """Wait until every named longhorn-system component is Running and ready here.
+
+    Split from a single "clean return" check because the two things worth
+    waiting for do not live under the same constraint. longhorn-csi-plugin is a
+    DaemonSet, so it tolerates the unschedulable taint and returns to a cordoned
+    node by itself. instance-manager is not: Longhorn will not place one on a
+    cordoned node, so waiting for it before the uncordon is a wait that can
+    never end. They have to be waited on either side of it.
+    """
     deadline = time.time() + timeout
     said = False
+    want = "+".join(require)
     while time.time() < deadline:
         if node_ready(node):
             try:
@@ -570,12 +579,12 @@ def wait_clean_return(node: str, timeout: int) -> None:
                     for name, phase, states in pods
                 )
 
-            has_im = _ready("instance-manager")
-            has_csi = _ready("longhorn-csi-plugin")
-            if has_im and has_csi:
-                log(f"    {node} returned clean (Ready + Longhorn engine + CSI)")
+            state = {name: _ready(name) for name in require}
+            if all(state.values()):
+                log(f"    {node}: {want} ready")
                 return
-            log(f"    {node} Ready; waiting for storage (engine={has_im} csi={has_csi})")
+            log(f"    {node} Ready; waiting for storage ("
+                + " ".join(f"{k}={v}" for k, v in state.items()) + ")")
             if not said:
                 # Say once what is actually on the node. "engine=False csi=False"
                 # on its own cannot distinguish a pod that is missing from one
@@ -588,7 +597,7 @@ def wait_clean_return(node: str, timeout: int) -> None:
                     log(f"      no longhorn-system pods on {node} at all -- "
                         f"nothing is being scheduled back onto it")
         time.sleep(POLL)
-    raise Abort(f"{node} did not return healthy within {timeout}s")
+    raise Abort(f"{node}: {want} did not become ready within {timeout}s")
 
 
 def drain_node(node: str) -> None:
@@ -697,10 +706,20 @@ def process_node(node: str, vm: VmRef, dry_run: bool, forced: bool = False,
         raise Abort(f"drain of {node} failed ({exc}); uncordoned, stopping run")
 
     reboot_node(node, vm, dry_run)
-    wait_clean_return(node, RETURN_TIMEOUT)
+
+    # Before uncordoning: CSI must be registered, or the first pod scheduled
+    # here fails its mount. This is the gap the original check existed for, and
+    # a DaemonSet returns to a cordoned node on its own, so it can be required
+    # while the node is still fenced off.
+    wait_for_storage(node, ("longhorn-csi-plugin",), RETURN_TIMEOUT)
 
     log("    uncordon")
     kubectl("uncordon", node)
+
+    # Only now can this be asked for. Longhorn does not place an
+    # instance-manager on a cordoned node, and the drain deleted the one that
+    # was here, so requiring it any earlier deadlocks until the timeout.
+    wait_for_storage(node, ("instance-manager",), RETURN_TIMEOUT)
 
     log("    waiting for Longhorn to settle before next node")
     wait_longhorn_settled(SETTLE_TIMEOUT, budget_left)
