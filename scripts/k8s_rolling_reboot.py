@@ -24,6 +24,13 @@ Per node, in sequence:
      on the node just finished endangers nothing about a node that holds none
      of that volume's copies. The run settles fully once, at the end.
 
+A volume reading FAULTED mid-run is re-checked for ten minutes before it stops
+anything: a node coming back through a reboot can fault a volume transiently
+while its engine re-attaches or its last replicas rebuild, and that clears on
+its own. Only a fault still standing at the end of the window aborts. The
+preflight gate is deliberately not given that grace -- nothing has been
+rebooted yet, so a fault there is not one this run caused.
+
 Host access is via a short-lived privileged pod pinned to the node with its root
 filesystem at /host, so no SSH is required -- SSH is exactly what is unavailable
 when a node wedges. The pod tolerates all taints, since by the time we run on a
@@ -67,10 +74,19 @@ REPLICA_FLOOR = 2            # healthy copies that must survive the next node
                              # waiting for a rebuild that endangers nothing.
                              # One would mean deliberately power-cycling a node
                              # while a volume had a single copy left.
+FAULT_GRACE = 600            # 10m of re-checks before a FAULTED volume is
+                             # believed. Longhorn calls a volume faulted the
+                             # moment it has no usable replica, which a node
+                             # returning from a reboot produces transiently.
+                             # A genuine fault outlives ten minutes easily.
+FAULT_POLL = 30              # re-check cadence inside that window
 POLL = 15
 # Worst case for one node, if every wait below runs to its limit.
+# FAULT_GRACE is in here because a fault seen during a node's redundancy wait
+# extends that wait by the window it spends re-checking.
 NODE_WORST_CASE = (DRAIN_TIMEOUT + DRAIN_FORCE_TIMEOUT + GRACEFUL_WAIT + ACPI_WAIT
-                   + HARD_STOP_WAIT + RETURN_TIMEOUT + SETTLE_TIMEOUT)
+                   + HARD_STOP_WAIT + RETURN_TIMEOUT + SETTLE_TIMEOUT
+                   + FAULT_GRACE)
 # GitHub caps a job at 360 minutes and kills it mid-step, which here could mean
 # a node left cordoned or half-rebooted with no failure email (a cancelled job
 # skips if: failure()). So stop starting nodes before that can happen. The
@@ -324,6 +340,53 @@ def longhorn_state() -> tuple[int, int, int]:
     return (degraded, rebuilding, faulted)
 
 
+def confirm_faulted(faulted: int, where: str) -> int:
+    """Re-check a FAULTED reading for FAULT_GRACE before acting on it.
+
+    Longhorn marks a volume faulted the moment it has no usable replica, and a
+    node going through a reboot produces exactly that transiently: the engine
+    has not re-attached yet, or the copies left are still rebuilding. It clears
+    on its own within a minute or two. Aborting on the first reading ends the
+    run over a condition that fixes itself, and a run that ends early leaves
+    every remaining node unbooted.
+
+    Returns 0 if the cluster recovered inside the window, otherwise the faulted
+    count still standing at the end of it -- which the caller treats exactly as
+    it used to treat the first reading. A volume whose last replica is really
+    gone stays faulted far longer than ten minutes, so the trade is ten minutes
+    of run budget against aborting on a blip.
+    """
+    log(f"    {faulted} Longhorn volume(s) FAULTED {where} -- re-checking for "
+        f"{FAULT_GRACE // 60}m before stopping; a reboot can fault a volume "
+        f"transiently")
+    deadline = time.time() + FAULT_GRACE
+    while time.time() < deadline:
+        time.sleep(FAULT_POLL)
+        degraded, rebuilding, faulted = longhorn_state()
+        if not faulted:
+            log(f"    FAULTED cleared (degraded={degraded} "
+                f"rebuilding={rebuilding}) -- continuing")
+            return 0
+        log(f"      still faulted={faulted} (degraded={degraded} "
+            f"rebuilding={rebuilding}), "
+            f"{max(0.0, deadline - time.time()) / 60:.0f}m of grace left")
+    log(f"    {faulted} volume(s) still FAULTED after {FAULT_GRACE // 60}m")
+    return faulted
+
+
+def grant_grace(deadline: float, given: float, started: float) -> tuple[float, float]:
+    """Hand a wait back the time a fault re-check cost it, up to one window.
+
+    The re-check was not spent on what the wait is actually waiting for, so
+    charging it to that wait would time a cluster out the moment it recovers.
+    The cap is what keeps that honest: a volume flapping in and out of faulted
+    would otherwise push the deadline back a window at a time and the wait
+    would never end. Past the cap the wait times out normally.
+    """
+    give = min(time.time() - started, max(0.0, FAULT_GRACE - given))
+    return deadline + give, given + give
+
+
 def replica_map() -> dict[str, dict[str, bool]]:
     """volume name -> {node holding a replica: is that replica healthy}.
 
@@ -402,12 +465,18 @@ def wait_safe_to_reboot(node: str, timeout: int,
         timeout = max(int(budget_left), 60)
         log(f"    (redundancy wait capped at {timeout // 60}m by the run budget)")
     deadline = time.time() + timeout
+    grace_given = 0.0
     bad: list[str] = []
     said = False
     while time.time() < deadline:
         _, _, faulted = longhorn_state()
         if faulted:
-            raise Abort(f"{faulted} Longhorn volume(s) FAULTED -- stopping")
+            grace_start = time.time()
+            faulted = confirm_faulted(faulted, f"while waiting on {node}")
+            deadline, grace_given = grant_grace(deadline, grace_given, grace_start)
+            if faulted:
+                raise Abort(f"{faulted} Longhorn volume(s) still FAULTED after "
+                            f"{FAULT_GRACE // 60}m -- stopping")
         bad = unsafe_volumes(node)
         if not bad:
             return
@@ -434,10 +503,19 @@ def wait_longhorn_settled(timeout: int, budget_left: float | None = None) -> Non
         timeout = max(int(budget_left), 60)
         log(f"      (settle capped at {timeout // 60}m by the run budget)")
     deadline = time.time() + timeout
+    grace_given = 0.0
     while time.time() < deadline:
         degraded, rebuilding, faulted = longhorn_state()
         if faulted:
-            raise Abort(f"{faulted} Longhorn volume(s) FAULTED -- stopping")
+            grace_start = time.time()
+            faulted = confirm_faulted(faulted, "while settling")
+            deadline, grace_given = grant_grace(deadline, grace_given, grace_start)
+            if faulted:
+                raise Abort(f"{faulted} Longhorn volume(s) still FAULTED after "
+                            f"{FAULT_GRACE // 60}m -- stopping")
+            # The counts above predate the window; re-read rather than settle
+            # on them.
+            continue
         if degraded == 0 and rebuilding == 0:
             return
         log(f"    Longhorn settling: degraded={degraded} rebuilding={rebuilding}")
