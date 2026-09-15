@@ -139,12 +139,14 @@ def kubectl(*args: str, check: bool = True, timeout: int = 120,
             if proc.returncode == 0:
                 return proc.stdout
             last = kubectl_error(proc.stderr)
-            if not check:
-                return proc.stdout
         if attempt < retries:
             log(f"      kubectl {args[0]} failed ({last}); "
                 f"retry {attempt}/{retries - 1}")
             time.sleep(KUBECTL_RETRY_DELAY)
+    # Reached only when every attempt failed. check=False used to return here on
+    # the FIRST failure, before any retry -- so the callers most exposed to an
+    # API blip were the only ones this wrapper never protected, and a
+    # control-plane reboot is exactly when kube-vip makes the API blip.
     if check:
         raise Abort(f"kubectl {' '.join(args)} failed after {retries} tries: {last}")
     return ""
@@ -154,15 +156,24 @@ def kubectl_json(*args: str, **kw) -> dict:
     return json.loads(kubectl(*args, "-o", "json", **kw))
 
 
-def node_ready(name: str) -> bool:
+def node_ready(name: str) -> bool | None:
+    """True, False, or None when the cluster could not be asked.
+
+    None is not False. It ran with check=False, which returns empty stdout on
+    failure, so an unreachable API read as "" -- which is not "True", which is
+    NotReady. That is how an API blip becomes a phantom reboot: wait_back sees a
+    down-then-up transition that never happened, calls the rung a success, and
+    the node is marked done still carrying the kernel update it was supposed to
+    take. Unknown has to stay distinguishable from down.
+    """
     try:
         out = kubectl(
             "get", "node", name, "-o",
             'jsonpath={range .status.conditions[?(@.type=="Ready")]}{.status}{end}',
-            check=False, timeout=30,
+            timeout=30,
         )
-    except subprocess.TimeoutExpired:
-        return False
+    except (Abort, subprocess.TimeoutExpired):
+        return None
     return out.strip() == "True"
 
 
@@ -504,7 +515,14 @@ def wait_back(node: str, vm: VmRef, seconds: int,
     down_deadline = start + down_wait
     saw_down = False
     while time.time() < deadline:
-        if not node_ready(node):
+        ready = node_ready(node)
+        if ready is None:
+            # Not evidence of anything. Poll again rather than bank a
+            # transition the cluster never actually reported.
+            log("      cluster unreadable; not counting that as the node going down")
+            time.sleep(POLL)
+            continue
+        if not ready:
             if not saw_down:
                 log("      node went NotReady (rebooting)")
             saw_down = True
@@ -562,7 +580,7 @@ def wait_for_storage(node: str, require: tuple[str, ...], timeout: int) -> None:
     said = False
     want = "+".join(require)
     while time.time() < deadline:
-        if node_ready(node):
+        if node_ready(node) is True:
             try:
                 pods = longhorn_pods_on(node)
             except Abort as exc:
