@@ -22,6 +22,11 @@ when a node wedges. The pod tolerates all taints, since by the time we run on a
 node it is already cordoned.
 
 Everything mutating is gated on --dry-run.
+
+For testing, FORCE_REBOOT_NODES (or --force-nodes) fakes step 1's sentinel for
+named nodes, so the whole path can be exercised without waiting for a kernel
+update to land. It is wired to the manual workflow input only, never the
+schedule.
 """
 
 from __future__ import annotations
@@ -56,6 +61,28 @@ DEBUG_IMAGE = os.environ.get(
 
 class Abort(Exception):
     """Stop the run. Remaining nodes are left untouched."""
+
+
+def parse_forced(raw: str) -> tuple[bool, set[str]]:
+    """Parse FORCE_REBOOT_NODES into (all_nodes, named_nodes).
+
+    Nothing else in this script can be tested end to end without a node that
+    genuinely has /var/run/reboot-required, which means waiting for a kernel
+    update. Faking the sentinel for named nodes -- or "all" -- exercises the
+    real drain/reboot/settle path on demand.
+
+    Only the sentinel check is skipped. Every safety gate (preflight health,
+    identity assertion, Longhorn settling, the deadline) still applies, and a
+    forced node with no Proxmox mapping is refused rather than rebooted blind.
+    """
+    tokens = [t for t in raw.replace(",", " ").split() if t]
+    if not tokens:
+        return False, set()
+    if any(t.lower() == "all" for t in tokens):
+        if len(tokens) > 1:
+            raise Abort("force list: 'all' cannot be combined with node names")
+        return True, set()
+    return False, set(tokens)
 
 
 def log(msg: str) -> None:
@@ -524,9 +551,11 @@ def reboot_node(node: str, vm: VmRef, dry_run: bool) -> None:
     vm.host.call(f"{base}/status/start", method="POST")
 
 
-def process_node(node: str, vm: VmRef, dry_run: bool) -> None:
-    reason = reboot_reason(node)
-    log(f"  {node}: reboot required ({reason})")
+def process_node(node: str, vm: VmRef, dry_run: bool, forced: bool = False) -> None:
+    if forced:
+        log(f"  {node}: FORCED -- treating as needing a reboot (test override)")
+    else:
+        log(f"  {node}: reboot required ({reboot_reason(node)})")
 
     degraded, rebuilding, faulted = longhorn_state()
     if faulted or degraded or rebuilding:
@@ -606,20 +635,49 @@ def main() -> int:
                     help="report what would happen; touch nothing")
     ap.add_argument("--deadline", default=os.environ.get("REBOOT_DEADLINE_UTC", ""),
                     help="HH:MM UTC after which no new node is started")
+    ap.add_argument("--force-nodes",
+                    default=os.environ.get("FORCE_REBOOT_NODES", ""),
+                    help="TESTING: treat these nodes as needing a reboot without "
+                         "reading the host sentinel ('all' for every mapped node)")
     args = ap.parse_args()
 
     dry_run = args.dry_run or os.environ.get("DRY_RUN", "").lower() == "true"
     if dry_run:
         log("DRY RUN -- no changes will be made")
+    if args.deadline:
+        log(f"Deadline: no new node started at or after {args.deadline} UTC "
+            f"(it is now {datetime.now(timezone.utc):%H:%M} UTC)")
 
     try:
+        force_all, force_names = parse_forced(args.force_nodes)
         hosts = load_hosts()
         plan = preflight(hosts)
+
+        if force_all or force_names:
+            log("FORCE OVERRIDE ACTIVE -- faking the host reboot sentinel for "
+                + ("every mapped node" if force_all else f"{sorted(force_names)}"))
+            log("  this is a test affordance; every other safety gate still applies")
+            unknown = force_names - set(plan.nodes)
+            if unknown:
+                raise Abort(f"force list names unknown node(s): {sorted(unknown)}")
+            unmapped = force_names & set(plan.unmapped)
+            if unmapped:
+                raise Abort(
+                    f"force list names node(s) with no Proxmox mapping: "
+                    f"{sorted(unmapped)} -- there would be no way to rescue them "
+                    "if they wedged mid-reboot"
+                )
+            if not dry_run:
+                log("  NOT a dry run: these nodes WILL be cordoned, drained "
+                    "and rebooted for real")
 
         log("Checking which nodes need a reboot")
         candidates, unreachable = [], []
         for name in plan.nodes:
             if name not in plan.vms:
+                continue
+            if force_all or name in force_names:
+                candidates.append(name)
                 continue
             needs = reboot_required(name)
             if needs is None:
@@ -653,7 +711,8 @@ def main() -> int:
                     log(f"Deadline {args.deadline} UTC reached -- stopping before "
                         f"{name}. Remaining: {candidates[candidates.index(name):]}")
                     break
-            process_node(name, plan.vms[name], dry_run)
+            process_node(name, plan.vms[name], dry_run,
+                         forced=force_all or name in force_names)
 
         log("Run complete. Cluster healthy.")
         return 0

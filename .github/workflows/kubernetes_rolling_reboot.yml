@@ -28,9 +28,13 @@ on:
         type: boolean
         default: true
       deadline_utc:
-        description: "Stop starting new nodes after this UTC time (HH:MM)"
+        description: "Stop starting new nodes after this UTC time (HH:MM). Blank = no deadline (needed for a daytime test run)"
         type: string
         default: "09:00"
+      force_reboot_nodes:
+        description: "TESTING ONLY: pretend these nodes need a reboot. Space/comma-separated node names, or 'all'. Blank = honour the real sentinel"
+        type: string
+        default: ""
   schedule:
     # 01:30 Eastern. Long window before the deadline stops new nodes.
     - cron: "30 5 * * *"
@@ -92,6 +96,9 @@ jobs:
           # Scheduled runs are live; manual runs default to dry-run.
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
           REBOOT_DEADLINE_UTC: ${{ github.event_name == 'workflow_dispatch' && inputs.deadline_utc || '09:00' }}
+          # Deliberately bound to the manual input only: a scheduled run can
+          # never fake the sentinel, it reboots what genuinely needs rebooting.
+          FORCE_REBOOT_NODES: ${{ github.event_name == 'workflow_dispatch' && inputs.force_reboot_nodes || '' }}
         run: python3 scripts/k8s_rolling_reboot.py
 
       - name: Report cluster state
