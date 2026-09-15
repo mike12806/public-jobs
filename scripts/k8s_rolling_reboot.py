@@ -476,8 +476,9 @@ def wait_safe_to_reboot(node: str, timeout: int,
     grace_given = 0.0
     bad: list[str] = []
     said = False
+    beat = time.time()
     while time.time() < deadline:
-        _, _, faulted = longhorn_state()
+        degraded, rebuilding, faulted = longhorn_state()
         if faulted:
             grace_start = time.time()
             faulted = confirm_faulted(faulted, f"while waiting on {node}")
@@ -490,12 +491,22 @@ def wait_safe_to_reboot(node: str, timeout: int,
             return
         if not said:
             said = True
+            beat = time.time()
             log(f"    waiting for redundancy before {node}: {len(bad)} volume(s) "
                 f"would drop below {REPLICA_FLOOR} copies")
             for line in bad[:5]:
                 log(f"      {line}")
             if len(bad) > 5:
                 log(f"      ... and {len(bad) - 5} more")
+        elif time.time() - beat >= HEARTBEAT:
+            # This is the longest wait in the run and it used to say the above
+            # once and then poll in silence until the rebuilds finished --
+            # a quarter of an hour of nothing on a busy cluster. degraded and
+            # rebuilding are the numbers that show it is actually progressing.
+            beat = time.time()
+            log(f"      still {len(bad)} volume(s) short before {node} "
+                f"(degraded={degraded} rebuilding={rebuilding}); "
+                f"{int(deadline - time.time())}s left")
         time.sleep(30)
     raise Abort(
         f"volumes still short of {REPLICA_FLOOR} copies after {timeout}s; "
