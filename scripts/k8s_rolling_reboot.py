@@ -47,23 +47,26 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 # --- tunables -----------------------------------------------------------------
-DRAIN_TIMEOUT = 300          # 5m of polite eviction; a PDB refusal never clears
+DRAIN_TIMEOUT = 180          # 3m of polite eviction; a PDB refusal never clears
 DRAIN_FORCE_TIMEOUT = 300    # 5m more, deleting rather than evicting
 DOWN_WAIT = 150              # 2.5m for a reboot to take the node NotReady at all
 GRACEFUL_WAIT = 420          # 7m for an in-guest reboot to go down AND return
 ACPI_WAIT = 420              # 7m for a hypervisor ACPI reboot to do the same
 HARD_STOP_WAIT = 180         # 3m for the VM to actually reach 'stopped'
 RETURN_TIMEOUT = 900         # 15m to come back fully healthy
-SETTLE_TIMEOUT = 3600        # 60m for Longhorn to finish rebuilding
+SETTLE_TIMEOUT = 1800        # 30m for Longhorn to finish rebuilding. One node
+                             # cannot be allowed an hour when there are 11.
 POLL = 15
 # Worst case for one node, if every wait below runs to its limit.
 NODE_WORST_CASE = (DRAIN_TIMEOUT + DRAIN_FORCE_TIMEOUT + GRACEFUL_WAIT + ACPI_WAIT
                    + HARD_STOP_WAIT + RETURN_TIMEOUT + SETTLE_TIMEOUT)
 # GitHub caps a job at 360 minutes and kills it mid-step, which here could mean
 # a node left cordoned or half-rebooted with no failure email (a cancelled job
-# skips if: failure()). So stop starting nodes while there is still room for one
-# to go badly. Default leaves 30m of the 360m job for the run to wind down.
-RUN_BUDGET = int(os.environ.get("REBOOT_RUN_BUDGET_MIN", "330")) * 60
+# skips if: failure()). So stop starting nodes before that can happen. The
+# default leaves 40m of the 360m job for a node already under way to finish.
+RUN_BUDGET = int(os.environ.get("REBOOT_RUN_BUDGET_MIN", "320")) * 60
+# How much slower than the slowest node so far to assume the next one will be.
+PACE_MARGIN = 1.5
 KUBECTL_RETRIES = 3          # ride out API blips (kube-vip failover, etc.)
 KUBECTL_RETRY_DELAY = 10
 # Pulled on every host read; use the local proxy so Docker Hub rate limits or
@@ -104,6 +107,18 @@ def log(msg: str) -> None:
 
 
 # --- kubectl ------------------------------------------------------------------
+def kubectl_error(stderr: str) -> str:
+    """The part of kubectl's stderr that says what went wrong.
+
+    drain prints its "ignoring DaemonSet-managed Pods" warning first and at
+    length, so a naive truncation reports that instead of the actual failure --
+    which is how a PDB-blocked drain came to look like a DaemonSet problem.
+    """
+    lines = [ln for ln in stderr.splitlines()
+             if ln.strip() and not ln.startswith("Warning:")]
+    return " / ".join(lines)[:200] if lines else stderr.strip()[:200]
+
+
 def kubectl(*args: str, check: bool = True, timeout: int = 120,
             retries: int = KUBECTL_RETRIES) -> str:
     """Run kubectl, riding out transient API failures.
@@ -123,11 +138,11 @@ def kubectl(*args: str, check: bool = True, timeout: int = 120,
         else:
             if proc.returncode == 0:
                 return proc.stdout
-            last = proc.stderr.strip()
+            last = kubectl_error(proc.stderr)
             if not check:
                 return proc.stdout
         if attempt < retries:
-            log(f"      kubectl {args[0]} failed ({last[:80]}); "
+            log(f"      kubectl {args[0]} failed ({last}); "
                 f"retry {attempt}/{retries - 1}")
             time.sleep(KUBECTL_RETRY_DELAY)
     if check:
@@ -285,7 +300,13 @@ def longhorn_state() -> tuple[int, int, int]:
     return (degraded, rebuilding, faulted)
 
 
-def wait_longhorn_settled(timeout: int) -> None:
+def wait_longhorn_settled(timeout: int, budget_left: float | None = None) -> None:
+    # The settle wait is the longest single wait in a node's cycle and the only
+    # safe one to cut short: the node is already back, Ready and uncordoned, so
+    # stopping here leaves a serving cluster that is merely still rebuilding.
+    if budget_left is not None and budget_left < timeout:
+        timeout = max(int(budget_left), 60)
+        log(f"      (settle capped at {timeout // 60}m by the run budget)")
     deadline = time.time() + timeout
     while time.time() < deadline:
         degraded, rebuilding, faulted = longhorn_state()
@@ -619,7 +640,8 @@ def reboot_node(node: str, vm: VmRef, dry_run: bool) -> None:
     vm.host.call(f"{base}/status/start", method="POST")
 
 
-def process_node(node: str, vm: VmRef, dry_run: bool, forced: bool = False) -> None:
+def process_node(node: str, vm: VmRef, dry_run: bool, forced: bool = False,
+                 budget_left: float | None = None) -> None:
     if forced:
         log(f"  {node}: FORCED -- treating as needing a reboot (test override)")
     else:
@@ -653,7 +675,7 @@ def process_node(node: str, vm: VmRef, dry_run: bool, forced: bool = False) -> N
     kubectl("uncordon", node)
 
     log("    waiting for Longhorn to settle before next node")
-    wait_longhorn_settled(SETTLE_TIMEOUT)
+    wait_longhorn_settled(SETTLE_TIMEOUT, budget_left)
     log(f"  {node}: DONE")
 
 
@@ -772,22 +794,37 @@ def main() -> int:
         candidates.sort(key=lambda n: (n in cp, n))
         log(f"Nodes to reboot ({len(candidates)}): {candidates}")
 
-        for name in candidates:
+        # Budgeting on NODE_WORST_CASE would be useless here: 11 nodes at the
+        # ceiling do not fit in any 360m job, so a run that assumed the worst
+        # would stop after three good ones. Nodes in a clean run cost a small
+        # fraction of the ceiling, so once a node has actually been done, pace
+        # the rest on that measurement instead.
+        done: list[float] = []
+        for i, name in enumerate(candidates):
             if args.deadline:
                 now = datetime.now(timezone.utc).strftime("%H:%M")
                 if now >= args.deadline:
                     log(f"Deadline {args.deadline} UTC reached -- stopping before "
-                        f"{name}. Remaining: {candidates[candidates.index(name):]}")
+                        f"{name}. Remaining: {candidates[i:]}")
                     break
             left = RUN_BUDGET - (time.time() - started)
-            if not dry_run and left < NODE_WORST_CASE:
-                log(f"Only {left / 60:.0f}m of the run budget left and {name} "
-                    f"could need {NODE_WORST_CASE / 60:.0f}m -- stopping here "
-                    f"rather than being killed mid-node. Remaining: "
-                    f"{candidates[candidates.index(name):]}")
+            need = max(done) * PACE_MARGIN if done else NODE_WORST_CASE
+            if not dry_run and left < need:
+                log(f"Stopping before {name}: {left / 60:.0f}m of budget left, "
+                    f"a node is costing up to {need / PACE_MARGIN / 60:.0f}m. "
+                    f"Better to end clean than be killed mid-node. "
+                    f"Remaining: {candidates[i:]}")
                 break
+
+            t0 = time.time()
             process_node(name, plan.vms[name], dry_run,
-                         forced=force_all or name in force_names)
+                         forced=force_all or name in force_names,
+                         budget_left=None if dry_run else left)
+            if not dry_run:
+                done.append(time.time() - t0)
+                log(f"  ({len(done)}/{len(candidates)} done, {done[-1] / 60:.0f}m "
+                    f"for {name}, {(RUN_BUDGET - (time.time() - started)) / 60:.0f}m "
+                    f"budget left)")
 
         log("Run complete. Cluster healthy.")
         return 0
