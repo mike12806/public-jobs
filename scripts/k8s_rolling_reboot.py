@@ -11,12 +11,16 @@ Per node, in sequence:
      aborts the run.
   3. reboot, escalating only on failure:
        a. systemctl reboot in-guest      (graceful, clean unmount)
-       b. Proxmox /status/reboot         (ACPI; shuts down AND restarts)
-       c. Proxmox stop + start           (hard power cycle -- last resort)
+       b. Proxmox stop + start           (power cycle; always completes)
      A rung "succeeds" only if the node goes NotReady AND returns Ready. A guest
      hung during shutdown fails that test and escalates, which is the point. A
      rung that never takes the node down at all is escalated early rather than
      sitting out its whole window.
+     There is deliberately no ACPI rung. /status/reboot asks the guest to shut
+     down and waits for it to agree, so the one situation an escalation exists
+     for -- a guest too wedged to answer -- is the situation where it can sit
+     there indefinitely. /status/stop kills the QEMU process outright, so it
+     always completes; rung (a) is what covers the clean case.
   4. wait for a *clean* return: CSI registered before the uncordon, Longhorn's
      instance-manager after it (Longhorn will not place one while cordoned)
   5. move on once every volume would still hold REPLICA_FLOOR healthy copies
@@ -62,7 +66,6 @@ DRAIN_TIMEOUT = 180          # 3m of polite eviction; a PDB refusal never clears
 DRAIN_FORCE_TIMEOUT = 300    # 5m more, deleting rather than evicting
 DOWN_WAIT = 150              # 2.5m for a reboot to take the node NotReady at all
 GRACEFUL_WAIT = 420          # 7m for an in-guest reboot to go down AND return
-ACPI_WAIT = 420              # 7m for a hypervisor ACPI reboot to do the same
 HARD_STOP_WAIT = 180         # 3m for the VM to actually reach 'stopped'
 RETURN_TIMEOUT = 900         # 15m to come back fully healthy
 SETTLE_TIMEOUT = 1800        # 30m for Longhorn to finish rebuilding. One node
@@ -81,10 +84,15 @@ FAULT_GRACE = 600            # 10m of re-checks before a FAULTED volume is
                              # A genuine fault outlives ten minutes easily.
 FAULT_POLL = 30              # re-check cadence inside that window
 POLL = 15
+HEARTBEAT = 60               # never go longer than this without saying
+                             # something. A wait that polls silently for
+                             # minutes is indistinguishable from a hung job,
+                             # and "is it stuck?" is not a question an
+                             # unattended run should leave anyone asking.
 # Worst case for one node, if every wait below runs to its limit.
 # FAULT_GRACE is in here because a fault seen during a node's redundancy wait
 # extends that wait by the window it spends re-checking.
-NODE_WORST_CASE = (DRAIN_TIMEOUT + DRAIN_FORCE_TIMEOUT + GRACEFUL_WAIT + ACPI_WAIT
+NODE_WORST_CASE = (DRAIN_TIMEOUT + DRAIN_FORCE_TIMEOUT + GRACEFUL_WAIT
                    + HARD_STOP_WAIT + RETURN_TIMEOUT + SETTLE_TIMEOUT
                    + FAULT_GRACE)
 # GitHub caps a job at 360 minutes and kills it mid-step, which here could mean
@@ -468,8 +476,9 @@ def wait_safe_to_reboot(node: str, timeout: int,
     grace_given = 0.0
     bad: list[str] = []
     said = False
+    beat = time.time()
     while time.time() < deadline:
-        _, _, faulted = longhorn_state()
+        degraded, rebuilding, faulted = longhorn_state()
         if faulted:
             grace_start = time.time()
             faulted = confirm_faulted(faulted, f"while waiting on {node}")
@@ -482,12 +491,22 @@ def wait_safe_to_reboot(node: str, timeout: int,
             return
         if not said:
             said = True
+            beat = time.time()
             log(f"    waiting for redundancy before {node}: {len(bad)} volume(s) "
                 f"would drop below {REPLICA_FLOOR} copies")
             for line in bad[:5]:
                 log(f"      {line}")
             if len(bad) > 5:
                 log(f"      ... and {len(bad) - 5} more")
+        elif time.time() - beat >= HEARTBEAT:
+            # This is the longest wait in the run and it used to say the above
+            # once and then poll in silence until the rebuilds finished --
+            # a quarter of an hour of nothing on a busy cluster. degraded and
+            # rebuilding are the numbers that show it is actually progressing.
+            beat = time.time()
+            log(f"      still {len(bad)} volume(s) short before {node} "
+                f"(degraded={degraded} rebuilding={rebuilding}); "
+                f"{int(deadline - time.time())}s left")
         time.sleep(30)
     raise Abort(
         f"volumes still short of {REPLICA_FLOOR} copies after {timeout}s; "
@@ -707,17 +726,20 @@ def wait_back(node: str, vm: VmRef, seconds: int,
     deadline = start + seconds
     down_deadline = start + down_wait
     saw_down = False
+    beat = start
     while time.time() < deadline:
         ready = node_ready(node)
         if ready is None:
             # Not evidence of anything. Poll again rather than bank a
             # transition the cluster never actually reported.
             log("      cluster unreadable; not counting that as the node going down")
+            beat = time.time()
             time.sleep(POLL)
             continue
         if not ready:
             if not saw_down:
                 log("      node went NotReady (rebooting)")
+                beat = time.time()
             saw_down = True
         elif saw_down:
             log("      node returned Ready")
@@ -726,6 +748,14 @@ def wait_back(node: str, vm: VmRef, seconds: int,
             log(f"      node never went down after {down_wait}s -- reboot did "
                 f"not take; escalating without waiting out the full {seconds}s")
             return False
+        # Say something on the way. The old loop announced NotReady once and
+        # then polled in silence until the node returned or the window ran
+        # out -- minutes of nothing, which reads exactly like a hung job.
+        if time.time() - beat >= HEARTBEAT:
+            beat = time.time()
+            log(f"      still {'NotReady' if saw_down else 'Ready'}; "
+                f"{int(deadline - time.time())}s left in this rung "
+                f"(Proxmox says: {vm_status(vm)})")
         time.sleep(POLL)
 
     if saw_down:
@@ -771,9 +801,19 @@ def wait_for_storage(node: str, require: tuple[str, ...], timeout: int) -> None:
     """
     deadline = time.time() + timeout
     said = False
+    beat = time.time()
     want = "+".join(require)
     while time.time() < deadline:
-        if node_ready(node) is True:
+        ready = node_ready(node)
+        if ready is not True and time.time() - beat >= HEARTBEAT:
+            # Until the node is Ready this loop had nothing to say at all, so a
+            # node still booting looked identical to a wedged script for up to
+            # the whole timeout.
+            beat = time.time()
+            log(f"    waiting for {node} to come back "
+                f"({'NotReady' if ready is False else 'cluster unreadable'}; "
+                f"{int(deadline - time.time())}s left)")
+        if ready is True:
             try:
                 pods = longhorn_pods_on(node)
             except Abort as exc:
@@ -851,32 +891,40 @@ def reboot_node(node: str, vm: VmRef, dry_run: bool) -> None:
         return
 
     # Rung 1 -- graceful, in-guest. Clean unmount of Longhorn replicas.
-    log("    rung 1/3: systemctl reboot (in-guest)")
+    log("    rung 1/2: systemctl reboot (in-guest)")
     run_on_host(node, "nsenter -t 1 -m -u -i -n -p -- systemctl reboot", timeout=60)
     if wait_back(node, vm, GRACEFUL_WAIT):
         return
 
-    # Rung 2 -- ACPI reboot via the hypervisor. Use /status/reboot, not
-    # /status/shutdown: shutdown leaves the VM powered off and nothing would
-    # start it again.
-    log("    rung 2/3: Proxmox ACPI reboot")
-    try:
-        vm.host.call(f"{base}/status/reboot", method="POST")
-    except Exception as exc:  # noqa: BLE001
-        log(f"      ACPI reboot call failed ({exc}); escalating")
-    else:
-        if wait_back(node, vm, ACPI_WAIT):
-            return
-
-    # Rung 3 -- hard power cycle. Unclean, so only for a node that is stuck.
-    log("    rung 3/3: HARD power cycle (qm stop + start)")
+    # Rung 2 -- power cycle via the hypervisor. Deliberately NOT /status/reboot:
+    # ACPI asks the guest to shut down and then waits for it to do so, which
+    # means the exact case this rung exists for -- a guest too wedged to answer
+    # -- is the case where it can sit there until something gives up. Stop kills
+    # the QEMU process, so it lands whatever the guest thinks.
+    #
+    # Unclean by construction, which is why rung 1 goes first: by the time we
+    # are here the guest has already failed to reboot itself, so there is no
+    # clean unmount left to preserve.
+    log("    rung 2/2: Proxmox power cycle (stop + start)")
     assert_identity(node, vm)  # re-verify identity right before destroying state
-    vm.host.call(f"{base}/status/stop", method="POST")
+    try:
+        vm.host.call(f"{base}/status/stop", method="POST")
+    except Exception as exc:  # noqa: BLE001
+        raise Abort(
+            f"{node}: Proxmox refused to stop VM {vm.host.name}:{vm.vmid} "
+            f"({exc}). The node is drained and cordoned; it needs a hand."
+        )
 
     deadline = time.time() + HARD_STOP_WAIT
+    beat = time.time()
     while time.time() < deadline:
-        if vm_status(vm) == "stopped":
+        st = vm_status(vm)
+        if st == "stopped":
             break
+        if time.time() - beat >= HEARTBEAT:
+            beat = time.time()
+            log(f"      waiting for VM to stop (Proxmox says: {st}; "
+                f"{int(deadline - time.time())}s left)")
         time.sleep(5)
     else:
         raise Abort(
@@ -886,6 +934,7 @@ def reboot_node(node: str, vm: VmRef, dry_run: bool) -> None:
 
     log("      VM stopped; starting")
     vm.host.call(f"{base}/status/start", method="POST")
+    log("      start issued; waiting for the node to come back")
 
 
 def process_node(node: str, vm: VmRef, dry_run: bool, forced: bool = False,
