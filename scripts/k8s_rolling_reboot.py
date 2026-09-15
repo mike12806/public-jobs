@@ -237,8 +237,15 @@ def reboot_reason(node: str) -> str:
 
 # --- Longhorn -----------------------------------------------------------------
 def longhorn_installed() -> bool:
-    out = kubectl("get", "crd", "volumes.longhorn.io", check=False, timeout=30)
-    return "volumes.longhorn.io" in out
+    try:
+        crds = kubectl_json("get", "crd")
+    except Abort:
+        return False
+
+    for item in crds.get("items", []):
+        if item.get("metadata", {}).get("name") == "volumes.longhorn.io":
+            return True
+    return False
 
 
 def longhorn_state() -> tuple[int, int, int]:
