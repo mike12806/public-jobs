@@ -17,8 +17,12 @@ Per node, in sequence:
      hung during shutdown fails that test and escalates, which is the point. A
      rung that never takes the node down at all is escalated early rather than
      sitting out its whole window.
-  4. wait for a *clean* return: Ready + Longhorn engine + CSI registered
-  5. uncordon, then wait for Longhorn to be fully healthy before the next node
+  4. wait for a *clean* return: CSI registered before the uncordon, Longhorn's
+     instance-manager after it (Longhorn will not place one while cordoned)
+  5. move on once every volume would still hold REPLICA_FLOOR healthy copies
+     with the *next* node down -- not once the cluster falls silent. A rebuild
+     on the node just finished endangers nothing about a node that holds none
+     of that volume's copies. The run settles fully once, at the end.
 
 Host access is via a short-lived privileged pod pinned to the node with its root
 filesystem at /host, so no SSH is required -- SSH is exactly what is unavailable
@@ -56,6 +60,13 @@ HARD_STOP_WAIT = 180         # 3m for the VM to actually reach 'stopped'
 RETURN_TIMEOUT = 900         # 15m to come back fully healthy
 SETTLE_TIMEOUT = 1800        # 30m for Longhorn to finish rebuilding. One node
                              # cannot be allowed an hour when there are 11.
+REPLICA_FLOOR = 2            # healthy copies that must survive the next node
+                             # going down. Two, not three: it keeps every volume
+                             # one-failure-tolerant at all times, which is the
+                             # property that matters. Requiring three means
+                             # waiting for a rebuild that endangers nothing.
+                             # One would mean deliberately power-cycling a node
+                             # while a volume had a single copy left.
 POLL = 15
 # Worst case for one node, if every wait below runs to its limit.
 NODE_WORST_CASE = (DRAIN_TIMEOUT + DRAIN_FORCE_TIMEOUT + GRACEFUL_WAIT + ACPI_WAIT
@@ -263,11 +274,14 @@ def reboot_reason(node: str) -> str:
 
 # --- Longhorn -----------------------------------------------------------------
 def longhorn_installed() -> bool:
-    try:
-        crds = kubectl_json("get", "crd")
-    except Abort:
-        return False
+    """Whether Longhorn's CRDs are present. Raises if the cluster cannot be asked.
 
+    Swallowing the error here returned False, which made longhorn_state() report
+    (0, 0, 0) -- a perfectly healthy cluster -- from an API blip. Every gate
+    below trusts these numbers, and they now decide whether it is safe to take
+    another node down, so "could not ask" must not read as "nothing to check".
+    """
+    crds = kubectl_json("get", "crd")
     for item in crds.get("items", []):
         if item.get("metadata", {}).get("name") == "volumes.longhorn.io":
             return True
@@ -284,10 +298,9 @@ def longhorn_state() -> tuple[int, int, int]:
 
     A cluster with no Longhorn at all legitimately has nothing to gate on.
     """
-    if not longhorn_installed():
-        return (0, 0, 0)
-
     try:
+        if not longhorn_installed():
+            return (0, 0, 0)
         vols = kubectl_json("get", "volumes.longhorn.io", "-n", "longhorn-system")
         engines = kubectl_json("get", "engines.longhorn.io", "-n", "longhorn-system")
     except Abort as exc:
@@ -309,6 +322,108 @@ def longhorn_state() -> tuple[int, int, int]:
         if e.get("status", {}).get("rebuildStatus")
     )
     return (degraded, rebuilding, faulted)
+
+
+def replica_map() -> dict[str, dict[str, bool]]:
+    """volume name -> {node holding a replica: is that replica healthy}.
+
+    Healthy means Longhorn has recorded the replica as healthy (spec.healthyAt)
+    and has not since failed it (spec.failedAt). A replica being rebuilt has no
+    healthyAt yet, which is exactly the state this gate needs to see.
+
+    currentState is deliberately not consulted: a detached volume's replicas are
+    stopped but perfectly good, and treating stopped as unhealthy would block
+    the run on volumes nothing is using.
+    """
+    data = kubectl_json("get", "replicas.longhorn.io", "-n", "longhorn-system")
+    out: dict[str, dict[str, bool]] = {}
+    for r in data.get("items", []):
+        spec = r.get("spec", {})
+        vol, node = spec.get("volumeName"), spec.get("nodeID")
+        if not vol or not node:
+            # Refuse to guess. Reporting fewer replicas than exist would be
+            # conservative; placing a replica on the wrong node would not.
+            raise Abort(
+                f"replica {r.get('metadata', {}).get('name')} has no volumeName "
+                "or nodeID -- cannot tell which node holds which copy"
+            )
+        healthy = bool(spec.get("healthyAt")) and not spec.get("failedAt")
+        # Two replicas of one volume on a single node is an anti-affinity
+        # violation, but if it happens that node counts as holding a healthy
+        # copy when any of them is healthy -- and as one node either way, which
+        # is what matters when it goes down.
+        out.setdefault(vol, {})[node] = out.get(vol, {}).get(node, False) or healthy
+    return out
+
+
+def unsafe_volumes(node: str) -> list[str]:
+    """Volumes that would fall below REPLICA_FLOOR if `node` went down now.
+
+    The old gate waited for the whole cluster to be clean, which asked the wrong
+    question: a volume rebuilding a replica on the node just finished endangers
+    nothing about the next node, unless the next node holds one of its remaining
+    healthy copies. This asks the question that matters -- once this node drops,
+    how many healthy copies does each volume still have.
+
+    The floor is lowered for volumes that cannot reach it: a two-replica volume
+    with a copy here can only ever keep one, and a single-replica volume keeps
+    none. Those get the redundancy they would have had in a fully healthy
+    cluster rather than an impossible target that would hang the run.
+    """
+    vols = kubectl_json("get", "volumes.longhorn.io", "-n", "longhorn-system")
+    reps = replica_map()
+    bad = []
+    for v in vols.get("items", []):
+        name = v.get("metadata", {}).get("name", "?")
+        robustness = v.get("status", {}).get("robustness")
+        if robustness not in ("healthy", "degraded"):
+            # unknown/detached: the settle gate never counted these either, and
+            # faulted is caught separately as an abort rather than a wait.
+            continue
+        holders = reps.get(name)
+        if not holders:
+            raise Abort(
+                f"volume {name} is {robustness} but no replicas report holding "
+                "it -- refusing to reason about redundancy from that"
+            )
+        healthy_elsewhere = sum(1 for n, ok in holders.items() if ok and n != node)
+        floor = min(REPLICA_FLOOR, len(holders) - (1 if node in holders else 0))
+        if healthy_elsewhere < floor:
+            bad.append(f"{name} ({healthy_elsewhere} healthy off {node}, needs {floor})")
+    return bad
+
+
+def wait_safe_to_reboot(node: str, timeout: int,
+                        budget_left: float | None = None) -> None:
+    """Block until taking `node` down leaves every volume above the floor."""
+    if not longhorn_installed():
+        return
+    if budget_left is not None and budget_left < timeout:
+        timeout = max(int(budget_left), 60)
+        log(f"    (redundancy wait capped at {timeout // 60}m by the run budget)")
+    deadline = time.time() + timeout
+    bad: list[str] = []
+    said = False
+    while time.time() < deadline:
+        _, _, faulted = longhorn_state()
+        if faulted:
+            raise Abort(f"{faulted} Longhorn volume(s) FAULTED -- stopping")
+        bad = unsafe_volumes(node)
+        if not bad:
+            return
+        if not said:
+            said = True
+            log(f"    waiting for redundancy before {node}: {len(bad)} volume(s) "
+                f"would drop below {REPLICA_FLOOR} copies")
+            for line in bad[:5]:
+                log(f"      {line}")
+            if len(bad) > 5:
+                log(f"      ... and {len(bad) - 5} more")
+        time.sleep(30)
+    raise Abort(
+        f"volumes still short of {REPLICA_FLOOR} copies after {timeout}s; "
+        f"not taking {node} down: {bad[:3]}"
+    )
 
 
 def wait_longhorn_settled(timeout: int, budget_left: float | None = None) -> None:
@@ -702,12 +817,10 @@ def process_node(node: str, vm: VmRef, dry_run: bool, forced: bool = False,
     else:
         log(f"  {node}: reboot required ({reboot_reason(node)})")
 
-    degraded, rebuilding, faulted = longhorn_state()
-    if faulted or degraded or rebuilding:
-        raise Abort(
-            f"cluster not healthy before {node}: degraded={degraded} "
-            f"rebuilding={rebuilding} faulted={faulted}"
-        )
+    # Not "is the cluster spotless" but "does removing this node still leave
+    # every volume with copies to spare". A rebuild elsewhere is none of this
+    # node's business.
+    wait_safe_to_reboot(node, SETTLE_TIMEOUT, budget_left)
 
     assert_identity(node, vm)
 
@@ -739,9 +852,8 @@ def process_node(node: str, vm: VmRef, dry_run: bool, forced: bool = False,
     # was here, so requiring it any earlier deadlocks until the timeout.
     wait_for_storage(node, ("instance-manager",), RETURN_TIMEOUT)
 
-    log("    waiting for Longhorn to settle before next node")
-    wait_longhorn_settled(SETTLE_TIMEOUT, budget_left)
-    log(f"  {node}: DONE")
+    log(f"  {node}: DONE (rebuilds may still be running; the next node waits on "
+        f"redundancy, not on silence)")
 
 
 # --- main ---------------------------------------------------------------------
@@ -891,6 +1003,12 @@ def main() -> int:
                     f"for {name}, {(RUN_BUDGET - (time.time() - started)) / 60:.0f}m "
                     f"budget left)")
 
+        # Per-node gating lets the run move on while rebuilds finish, so the
+        # last one can still be in flight. Settle once here, because "Cluster
+        # healthy" has to be true when it is printed.
+        if not dry_run:
+            log("All nodes done; waiting for Longhorn to finish rebuilding")
+            wait_longhorn_settled(SETTLE_TIMEOUT)
         log("Run complete. Cluster healthy.")
         return 0
 
