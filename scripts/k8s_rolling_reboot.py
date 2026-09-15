@@ -139,30 +139,41 @@ def kubectl(*args: str, check: bool = True, timeout: int = 120,
             if proc.returncode == 0:
                 return proc.stdout
             last = kubectl_error(proc.stderr)
-            if not check:
-                return proc.stdout
         if attempt < retries:
             log(f"      kubectl {args[0]} failed ({last}); "
                 f"retry {attempt}/{retries - 1}")
             time.sleep(KUBECTL_RETRY_DELAY)
+    # Reached only when every attempt failed. check=False used to return here on
+    # the FIRST failure, before any retry -- so the callers most exposed to an
+    # API blip were the only ones this wrapper never protected, and a
+    # control-plane reboot is exactly when kube-vip makes the API blip.
     if check:
         raise Abort(f"kubectl {' '.join(args)} failed after {retries} tries: {last}")
     return ""
 
 
-def kubectl_json(*args: str) -> dict:
-    return json.loads(kubectl(*args, "-o", "json"))
+def kubectl_json(*args: str, **kw) -> dict:
+    return json.loads(kubectl(*args, "-o", "json", **kw))
 
 
-def node_ready(name: str) -> bool:
+def node_ready(name: str) -> bool | None:
+    """True, False, or None when the cluster could not be asked.
+
+    None is not False. It ran with check=False, which returns empty stdout on
+    failure, so an unreachable API read as "" -- which is not "True", which is
+    NotReady. That is how an API blip becomes a phantom reboot: wait_back sees a
+    down-then-up transition that never happened, calls the rung a success, and
+    the node is marked done still carrying the kernel update it was supposed to
+    take. Unknown has to stay distinguishable from down.
+    """
     try:
         out = kubectl(
             "get", "node", name, "-o",
             'jsonpath={range .status.conditions[?(@.type=="Ready")]}{.status}{end}',
-            check=False, timeout=30,
+            timeout=30,
         )
-    except subprocess.TimeoutExpired:
-        return False
+    except (Abort, subprocess.TimeoutExpired):
+        return None
     return out.strip() == "True"
 
 
@@ -504,7 +515,14 @@ def wait_back(node: str, vm: VmRef, seconds: int,
     down_deadline = start + down_wait
     saw_down = False
     while time.time() < deadline:
-        if not node_ready(node):
+        ready = node_ready(node)
+        if ready is None:
+            # Not evidence of anything. Poll again rather than bank a
+            # transition the cluster never actually reported.
+            log("      cluster unreadable; not counting that as the node going down")
+            time.sleep(POLL)
+            continue
+        if not ready:
             if not saw_down:
                 log("      node went NotReady (rebooting)")
             saw_down = True
@@ -525,42 +543,79 @@ def wait_back(node: str, vm: VmRef, seconds: int,
     return False
 
 
-def wait_clean_return(node: str, timeout: int) -> None:
-    """Ready is not enough -- CSI registers ~60s later and mounts fail in the gap."""
+def longhorn_pods_on(node: str) -> list[tuple[str, str, list[str]]]:
+    """(name, phase, container readiness) for every longhorn-system pod on node.
+
+    Built from JSON rather than a jsonpath template. The template this replaced
+    embedded \t and \n, which Python turned into literal control characters
+    inside the jsonpath before kubectl ever saw them -- and it ran with
+    check=False, so if kubectl rejected it the result was empty output, which
+    reads exactly like "no storage pods here". A gate cannot be allowed to fail
+    silently into its own negative.
+    """
+    data = kubectl_json("get", "pods", "-n", "longhorn-system",
+                        "--field-selector", f"spec.nodeName={node}", timeout=30)
+    pods = []
+    for item in data.get("items", []):
+        pods.append((
+            item.get("metadata", {}).get("name", ""),
+            item.get("status", {}).get("phase", ""),
+            [str(c.get("ready")) for c in
+             item.get("status", {}).get("containerStatuses", [])],
+        ))
+    return pods
+
+
+def wait_for_storage(node: str, require: tuple[str, ...], timeout: int) -> None:
+    """Wait until every named longhorn-system component is Running and ready here.
+
+    Split from a single "clean return" check because the two things worth
+    waiting for do not live under the same constraint. longhorn-csi-plugin is a
+    DaemonSet, so it tolerates the unschedulable taint and returns to a cordoned
+    node by itself. instance-manager is not: Longhorn will not place one on a
+    cordoned node, so waiting for it before the uncordon is a wait that can
+    never end. They have to be waited on either side of it.
+    """
     deadline = time.time() + timeout
+    said = False
+    want = "+".join(require)
     while time.time() < deadline:
-        if node_ready(node):
-            # Ask for readiness explicitly rather than pattern-matching "2/2" in
-            # the table, which silently breaks if the DaemonSet changes shape.
-            out = kubectl(
-                "get", "pods", "-n", "longhorn-system",
-                "--field-selector", f"spec.nodeName={node}",
-                "-o", 'jsonpath={range .items[*]}{.metadata.name}{"\t"}'
-                      '{.status.phase}{"\t"}'
-                      '{.status.containerStatuses[*].ready}{"\n"}{end}',
-                check=False, timeout=30,
-            )
+        if node_ready(node) is True:
+            try:
+                pods = longhorn_pods_on(node)
+            except Abort as exc:
+                # Loudly, not as a False. An unreadable cluster is not an
+                # unhealthy node, and the two must not look the same here.
+                log(f"    cannot read storage pods on {node}: {exc}")
+                time.sleep(POLL)
+                continue
 
             def _ready(substr: str) -> bool:
-                for line in out.splitlines():
-                    parts = line.split("\t")
-                    if len(parts) < 3 or substr not in parts[0]:
-                        continue
-                    states = parts[2].split()
-                    if parts[1] == "Running" and states and all(
-                        s == "true" for s in states
-                    ):
-                        return True
-                return False
+                return any(
+                    substr in name and phase == "Running"
+                    and states and all(s == "True" for s in states)
+                    for name, phase, states in pods
+                )
 
-            has_im = _ready("instance-manager")
-            has_csi = _ready("longhorn-csi-plugin")
-            if has_im and has_csi:
-                log(f"    {node} returned clean (Ready + Longhorn engine + CSI)")
+            state = {name: _ready(name) for name in require}
+            if all(state.values()):
+                log(f"    {node}: {want} ready")
                 return
-            log(f"    {node} Ready; waiting for storage (engine={has_im} csi={has_csi})")
+            log(f"    {node} Ready; waiting for storage ("
+                + " ".join(f"{k}={v}" for k, v in state.items()) + ")")
+            if not said:
+                # Say once what is actually on the node. "engine=False csi=False"
+                # on its own cannot distinguish a pod that is missing from one
+                # that is Pending, crash-looping, or simply not ready yet.
+                said = True
+                if pods:
+                    for name, phase, states in pods:
+                        log(f"      {name}: {phase} ready={','.join(states) or '-'}")
+                else:
+                    log(f"      no longhorn-system pods on {node} at all -- "
+                        f"nothing is being scheduled back onto it")
         time.sleep(POLL)
-    raise Abort(f"{node} did not return healthy within {timeout}s")
+    raise Abort(f"{node}: {want} did not become ready within {timeout}s")
 
 
 def drain_node(node: str) -> None:
@@ -669,10 +724,20 @@ def process_node(node: str, vm: VmRef, dry_run: bool, forced: bool = False,
         raise Abort(f"drain of {node} failed ({exc}); uncordoned, stopping run")
 
     reboot_node(node, vm, dry_run)
-    wait_clean_return(node, RETURN_TIMEOUT)
+
+    # Before uncordoning: CSI must be registered, or the first pod scheduled
+    # here fails its mount. This is the gap the original check existed for, and
+    # a DaemonSet returns to a cordoned node on its own, so it can be required
+    # while the node is still fenced off.
+    wait_for_storage(node, ("longhorn-csi-plugin",), RETURN_TIMEOUT)
 
     log("    uncordon")
     kubectl("uncordon", node)
+
+    # Only now can this be asked for. Longhorn does not place an
+    # instance-manager on a cordoned node, and the drain deleted the one that
+    # was here, so requiring it any earlier deadlocks until the timeout.
+    wait_for_storage(node, ("instance-manager",), RETURN_TIMEOUT)
 
     log("    waiting for Longhorn to settle before next node")
     wait_longhorn_settled(SETTLE_TIMEOUT, budget_left)

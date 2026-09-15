@@ -52,29 +52,71 @@ jobs:
       - name: Check node readiness
         id: check_nodes
         run: |
-          NOT_READY=$(kubectl get nodes --no-headers | grep -v " Ready " || true)
-          PENDING_REBOOT=$(kubectl get nodes -o json | jq -r '.items[] | select(.spec.taints != null) | select(.spec.taints[] | select(.key == "weave.works/kured-node-reboot" and .value == "true")) | .metadata.name' || true)
+          set -uo pipefail
+
+          # Multi-line values need heredoc syntax; bare lines in $GITHUB_ENV are
+          # an "Invalid format" error, which is what the old alert path emitted
+          # instead of a body.
+          emit() {
+            echo "status=$1" >> "$GITHUB_OUTPUT"
+            {
+              echo "subject=$2"
+              echo "body<<NODE_CHECK_EOF"
+              cat
+              echo "NODE_CHECK_EOF"
+            } >> "$GITHUB_ENV"
+          }
+
+          # kubectl's failure used to be invisible: its output fed a pipeline
+          # whose exit status is grep's, under a `|| true` that swallowed the
+          # rest. An unreachable API left NOT_READY empty, and empty was read as
+          # "every node is Ready" -- so the one job whose purpose is to report an
+          # outage reported a tick. Unknown is not healthy; say so.
+          if ! NODES_JSON=$(kubectl get nodes -o json 2>&1); then
+            emit FAIL "❌ K8s node check could NOT reach the cluster" <<EOF
+          kubectl could not list nodes, so node health is UNKNOWN.
+          This is not a report that the nodes are healthy.
+
+          $NODES_JSON
+          EOF
+            exit 0
+          fi
+
+          NODE_COUNT=$(printf '%s' "$NODES_JSON" | jq '.items | length')
+          if [ "$NODE_COUNT" -eq 0 ]; then
+            emit FAIL "❌ K8s node check returned no nodes at all" <<EOF
+          kubectl succeeded but reported zero nodes, which is never correct for
+          this cluster. Treating it as a failure rather than as "nothing wrong".
+          EOF
+            exit 0
+          fi
+
+          NOT_READY=$(printf '%s' "$NODES_JSON" | jq -r '
+            .items[]
+            | select([.status.conditions[] | select(.type == "Ready" and .status == "True")] | length == 0)
+            | .metadata.name')
+
+          PENDING_REBOOT=$(printf '%s' "$NODES_JSON" | jq -r '.items[] | select(.spec.taints != null) | select(.spec.taints[] | select(.key == "weave.works/kured-node-reboot" and .value == "true")) | .metadata.name')
 
           if [ -z "$NOT_READY" ] && [ -z "$PENDING_REBOOT" ]; then
-            echo "status=OK" >> $GITHUB_OUTPUT
-            echo "subject=✅ All K8s Nodes Ready" >> $GITHUB_ENV
-            echo "body=All nodes in your Kubernetes cluster are Ready and no nodes are pending reboot." >> $GITHUB_ENV
+            emit OK "✅ All K8s Nodes Ready" <<EOF
+          All $NODE_COUNT nodes in your Kubernetes cluster are Ready and no nodes
+          are pending reboot.
+          EOF
           else
-            echo "status=FAIL" >> $GITHUB_OUTPUT
-            echo "subject=❌ K8s Nodes Issue Detected" >> $GITHUB_ENV
             {
-              echo "The following issues were detected:"
+              echo "The following issues were detected across $NODE_COUNT nodes:"
               echo
-              if [ ! -z "$NOT_READY" ]; then
+              if [ -n "$NOT_READY" ]; then
                 echo "Nodes not in Ready state:"
                 echo "$NOT_READY"
                 echo
               fi
-              if [ ! -z "$PENDING_REBOOT" ]; then
+              if [ -n "$PENDING_REBOOT" ]; then
                 echo "Nodes pending reboot:"
                 echo "$PENDING_REBOOT"
               fi
-            } >> $GITHUB_ENV
+            } | emit FAIL "❌ K8s Nodes Issue Detected"
           fi
 
       - name: Send email
