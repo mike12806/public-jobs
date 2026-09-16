@@ -23,10 +23,10 @@ Per node, in sequence:
      always completes; rung (a) is what covers the clean case.
   4. wait for Longhorn's own pods to come back: CSI registered before the
      uncordon, instance-manager after it (Longhorn will not place one while
-     cordoned). Bounded, and advisory rather than fatal. A node Longhorn does
-     not run on at all -- a control-plane node it is kept off -- is skipped
-     outright, and a node whose pods are late only stops the run if the volumes
-     actually need them. Which pods are up on the node just rebooted is not the
+     cordoned). Bounded, and advisory rather than fatal. Control-plane nodes
+     skip it entirely -- Longhorn is kept off them -- as does any other node
+     Longhorn has no record of running on, and a node whose pods are late only
+     stops the run if the volumes actually need them. Which pods are up on the node just rebooted is not the
      property this job exists to protect; see step 5 for the one that is.
   5. move on once every volume would still hold REPLICA_FLOOR healthy copies
      with the *next* node down -- not once the cluster falls silent. A rebuild
@@ -973,7 +973,8 @@ def wait_for_storage(node: str, require: tuple[str, ...], timeout: int) -> bool:
     return False
 
 
-def storage_back(node: str, require: tuple[str, ...]) -> bool:
+def storage_back(node: str, require: tuple[str, ...],
+                 control_plane: bool = False) -> bool:
     """Wait for Longhorn's pods on `node`, and decide what their absence means.
 
     They are worth waiting for: a node whose csi-plugin has not registered
@@ -988,7 +989,12 @@ def storage_back(node: str, require: tuple[str, ...]) -> bool:
     the question to ask here too. Three outcomes:
 
       * Longhorn does not run on this node. Nothing to wait for, nothing
-        depends on it, move on.
+        depends on it, move on. Control-plane nodes are that case by design
+        here and are taken at their label: Longhorn is kept off them, so there
+        is no point asking Longhorn about them. Asking is not free either --
+        longhorn-manager's nodes.longhorn.io object outlives the pods, so a
+        node Longhorn was taken off still has one, and the lookup would put a
+        control-plane node back in the queue for a wait that cannot end.
       * Pods late, volumes fine. Say so loudly and carry on: losing this node
         outright would still leave every volume above the floor, so its pods
         being late endangers nothing.
@@ -997,6 +1003,10 @@ def storage_back(node: str, require: tuple[str, ...]) -> bool:
         and had no way to express.
     """
     if not longhorn_installed():
+        return True
+    if control_plane:
+        log(f"    {node}: control-plane -- Longhorn does not run here, "
+            f"no storage to wait for")
         return True
     if not longhorn_manages(node):
         log(f"    {node}: Longhorn does not run here -- no storage to wait for")
@@ -1140,7 +1150,8 @@ def reboot_node(node: str, vm: VmRef, dry_run: bool) -> None:
 
 
 def process_node(node: str, vm: VmRef, dry_run: bool, forced: bool = False,
-                 budget_left: float | None = None) -> bool:
+                 budget_left: float | None = None,
+                 control_plane: bool = False) -> bool:
     if forced:
         log(f"  {node}: FORCED -- treating as needing a reboot (test override)")
     else:
@@ -1171,7 +1182,7 @@ def process_node(node: str, vm: VmRef, dry_run: bool, forced: bool = False,
     # here fails its mount. This is the gap the original check existed for, and
     # a DaemonSet returns to a cordoned node on its own, so it can be waited on
     # while the node is still fenced off.
-    storage = storage_back(node, ("longhorn-csi-plugin",))
+    storage = storage_back(node, ("longhorn-csi-plugin",), control_plane)
 
     log("    uncordon")
     kubectl("uncordon", node)
@@ -1179,7 +1190,7 @@ def process_node(node: str, vm: VmRef, dry_run: bool, forced: bool = False,
     # Only now can this be asked for. Longhorn does not place an
     # instance-manager on a cordoned node, and the drain deleted the one that
     # was here, so asking for it any earlier waits out the timeout for nothing.
-    storage = storage_back(node, ("instance-manager",)) and storage
+    storage = storage_back(node, ("instance-manager",), control_plane) and storage
 
     if storage:
         log(f"  {node}: DONE (rebuilds may still be running; the next node waits "
@@ -1300,7 +1311,8 @@ def main() -> int:
             return 0
 
         # Control-plane last: keep the API (and this script's kubectl) alive as
-        # long as possible.
+        # long as possible. The same set tells process_node which nodes to skip
+        # the Longhorn waits on -- storage is kept off the control plane here.
         cp = set()
         for n in kubectl_json("get", "nodes")["items"]:
             labels = n["metadata"].get("labels", {})
@@ -1335,7 +1347,8 @@ def main() -> int:
             t0 = time.time()
             if not process_node(name, plan.vms[name], dry_run,
                                 forced=force_all or name in force_names,
-                                budget_left=None if dry_run else left):
+                                budget_left=None if dry_run else left,
+                                control_plane=name in cp):
                 no_storage.append(name)
             if not dry_run:
                 done.append(time.time() - t0)
