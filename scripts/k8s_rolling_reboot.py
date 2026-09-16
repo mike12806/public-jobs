@@ -21,12 +21,19 @@ Per node, in sequence:
      for -- a guest too wedged to answer -- is the situation where it can sit
      there indefinitely. /status/stop kills the QEMU process outright, so it
      always completes; rung (a) is what covers the clean case.
-  4. wait for a *clean* return: CSI registered before the uncordon, Longhorn's
-     instance-manager after it (Longhorn will not place one while cordoned)
+  4. wait for Longhorn's own pods to come back: CSI registered before the
+     uncordon, instance-manager after it (Longhorn will not place one while
+     cordoned). Bounded, and advisory rather than fatal. Control-plane nodes
+     skip it entirely -- Longhorn is kept off them -- as does any other node
+     Longhorn has no record of running on, and a node whose pods are late only
+     stops the run if the volumes actually need them. Which pods are up on the node just rebooted is not the
+     property this job exists to protect; see step 5 for the one that is.
   5. move on once every volume would still hold REPLICA_FLOOR healthy copies
      with the *next* node down -- not once the cluster falls silent. A rebuild
      on the node just finished endangers nothing about a node that holds none
-     of that volume's copies. The run settles fully once, at the end.
+     of that volume's copies. The run settles fully once, at the end -- and
+     even there, volumes still rebuilding above the floor finish the run
+     rather than fail it.
 
 A volume reading FAULTED mid-run is re-checked for ten minutes before it stops
 anything: a node coming back through a reboot can fault a volume transiently
@@ -67,7 +74,17 @@ DRAIN_FORCE_TIMEOUT = 300    # 5m more, deleting rather than evicting
 DOWN_WAIT = 150              # 2.5m for a reboot to take the node NotReady at all
 GRACEFUL_WAIT = 420          # 7m for an in-guest reboot to go down AND return
 HARD_STOP_WAIT = 180         # 3m for the VM to actually reach 'stopped'
-RETURN_TIMEOUT = 900         # 15m to come back fully healthy
+RETURN_TIMEOUT = 900         # 15m to come back Ready on a new boot
+STORAGE_TIMEOUT = 300        # 5m for Longhorn's per-node pods, once the node
+                             # itself is back. Measured, not guessed: in a
+                             # clean run csi-plugin and instance-manager are
+                             # ready within half a minute of the node
+                             # returning, every time. This used to borrow
+                             # RETURN_TIMEOUT, so a node where they were never
+                             # coming back cost a quarter of an hour before
+                             # saying so -- and then ended the run. It no
+                             # longer ends the run on its own; see
+                             # storage_back().
 SETTLE_TIMEOUT = 3600        # 60m for Longhorn to finish rebuilding. Half an
                              # hour was not enough: a large volume rebuilding
                              # across a busy cluster routinely runs past it, and
@@ -99,10 +116,11 @@ HEARTBEAT = 60               # never go longer than this without saying
                              # unattended run should leave anyone asking.
 # Worst case for one node, if every wait below runs to its limit.
 # FAULT_GRACE is in here because a fault seen during a node's redundancy wait
-# extends that wait by the window it spends re-checking.
+# extends that wait by the window it spends re-checking. STORAGE_TIMEOUT counts
+# twice: once before the uncordon and once after.
 NODE_WORST_CASE = (DRAIN_TIMEOUT + DRAIN_FORCE_TIMEOUT + GRACEFUL_WAIT
-                   + HARD_STOP_WAIT + RETURN_TIMEOUT + SETTLE_TIMEOUT
-                   + FAULT_GRACE)
+                   + HARD_STOP_WAIT + RETURN_TIMEOUT + 2 * STORAGE_TIMEOUT
+                   + SETTLE_TIMEOUT + FAULT_GRACE)
 # GitHub caps a job at 360 minutes and kills it mid-step, which here could mean
 # a node left cordoned or half-rebooted with no failure email (a cancelled job
 # skips if: failure()). So stop starting nodes before that can happen. The
@@ -218,6 +236,28 @@ def node_ready(name: str) -> bool | None:
     except (Abort, subprocess.TimeoutExpired):
         return None
     return out.strip() == "True"
+
+
+def node_boot_id(name: str) -> str | None:
+    """The node's kernel boot_id, or None when it could not be read.
+
+    A different one means the machine has actually booted, which is the only
+    unambiguous evidence that a reboot happened. Ready/NotReady is not. The node
+    controller needs about forty seconds of missed leases before it calls a node
+    NotReady, so for the first half minute after a power cycle the API still
+    reports the node Ready -- carrying the status it had when the power went.
+    That is how the run this came from walked straight out of "start issued"
+    into a storage wait against a node that was still in its BIOS, and then
+    spent fifteen minutes blaming Longhorn for it.
+    """
+    try:
+        out = kubectl(
+            "get", "node", name, "-o", "jsonpath={.status.nodeInfo.bootID}",
+            timeout=30,
+        )
+    except (Abort, subprocess.TimeoutExpired):
+        return None
+    return out.strip() or None
 
 
 def _host_pod_spec(node: str, name: str, script: str) -> dict:
@@ -547,7 +587,21 @@ def wait_longhorn_settled(timeout: int, budget_left: float | None = None) -> Non
             return
         log(f"    Longhorn settling: degraded={degraded} rebuilding={rebuilding}")
         time.sleep(30)
-    raise Abort(f"Longhorn did not settle within {timeout}s")
+
+    # Out of time, but "not settled" and "not safe" are different claims, and
+    # only the second is worth failing a run over. Every node is back and
+    # uncordoned by now; a volume that holds REPLICA_FLOOR healthy copies can
+    # finish rebuilding the rest on its own time. "" is no node: it asks what
+    # each volume has right now, rather than what it would have with some node
+    # taken away.
+    short = unsafe_volumes("")
+    if short:
+        raise Abort(
+            f"Longhorn did not settle within {timeout}s and {len(short)} "
+            f"volume(s) are below {REPLICA_FLOOR} healthy copies: {short[:3]}"
+        )
+    log(f"    Longhorn still rebuilding after {timeout}s, but every volume holds "
+        f"{REPLICA_FLOOR} healthy copies -- finishing")
 
 
 # --- Proxmox ------------------------------------------------------------------
@@ -709,7 +763,8 @@ def vm_status(vm: VmRef) -> str | None:
 
 
 def wait_back(node: str, vm: VmRef, seconds: int,
-              down_wait: int = DOWN_WAIT) -> bool:
+              down_wait: int = DOWN_WAIT, boot_id: str | None = None,
+              already_down: bool = False) -> bool:
     """Did the node go away and come back Ready?
 
     This, not "did it go down", is the right success test for a reboot rung.
@@ -729,11 +784,19 @@ def wait_back(node: str, vm: VmRef, seconds: int,
     within a minute or so -- and waiting out the rest of the window only delays
     the rung that would have fixed it. So give "did it go down" its own short
     deadline and escalate the moment it passes.
+
+    Given `boot_id` -- the node's boot id from before the reboot was issued --
+    the transition stops being the test and becomes a fallback. Ready on a new
+    boot id is proof the node rebooted, whether or not anyone was watching when
+    it went down; Ready on the *same* boot id is not, however many NotReady
+    polls preceded it, because a kubelet that merely blipped produces exactly
+    that. `already_down` is for the rung that took the power away itself: there
+    is no going-down left to observe, only a coming-back.
     """
     start = time.time()
     deadline = start + seconds
     down_deadline = start + down_wait
-    saw_down = False
+    saw_down = already_down
     beat = start
     while time.time() < deadline:
         ready = node_ready(node)
@@ -749,25 +812,40 @@ def wait_back(node: str, vm: VmRef, seconds: int,
                 log("      node went NotReady (rebooting)")
                 beat = time.time()
             saw_down = True
-        elif saw_down:
-            log("      node returned Ready")
-            return True
-        elif time.time() >= down_deadline:
-            log(f"      node never went down after {down_wait}s -- reboot did "
-                f"not take; escalating without waiting out the full {seconds}s")
-            return False
+        else:
+            now_boot = node_boot_id(node) if boot_id else None
+            if now_boot and now_boot != boot_id:
+                log("      node returned Ready (rebooted)")
+                return True
+            if saw_down and not now_boot:
+                # Nothing to compare against -- fall back to the transition,
+                # which is all this check ever had.
+                log("      node returned Ready")
+                return True
+            if not saw_down and time.time() >= down_deadline:
+                log(f"      node never went down after {down_wait}s -- reboot "
+                    f"did not take; escalating without waiting out the full "
+                    f"{seconds}s")
+                return False
         # Say something on the way. The old loop announced NotReady once and
         # then polled in silence until the node returned or the window ran
         # out -- minutes of nothing, which reads exactly like a hung job.
         if time.time() - beat >= HEARTBEAT:
             beat = time.time()
-            log(f"      still {'NotReady' if saw_down else 'Ready'}; "
-                f"{int(deadline - time.time())}s left in this rung "
+            # What the cluster says now, not what this loop has decided. With a
+            # boot id in play those differ, and the difference is the whole
+            # point: a node reported Ready on the boot id it had before the
+            # power cycle has not come back, it has not left yet.
+            if ready:
+                seen = "still Ready on the pre-reboot boot" if boot_id else "still Ready"
+            else:
+                seen = "still NotReady"
+            log(f"      {seen}; {int(deadline - time.time())}s left in this rung "
                 f"(Proxmox says: {vm_status(vm)})")
         time.sleep(POLL)
 
     if saw_down:
-        log(f"      STUCK: NotReady for {seconds}s without returning "
+        log(f"      STUCK: never came back Ready on a new boot within {seconds}s "
             f"(Proxmox says: {vm_status(vm)})")
     else:
         log(f"      node never went down after {seconds}s -- reboot did not take")
@@ -797,8 +875,35 @@ def longhorn_pods_on(node: str) -> list[tuple[str, str, list[str]]]:
     return pods
 
 
-def wait_for_storage(node: str, require: tuple[str, ...], timeout: int) -> None:
+def longhorn_manages(node: str) -> bool:
+    """Does Longhorn run on this node at all?
+
+    longhorn-manager creates a nodes.longhorn.io object for every node it lands
+    on. A node Longhorn is kept off -- a control-plane node whose taint its
+    DaemonSets do not tolerate, or one outside a node selector -- never gets
+    one, never gets a csi-plugin pod, and holds no replicas for anything to
+    depend on. Waiting for storage to come back there is waiting for something
+    that was never there, which is exactly how the run this came from ended:
+    fifteen minutes of "waiting for storage (longhorn-csi-plugin=False)" on a
+    control-plane node, then an abort with two nodes still to do.
+
+    Unreadable counts as managed. The wait it gates is bounded and no longer
+    fatal on its own, so the cautious answer costs a few minutes at worst.
+    """
+    try:
+        data = kubectl_json("get", "nodes.longhorn.io", "-n", "longhorn-system",
+                            timeout=30)
+    except (Abort, subprocess.TimeoutExpired):
+        return True
+    return any(i.get("metadata", {}).get("name") == node
+               for i in data.get("items", []))
+
+
+def wait_for_storage(node: str, require: tuple[str, ...], timeout: int) -> bool:
     """Wait until every named longhorn-system component is Running and ready here.
+
+    Reports whether they came back; deciding what that is worth belongs to
+    storage_back(), which knows what the volumes need.
 
     Split from a single "clean return" check because the two things worth
     waiting for do not live under the same constraint. longhorn-csi-plugin is a
@@ -810,6 +915,7 @@ def wait_for_storage(node: str, require: tuple[str, ...], timeout: int) -> None:
     deadline = time.time() + timeout
     said = False
     beat = time.time()
+    last = ""
     want = "+".join(require)
     while time.time() < deadline:
         ready = node_ready(node)
@@ -841,9 +947,16 @@ def wait_for_storage(node: str, require: tuple[str, ...], timeout: int) -> None:
             state = {name: _ready(name) for name in require}
             if all(state.values()):
                 log(f"    {node}: {want} ready")
-                return
-            log(f"    {node} Ready; waiting for storage ("
-                + " ".join(f"{k}={v}" for k, v in state.items()) + ")")
+                return True
+            shown = " ".join(f"{k}={v}" for k, v in state.items())
+            if shown != last or time.time() - beat >= HEARTBEAT:
+                # Once per change, then at the heartbeat. Polling every 15s and
+                # printing every poll filled the run log that prompted this
+                # with sixty copies of one line.
+                beat = time.time()
+                last = shown
+                log(f"    {node} Ready; waiting for storage ({shown}; "
+                    f"{int(deadline - time.time())}s left)")
             if not said:
                 # Say once what is actually on the node. "engine=False csi=False"
                 # on its own cannot distinguish a pod that is missing from one
@@ -856,7 +969,71 @@ def wait_for_storage(node: str, require: tuple[str, ...], timeout: int) -> None:
                     log(f"      no longhorn-system pods on {node} at all -- "
                         f"nothing is being scheduled back onto it")
         time.sleep(POLL)
-    raise Abort(f"{node}: {want} did not become ready within {timeout}s")
+    log(f"    {node}: {want} did not become ready within {timeout}s")
+    return False
+
+
+def storage_back(node: str, require: tuple[str, ...],
+                 control_plane: bool = False) -> bool:
+    """Wait for Longhorn's pods on `node`, and decide what their absence means.
+
+    They are worth waiting for: a node whose csi-plugin has not registered
+    cannot mount a Longhorn volume. They are the wrong thing to end a run over,
+    and until now they were the only thing that could end one here -- a pod
+    readiness check on the node just rebooted, given the authority to abort a
+    cluster-wide maintenance run.
+
+    What this job has to protect is redundancy: REPLICA_FLOOR healthy copies of
+    every volume on nodes other than this one. That is a question about the
+    volumes, it is already asked directly before each node goes down, and it is
+    the question to ask here too. Three outcomes:
+
+      * Longhorn does not run on this node. Nothing to wait for, nothing
+        depends on it, move on. Control-plane nodes are that case by design
+        here and are taken at their label: Longhorn is kept off them, so there
+        is no point asking Longhorn about them. Asking is not free either --
+        longhorn-manager's nodes.longhorn.io object outlives the pods, so a
+        node Longhorn was taken off still has one, and the lookup would put a
+        control-plane node back in the queue for a wait that cannot end.
+      * Pods late, volumes fine. Say so loudly and carry on: losing this node
+        outright would still leave every volume above the floor, so its pods
+        being late endangers nothing.
+      * Pods late and some volume is counting on this node. Now it matters, and
+        now it stops the run -- which is what the old check was reaching for
+        and had no way to express.
+    """
+    if not longhorn_installed():
+        return True
+    if control_plane:
+        log(f"    {node}: control-plane -- Longhorn does not run here, "
+            f"no storage to wait for")
+        return True
+    if not longhorn_manages(node):
+        log(f"    {node}: Longhorn does not run here -- no storage to wait for")
+        return True
+    if wait_for_storage(node, require, STORAGE_TIMEOUT):
+        return True
+
+    want = "+".join(require)
+    degraded, rebuilding, faulted = longhorn_state()
+    if faulted:
+        faulted = confirm_faulted(faulted, f"with {want} still down on {node}")
+        if faulted:
+            raise Abort(f"{faulted} Longhorn volume(s) still FAULTED and {want} "
+                        f"has not come back on {node} -- stopping")
+        # The counts above predate the window; re-read rather than report them.
+        degraded, rebuilding, _ = longhorn_state()
+    bad = unsafe_volumes(node)
+    if bad:
+        raise Abort(
+            f"{node}: {want} did not come back within {STORAGE_TIMEOUT}s and "
+            f"{len(bad)} volume(s) need this node to stay above "
+            f"{REPLICA_FLOOR} copies: {bad[:3]}"
+        )
+    log(f"    {node}: {want} still down after {STORAGE_TIMEOUT}s, but every "
+        f"volume holds {REPLICA_FLOOR} healthy copies without it "
+        f"(degraded={degraded} rebuilding={rebuilding}) -- continuing")
+    return False
 
 
 def drain_node(node: str) -> None:
@@ -898,10 +1075,23 @@ def reboot_node(node: str, vm: VmRef, dry_run: bool) -> None:
         log(f"    DRY-RUN: would reboot {node} ({vm.host.name}:{vm.vmid})")
         return
 
+    # Read before anything is issued: this is what "did it actually reboot"
+    # compares against, on both rungs.
+    boot = node_boot_id(node)
+
     # Rung 1 -- graceful, in-guest. Clean unmount of Longhorn replicas.
     log("    rung 1/2: systemctl reboot (in-guest)")
-    run_on_host(node, "nsenter -t 1 -m -u -i -n -p -- systemctl reboot", timeout=60)
-    if wait_back(node, vm, GRACEFUL_WAIT):
+    ok, out = run_on_host(node, "nsenter -t 1 -m -u -i -n -p -- systemctl reboot",
+                          timeout=60)
+    if not ok:
+        # Not fatal, and deliberately not read as "the reboot did not land":
+        # the pod is racing the shutdown it just asked for and can lose that
+        # race on a perfectly successful reboot. But when the node then never
+        # goes down, this line is the difference between a guest that ignored
+        # the reboot and a reboot nobody ever managed to ask for.
+        log(f"      (could not confirm the reboot command ran: "
+            f"{out.strip()[:120] or 'no output from the pod'})")
+    if wait_back(node, vm, GRACEFUL_WAIT, boot_id=boot):
         return
 
     # Rung 2 -- power cycle via the hypervisor. Deliberately NOT /status/reboot:
@@ -944,9 +1134,24 @@ def reboot_node(node: str, vm: VmRef, dry_run: bool) -> None:
     vm.host.call(f"{base}/status/start", method="POST")
     log("      start issued; waiting for the node to come back")
 
+    # This rung used to end here, on the word of the Proxmox API that a start
+    # had been issued, and everything after it ran against whatever the cluster
+    # happened to say about a node that was still powering on -- which, for the
+    # first half minute, is the Ready it was carrying when the power went. So
+    # wait for the node itself, and take a new boot id as the proof: there is no
+    # going-down left to watch for, we took it down ourselves.
+    if not wait_back(node, vm, RETURN_TIMEOUT, down_wait=RETURN_TIMEOUT,
+                     boot_id=boot, already_down=True):
+        raise Abort(
+            f"{node}: did not come back Ready within {RETURN_TIMEOUT // 60}m of "
+            f"the power cycle (Proxmox says: {vm_status(vm)}). It is drained and "
+            f"cordoned; it needs a hand."
+        )
+
 
 def process_node(node: str, vm: VmRef, dry_run: bool, forced: bool = False,
-                 budget_left: float | None = None) -> None:
+                 budget_left: float | None = None,
+                 control_plane: bool = False) -> bool:
     if forced:
         log(f"  {node}: FORCED -- treating as needing a reboot (test override)")
     else:
@@ -961,7 +1166,7 @@ def process_node(node: str, vm: VmRef, dry_run: bool, forced: bool = False,
 
     if dry_run:
         log(f"    DRY-RUN: would cordon, drain, reboot, uncordon {node}")
-        return
+        return True
 
     log("    cordon + drain")
     kubectl("cordon", node)
@@ -973,22 +1178,31 @@ def process_node(node: str, vm: VmRef, dry_run: bool, forced: bool = False,
 
     reboot_node(node, vm, dry_run)
 
-    # Before uncordoning: CSI must be registered, or the first pod scheduled
+    # Before uncordoning: CSI should be registered, or the first pod scheduled
     # here fails its mount. This is the gap the original check existed for, and
-    # a DaemonSet returns to a cordoned node on its own, so it can be required
+    # a DaemonSet returns to a cordoned node on its own, so it can be waited on
     # while the node is still fenced off.
-    wait_for_storage(node, ("longhorn-csi-plugin",), RETURN_TIMEOUT)
+    storage = storage_back(node, ("longhorn-csi-plugin",), control_plane)
 
     log("    uncordon")
     kubectl("uncordon", node)
 
     # Only now can this be asked for. Longhorn does not place an
     # instance-manager on a cordoned node, and the drain deleted the one that
-    # was here, so requiring it any earlier deadlocks until the timeout.
-    wait_for_storage(node, ("instance-manager",), RETURN_TIMEOUT)
+    # was here, so asking for it any earlier waits out the timeout for nothing.
+    storage = storage_back(node, ("instance-manager",), control_plane) and storage
 
-    log(f"  {node}: DONE (rebuilds may still be running; the next node waits on "
-        f"redundancy, not on silence)")
+    if storage:
+        log(f"  {node}: DONE (rebuilds may still be running; the next node waits "
+            f"on redundancy, not on silence)")
+    else:
+        # Uncordoned anyway. Leaving it fenced off would keep Longhorn from
+        # placing the very pods it is waiting for, and the volumes have already
+        # said they do not need this node.
+        log(f"  {node}: DONE, but Longhorn has not come back on it. No volume "
+            f"needs it -- that was just checked -- so the run continues; the "
+            f"node carries no replicas until Longhorn is back.")
+    return storage
 
 
 # --- main ---------------------------------------------------------------------
@@ -1097,7 +1311,8 @@ def main() -> int:
             return 0
 
         # Control-plane last: keep the API (and this script's kubectl) alive as
-        # long as possible.
+        # long as possible. The same set tells process_node which nodes to skip
+        # the Longhorn waits on -- storage is kept off the control plane here.
         cp = set()
         for n in kubectl_json("get", "nodes")["items"]:
             labels = n["metadata"].get("labels", {})
@@ -1112,6 +1327,7 @@ def main() -> int:
         # fraction of the ceiling, so once a node has actually been done, pace
         # the rest on that measurement instead.
         done: list[float] = []
+        no_storage: list[str] = []
         for i, name in enumerate(candidates):
             if args.deadline:
                 now = datetime.now(timezone.utc).strftime("%H:%M")
@@ -1129,9 +1345,11 @@ def main() -> int:
                 break
 
             t0 = time.time()
-            process_node(name, plan.vms[name], dry_run,
-                         forced=force_all or name in force_names,
-                         budget_left=None if dry_run else left)
+            if not process_node(name, plan.vms[name], dry_run,
+                                forced=force_all or name in force_names,
+                                budget_left=None if dry_run else left,
+                                control_plane=name in cp):
+                no_storage.append(name)
             if not dry_run:
                 done.append(time.time() - t0)
                 log(f"  ({len(done)}/{len(candidates)} done, {done[-1] / 60:.0f}m "
@@ -1149,6 +1367,14 @@ def main() -> int:
             # already back and uncordoned.
             wait_longhorn_settled(SETTLE_TIMEOUT,
                                   budget_left=RUN_BUDGET - (time.time() - started))
+        if no_storage:
+            # Worth one line at the top level. The run was right to continue --
+            # every volume kept its copies elsewhere, which is the only reason
+            # it did -- but a node Longhorn never came back on is carrying no
+            # replicas, and nothing else is going to mention it.
+            log(f"NOTE: Longhorn did not come back on {no_storage}. Every volume "
+                f"held {REPLICA_FLOOR} healthy copies without those nodes, so the "
+                f"run continued; they are worth a look.")
         log("Run complete. Cluster healthy.")
         return 0
 

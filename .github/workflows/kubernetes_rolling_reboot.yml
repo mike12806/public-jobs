@@ -1,8 +1,9 @@
 name: Kubernetes Rolling Node Reboot
 
 # Replaces kured. Reboots only nodes that actually need it, one at a time,
-# waiting for Longhorn to be fully healthy between nodes, and aborting rather
-# than continuing if anything fails to come back cleanly.
+# keeping every Longhorn volume above its replica floor between nodes, and
+# aborting rather than continuing if a node or the storage it is carrying
+# cannot come back.
 #
 # Required secrets:
 #   KUBECONFIG         base64-encoded kubeconfig (same as the other k8s jobs)
@@ -23,8 +24,9 @@ name: Kubernetes Rolling Node Reboot
 #   dry_run OFF + force_reboot_nodes "all"   LIVE: every node is cordoned,
 #                                            drained and rebooted in turn,
 #                                            workers first, control-plane last,
-#                                            waiting for Longhorn to be fully
-#                                            healthy between each one
+#                                            waiting between each one until
+#                                            every volume holds two healthy
+#                                            copies without the next node
 # Only the /var/run/reboot-required check is skipped. Every health gate still
 # applies, and the run still aborts rather than continuing past a failure.
 
