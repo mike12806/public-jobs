@@ -35,6 +35,25 @@ Per node, in sequence:
      even there, volumes still rebuilding above the floor finish the run
      rather than fail it.
 
+That wait ends on whether Longhorn is making progress, not on a fixed clock.
+Engines publish the percentage the UI shows for a rebuild in flight, so the
+wait watches those percentages climb. A rebuild still gaining ground keeps the
+wait alive -- past SETTLE_TIMEOUT, up to whatever the run budget can spare --
+because a volume five minutes from safe is not a reason to fail a run, and the
+old fixed hour failed exactly those. A rebuild that has gained nothing for
+REBUILD_STALL ends it instead, since nothing is being waited for.
+
+The run budget is what actually bounds the wait now. That limit is real: the
+job is killed at 360m and a node cordoned at that moment stays cordoned, so
+the wait extends only into budget the reboot it precedes will not need.
+
+Why nothing is moving is reported, never acted on. A volume Longhorn cannot
+place reads as unschedulable, but this job cordons a node at a time and
+Longhorn will not schedule onto a cordoned node by default, so that condition
+is one the run itself produces and clears. It belongs in the message that
+explains a stall, not in a rule that causes one -- "still short after 3600s"
+named a symptom, and the point of the percentages is to name a cause.
+
 A volume reading FAULTED mid-run is re-checked for ten minutes before it stops
 anything: a node coming back through a reboot can fault a volume transiently
 while its engine re-attaches or its last replicas rebuild, and that clears on
@@ -108,6 +127,26 @@ FAULT_GRACE = 600            # 10m of re-checks before a FAULTED volume is
                              # returning from a reboot produces transiently.
                              # A genuine fault outlives ten minutes easily.
 FAULT_POLL = 30              # re-check cadence inside that window
+REBUILD_STALL = 1200         # 20m of no rebuild gaining any ground before a
+                             # wait stops waiting. SETTLE_TIMEOUT alone cannot
+                             # tell "slow" from "stuck": it spends the same
+                             # hour either way, which is both too long for a
+                             # rebuild that is never going to finish and too
+                             # short for a large one that would have. Longhorn
+                             # publishes the percentage the UI shows, so ask
+                             # the question directly -- is anything copying.
+                             # This is also how much runway a wait is given
+                             # each time something does move, which is what
+                             # lets a slow rebuild outlast SETTLE_TIMEOUT.
+                             # Twenty minutes rather than ten because Longhorn
+                             # legitimately does nothing for a while after a
+                             # node goes away: replica-replenishment-wait-
+                             # interval (default 600s) is how long it holds off
+                             # replacing replicas from a node that might just
+                             # be rebooting -- which is every node this script
+                             # touches. A window under that would call the
+                             # cluster stalled while it was only being patient.
+                             # Raise this if that setting is raised.
 POLL = 15
 HEARTBEAT = 60               # never go longer than this without saying
                              # something. A wait that polls silently for
@@ -121,6 +160,12 @@ HEARTBEAT = 60               # never go longer than this without saying
 NODE_WORST_CASE = (DRAIN_TIMEOUT + DRAIN_FORCE_TIMEOUT + GRACEFUL_WAIT
                    + HARD_STOP_WAIT + RETURN_TIMEOUT + 2 * STORAGE_TIMEOUT
                    + SETTLE_TIMEOUT + FAULT_GRACE)
+# What a node still needs after its redundancy wait returns: everything in the
+# worst case except the wait itself. The wait is allowed to run long while
+# rebuilds are progressing, so it has to leave this much of the run budget
+# behind -- waiting until the budget is gone and then cordoning a node is how
+# you get killed at GitHub's 360m limit with a node half rebooted.
+REBOOT_RESERVE = NODE_WORST_CASE - SETTLE_TIMEOUT
 # GitHub caps a job at 360 minutes and kills it mid-step, which here could mean
 # a node left cordoned or half-rebooted with no failure email (a cancelled job
 # skips if: failure()). So stop starting nodes before that can happen. The
@@ -396,6 +441,88 @@ def longhorn_state() -> tuple[int, int, int]:
     return (degraded, rebuilding, faulted)
 
 
+def rebuild_progress() -> dict[str, int]:
+    """{volume/replica: percent complete} for every rebuild now in flight.
+
+    This is the number the Longhorn UI puts on a rebuilding volume, and it is
+    the only thing here that separates "slow" from "stuck". The degraded and
+    rebuilding counts say a rebuild exists; they say nothing about whether it
+    is moving, which is why a run can sit on them for an hour and learn
+    nothing. Engines carry the percentage in status.rebuildStatus, keyed by
+    the replica being rebuilt.
+
+    Only an attached volume with a running engine reports anything, and
+    Longhorn rebuilds a limited number of replicas at a time, so an empty map
+    means "nothing copying right now" rather than "nothing to do" -- normal
+    between rebuilds, and why callers judge the cluster as a whole rather than
+    any single volume.
+    """
+    engines = kubectl_json("get", "engines.longhorn.io", "-n", "longhorn-system")
+    out: dict[str, int] = {}
+    for e in engines.get("items", []):
+        vol = e.get("spec", {}).get("volumeName", "?")
+        for replica, status in (e.get("status", {}).get("rebuildStatus") or {}).items():
+            out[f"{vol}/{replica}"] = int(status.get("progress") or 0)
+    return out
+
+
+def rebuilds_advanced(before: dict[str, int], now: dict[str, int]) -> bool:
+    """Whether any rebuild gained ground between two readings.
+
+    Ground gained means one thing: a percentage that went up. Deliberately not
+    "a rebuild appeared" -- Longhorn replaces a failed replica with a brand new
+    one under a brand new name, so a rebuild that dies and is retried forever
+    is an endless stream of new keys, and counting those as progress would make
+    a crash loop look like the healthiest volume in the cluster. It is the one
+    failure worth catching that the old timeout could not see at all.
+
+    A rebuild that vanishes counts neither way; if it finished, the volume
+    leaves the caller's short list and that is what says so. A percentage that
+    drops is a rebuild starting over, which is not progress either.
+
+    The cost of being this strict is a rebuild that reports 0% for its first
+    few minutes, which reads as no movement until the first percent lands.
+    REBUILD_STALL is sized so that is comfortably survivable.
+    """
+    return any(key in before and pct > before[key] for key, pct in now.items())
+
+
+def rebuild_detail(progress: dict[str, int]) -> str:
+    """The in-flight rebuilds as the heartbeat and abort messages show them."""
+    if not progress:
+        return "; no rebuild in flight"
+    shown = sorted(progress.items())
+    at = ", ".join(f"{key} at {pct}%" for key, pct in shown[:3])
+    more = f" (+{len(shown) - 3} more)" if len(shown) > 3 else ""
+    return f"; rebuilding {at}{more}"
+
+
+def unschedulable_volumes() -> dict[str, str]:
+    """{volume: why} for volumes Longhorn cannot place a replica for.
+
+    A volume whose Scheduled condition is False is not rebuilding slowly, it is
+    not rebuilding at all: Longhorn has looked for somewhere to put the copy
+    and found nowhere. Disk pressure, a tag or anti-affinity rule no remaining
+    node satisfies, or replicas stranded on a node that is gone all land here.
+    None of them resolve by waiting, so a wait that treats this like a slow
+    rebuild spends its whole window to reach a conclusion available in the
+    first minute.
+
+    Unknown is not False: Longhorn uses it while it is still working the
+    placement out, and only False is a decision.
+    """
+    vols = kubectl_json("get", "volumes.longhorn.io", "-n", "longhorn-system")
+    out: dict[str, str] = {}
+    for v in vols.get("items", []):
+        if v.get("status", {}).get("robustness") not in ("healthy", "degraded"):
+            continue
+        for cond in v.get("status", {}).get("conditions", []) or []:
+            if cond.get("type") == "Scheduled" and cond.get("status") == "False":
+                name = v.get("metadata", {}).get("name", "?")
+                out[name] = cond.get("reason") or cond.get("message") or "unschedulable"
+    return out
+
+
 def confirm_faulted(faulted: int, where: str) -> int:
     """Re-check a FAULTED reading for FAULT_GRACE before acting on it.
 
@@ -475,7 +602,12 @@ def replica_map() -> dict[str, dict[str, bool]]:
     return out
 
 
-def unsafe_volumes(node: str) -> list[str]:
+def shortfalls(vols: dict[str, str], limit: int) -> list[str]:
+    """The first `limit` short volumes, rendered for a log line or an abort."""
+    return [f"{name} ({why})" for name, why in sorted(vols.items())[:limit]]
+
+
+def unsafe_volumes(node: str) -> dict[str, str]:
     """Volumes that would fall below REPLICA_FLOOR if `node` went down now.
 
     The old gate waited for the whole cluster to be clean, which asked the wrong
@@ -488,10 +620,15 @@ def unsafe_volumes(node: str) -> list[str]:
     with a copy here can only ever keep one, and a single-replica volume keeps
     none. Those get the redundancy they would have had in a fully healthy
     cluster rather than an impossible target that would hang the run.
+
+    Keyed by volume name so a caller can line the answer up against the other
+    things Longhorn says about the same volume -- whether it can be scheduled,
+    whether anything is copying into it -- rather than re-deriving the name
+    from a sentence.
     """
     vols = kubectl_json("get", "volumes.longhorn.io", "-n", "longhorn-system")
     reps = replica_map()
-    bad = []
+    bad: dict[str, str] = {}
     for v in vols.get("items", []):
         name = v.get("metadata", {}).get("name", "?")
         robustness = v.get("status", {}).get("robustness")
@@ -508,57 +645,142 @@ def unsafe_volumes(node: str) -> list[str]:
         healthy_elsewhere = sum(1 for n, ok in holders.items() if ok and n != node)
         floor = min(REPLICA_FLOOR, len(holders) - (1 if node in holders else 0))
         if healthy_elsewhere < floor:
-            bad.append(f"{name} ({healthy_elsewhere} healthy off {node}, needs {floor})")
+            bad[name] = f"{healthy_elsewhere} healthy off {node}, needs {floor}"
     return bad
 
 
 def wait_safe_to_reboot(node: str, timeout: int,
                         budget_left: float | None = None) -> None:
-    """Block until taking `node` down leaves every volume above the floor."""
+    """Block until taking `node` down leaves every volume above the floor.
+
+    Two clocks, and which one stops the wait is the whole point.
+
+    `timeout` is patience with a cluster that is not visibly doing anything.
+    It no longer ends a wait on its own: a rebuild that is still copying gets
+    the deadline pushed out, because the question this wait exists to answer
+    is "will the volumes be safe", and a rebuild gaining ground is the cluster
+    answering yes slowly. Cutting it off at a fixed hour failed runs that were
+    minutes from clearing, which is what the old fixed deadline did.
+
+    The run budget is the clock that does stop it. That one is real -- GitHub
+    kills the job at 360m and a node cordoned when that happens stays cordoned
+    -- so the wait may extend only while REBOOT_RESERVE of budget remains for
+    the reboot it is waiting to start. When neither clock is available (a dry
+    run passes no budget), `timeout` stands in as the ceiling.
+
+    Nothing gaining ground for REBUILD_STALL ends it too, and that is the only
+    genuinely new way to stop: no rebuild anywhere moved, so waiting longer is
+    not waiting for anything.
+    """
     if not longhorn_installed():
         return
-    if budget_left is not None and budget_left < timeout:
-        timeout = max(int(budget_left), 60)
-        log(f"    (redundancy wait capped at {timeout // 60}m by the run budget)")
-    deadline = time.time() + timeout
+    started = time.time()
+    # `base` is what this wait always got: `timeout`, cut down when the run is
+    # short on time. `ceiling` is how far progress may push it -- only into
+    # budget the reboot itself will not need. Never below `base`, because the
+    # caller admits a node on its observed pace while REBOOT_RESERVE is a
+    # worst case, so the subtraction goes negative on a cluster rebooting
+    # briskly. Extending must never shorten.
+    base = timeout if budget_left is None else max(min(timeout, budget_left), 60)
+    ceiling = started + (base if budget_left is None
+                         else max(base, budget_left - REBOOT_RESERVE))
+    if base < timeout:
+        log(f"    (redundancy wait capped at {int(base) // 60}m "
+            f"by the run budget)")
+    deadline = started + base
     grace_given = 0.0
-    bad: list[str] = []
+    bad: dict[str, str] = {}
     said = False
     beat = time.time()
+    seen = rebuild_progress()   # rebuilds in flight as of the last reading
+    short = -1                  # how many volumes were short at that reading
+    moved = time.time()         # when either of those last improved
     while time.time() < deadline:
         degraded, rebuilding, faulted = longhorn_state()
         if faulted:
             grace_start = time.time()
             faulted = confirm_faulted(faulted, f"while waiting on {node}")
+            was = deadline
             deadline, grace_given = grant_grace(deadline, grace_given, grace_start)
+            # Time spent re-checking a fault is not time this wait spent
+            # waiting, by the same argument grant_grace makes -- so it is not
+            # time the cluster spent failing to rebuild either. Charging it to
+            # the stall clock would let a single fault window plus one quiet
+            # stretch look like a rebuild that died. Progress actually made
+            # during the window is still seen: the next reading is compared
+            # against the one from before it.
+            # Credited from the grace granted, before the budget claws any of
+            # it back below: whether the deadline had room for that window has
+            # no bearing on whether the cluster was rebuilding during it.
+            moved += deadline - was
+            deadline = min(deadline, ceiling)   # the budget outranks the grace
             if faulted:
                 raise Abort(f"{faulted} Longhorn volume(s) still FAULTED after "
                             f"{FAULT_GRACE // 60}m -- stopping")
         bad = unsafe_volumes(node)
         if not bad:
             return
+
+        # Why nothing is rebuilding, when nothing is. Reported, never acted on:
+        # this job cordons a node at a time, and Longhorn stops scheduling onto
+        # a cordoned node by default, so a volume can read unschedulable purely
+        # because of what this run is doing and clear on the uncordon. Treating
+        # that as terminal would fail runs over a condition the run created.
+        # As a line in the stall message it is exactly what is wanted -- the
+        # reason the percentages were not moving.
+        cannot = {v: why for v, why in unschedulable_volumes().items() if v in bad}
+
+        now = rebuild_progress()
+        if short < 0 or len(bad) < short or rebuilds_advanced(seen, now):
+            moved = time.time()
+            # Ground gained buys more waiting, up to what the run can spare.
+            deadline = min(max(deadline, time.time() + REBUILD_STALL), ceiling)
+        seen, short = now, len(bad)
+        idle = time.time() - moved
+        if idle >= REBUILD_STALL:
+            why = (f"; Longhorn cannot place a replica for "
+                   f"{shortfalls(cannot, 3)}" if cannot else "")
+            raise Abort(
+                f"no Longhorn rebuild has gained ground in "
+                f"{REBUILD_STALL // 60}m and {len(bad)} volume(s) are still "
+                f"short of {REPLICA_FLOOR} copies; not taking {node} down: "
+                f"{shortfalls(bad, 3)}{rebuild_detail(now)}{why}"
+            )
+
         if not said:
             said = True
             beat = time.time()
             log(f"    waiting for redundancy before {node}: {len(bad)} volume(s) "
                 f"would drop below {REPLICA_FLOOR} copies")
-            for line in bad[:5]:
+            for line in shortfalls(bad, 5):
                 log(f"      {line}")
             if len(bad) > 5:
                 log(f"      ... and {len(bad) - 5} more")
         elif time.time() - beat >= HEARTBEAT:
             # This is the longest wait in the run and it used to say the above
             # once and then poll in silence until the rebuilds finished --
-            # a quarter of an hour of nothing on a busy cluster. degraded and
-            # rebuilding are the numbers that show it is actually progressing.
+            # a quarter of an hour of nothing on a busy cluster. The counts
+            # show there is work outstanding; the percentages show it is
+            # actually being done, and the idle clock shows how close this is
+            # to deciding it is not.
             beat = time.time()
+            stalling = (f"; nothing moved for {int(idle)}s of {REBUILD_STALL}s"
+                        if idle >= HEARTBEAT else "")
+            unplaceable = (f"; unschedulable: {shortfalls(cannot, 2)}"
+                           if cannot else "")
             log(f"      still {len(bad)} volume(s) short before {node} "
-                f"(degraded={degraded} rebuilding={rebuilding}); "
-                f"{int(deadline - time.time())}s left")
+                f"(degraded={degraded} rebuilding={rebuilding}"
+                f"{rebuild_detail(now)}{stalling}{unplaceable}); "
+                f"{int(deadline - time.time())}s left, "
+                f"{int(ceiling - time.time())}s of budget")
         time.sleep(30)
+    # Reached only by running out of budget, or out of `timeout` without ever
+    # seeing progress buy more. Either way the volumes never got there.
+    waited = int(time.time() - started)
     raise Abort(
-        f"volumes still short of {REPLICA_FLOOR} copies after {timeout}s; "
-        f"not taking {node} down: {bad[:3]}"
+        f"volumes still short of {REPLICA_FLOOR} copies after {waited}s "
+        f"({'run budget spent' if time.time() >= ceiling else 'no progress'}); "
+        f"not taking {node} down: {shortfalls(bad, 3)}"
     )
 
 
@@ -569,14 +791,24 @@ def wait_longhorn_settled(timeout: int, budget_left: float | None = None) -> Non
     if budget_left is not None and budget_left < timeout:
         timeout = max(int(budget_left), 60)
         log(f"      (settle capped at {timeout // 60}m by the run budget)")
-    deadline = time.time() + timeout
+    started = time.time()
+    # Same two clocks as the redundancy wait, and the same reason: a rebuild
+    # still copying is not a reason to stop waiting. Nothing follows this wait
+    # inside the run, so the budget itself is the ceiling -- no reserve.
+    ceiling = (started + max(budget_left, 60.0)
+               if budget_left is not None else started + timeout)
+    deadline = min(started + timeout, ceiling)
     grace_given = 0.0
+    seen = rebuild_progress()
+    moved = time.time()
     while time.time() < deadline:
         degraded, rebuilding, faulted = longhorn_state()
         if faulted:
             grace_start = time.time()
             faulted = confirm_faulted(faulted, "while settling")
+            was = deadline
             deadline, grace_given = grant_grace(deadline, grace_given, grace_start)
+            moved += deadline - was   # not time spent failing to rebuild
             if faulted:
                 raise Abort(f"{faulted} Longhorn volume(s) still FAULTED after "
                             f"{FAULT_GRACE // 60}m -- stopping")
@@ -585,7 +817,22 @@ def wait_longhorn_settled(timeout: int, budget_left: float | None = None) -> Non
             continue
         if degraded == 0 and rebuilding == 0:
             return
-        log(f"    Longhorn settling: degraded={degraded} rebuilding={rebuilding}")
+        now = rebuild_progress()
+        if rebuilds_advanced(seen, now):
+            moved = time.time()
+            deadline = min(max(deadline, time.time() + REBUILD_STALL), ceiling)
+        seen = now
+        if time.time() - moved >= REBUILD_STALL:
+            # Stop waiting, but do not decide anything here: this is the one
+            # wait whose timeout is not a failure, and a stall is only a reason
+            # to reach that same verdict sooner. The check below is what says
+            # whether the cluster is actually unsafe or merely untidy.
+            log(f"    Longhorn has gained no ground in {REBUILD_STALL // 60}m "
+                f"(degraded={degraded} rebuilding={rebuilding}"
+                f"{rebuild_detail(now)}) -- not waiting out the rest")
+            break
+        log(f"    Longhorn settling: degraded={degraded} "
+            f"rebuilding={rebuilding}{rebuild_detail(now)}")
         time.sleep(30)
 
     # Out of time, but "not settled" and "not safe" are different claims, and
@@ -594,13 +841,15 @@ def wait_longhorn_settled(timeout: int, budget_left: float | None = None) -> Non
     # finish rebuilding the rest on its own time. "" is no node: it asks what
     # each volume has right now, rather than what it would have with some node
     # taken away.
+    waited = int(time.time() - started)
     short = unsafe_volumes("")
     if short:
         raise Abort(
-            f"Longhorn did not settle within {timeout}s and {len(short)} "
-            f"volume(s) are below {REPLICA_FLOOR} healthy copies: {short[:3]}"
+            f"Longhorn did not settle within {waited}s and {len(short)} "
+            f"volume(s) are below {REPLICA_FLOOR} healthy copies: "
+            f"{shortfalls(short, 3)}"
         )
-    log(f"    Longhorn still rebuilding after {timeout}s, but every volume holds "
+    log(f"    Longhorn still rebuilding after {waited}s, but every volume holds "
         f"{REPLICA_FLOOR} healthy copies -- finishing")
 
 
@@ -1028,7 +1277,7 @@ def storage_back(node: str, require: tuple[str, ...],
         raise Abort(
             f"{node}: {want} did not come back within {STORAGE_TIMEOUT}s and "
             f"{len(bad)} volume(s) need this node to stay above "
-            f"{REPLICA_FLOOR} copies: {bad[:3]}"
+            f"{REPLICA_FLOOR} copies: {shortfalls(bad, 3)}"
         )
     log(f"    {node}: {want} still down after {STORAGE_TIMEOUT}s, but every "
         f"volume holds {REPLICA_FLOOR} healthy copies without it "
