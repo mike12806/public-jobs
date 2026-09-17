@@ -1517,6 +1517,80 @@ def preflight(hosts: list[PveHost], strict: bool = True) -> Plan:
     return plan
 
 
+def uncordon_healthy(nodes: list[str], dry_run: bool) -> int:
+    """Put back any of `nodes` still cordoned but perfectly able to serve.
+
+    A cordon is half of a pair. Every path that sets one is supposed to clear
+    it, but the ways a run ends are not all paths: a job killed at its
+    wall-clock limit, or cancelled when a sibling failed, stops between the two
+    halves and leaves a healthy node refusing pods until somebody notices. The
+    cluster is down capacity for no reason, and nothing says so.
+
+    So this is a repair pass over exactly one thing -- cordons this run is
+    responsible for -- and it is deliberately narrow, because undoing a cordon
+    somebody set on purpose is worse than leaving one set by accident. Two
+    fences keep it honest:
+
+      * `nodes` is this run's own plan, passed in by the caller, and the caller
+        only runs this when the planning preflight passed. That preflight
+        refuses to start when anything is already cordoned, so a cordon seen
+        now is one this run placed. A cordon that predates the run makes the
+        preflight fail, the caller skip this, and the cordon survive -- which
+        is what should happen to a node somebody is draining by hand.
+      * Ready, and storage back if Longhorn runs there. Uncordoning a node that
+        cannot mount a volume just moves the outage: pods schedule onto it and
+        sit in ContainerCreating. A node that is cordoned *and* unhealthy is a
+        real problem and stays cordoned, named in the log, for a human.
+
+    Returns how many nodes were left cordoned, for the caller to report. Never
+    raises: this runs after everything else has had its turn, including the
+    failures, and a repair pass that could itself end the job would be one more
+    thing to go wrong at the worst moment.
+    """
+    if not nodes:
+        return 0
+    log("Checking for nodes left cordoned")
+    stuck = 0
+    try:
+        current = {n["metadata"]["name"]: n
+                   for n in kubectl_json("get", "nodes")["items"]}
+    except Abort as exc:
+        log(f"  could not list nodes ({exc}) -- skipping the uncordon sweep")
+        return 0
+
+    for name in nodes:
+        node = current.get(name)
+        if node is None or not node.get("spec", {}).get("unschedulable"):
+            continue
+
+        if node_ready(name) is not True:
+            log(f"  {name}: cordoned and NOT Ready -- leaving it cordoned, "
+                f"this one needs a look")
+            stuck += 1
+            continue
+
+        # Ready is not enough on a node that carries replicas: scheduling pods
+        # onto a node whose csi-plugin never came back trades a cordon for a
+        # queue of pods that cannot mount.
+        if longhorn_manages(name) and not wait_for_storage(
+                name, ("longhorn-csi-plugin", "instance-manager"), STORAGE_TIMEOUT):
+            log(f"  {name}: cordoned and Ready, but Longhorn has not come back "
+                f"-- leaving it cordoned rather than sending pods it cannot serve")
+            stuck += 1
+            continue
+
+        if dry_run:
+            log(f"  DRY-RUN: would uncordon {name} (cordoned, Ready, storage back)")
+            continue
+        log(f"  {name}: cordoned but healthy -- uncordoning (a run ended "
+            f"between the cordon and the uncordon)")
+        kubectl("uncordon", name, check=False)
+
+    if not stuck:
+        log("  no healthy node left cordoned")
+    return stuck
+
+
 def resolve(args, dry_run: bool,
             strict: bool) -> tuple[Plan, list[str], set[str], set[str]]:
     """Preflight, then work out which nodes to reboot and in what order.
@@ -1600,6 +1674,12 @@ def main() -> int:
     ap.add_argument("--settle-only", action="store_true",
                     help="skip straight to the end-of-run Longhorn settle and "
                          "report; for the job that follows per-node jobs")
+    ap.add_argument("--uncordon-healthy", default="",
+                    help="comma/space-separated nodes this run was responsible "
+                         "for: uncordon any still cordoned that are Ready and "
+                         "have their storage back, and report any that are "
+                         "cordoned and not healthy. For the end of a run, "
+                         "including one that timed out mid-node")
     ap.add_argument("--deadline", default=os.environ.get("REBOOT_DEADLINE_UTC", ""),
                     help="HH:MM UTC after which no new node is started")
     ap.add_argument("--force-nodes",
@@ -1617,6 +1697,15 @@ def main() -> int:
             f"(it is now {datetime.now(timezone.utc):%H:%M} UTC)")
 
     try:
+        if args.uncordon_healthy:
+            # Runs after everything, including after the failures, so it asks
+            # the cluster nothing it has not been told and changes nothing it
+            # was not responsible for. A node left cordoned AND unhealthy is
+            # worth a non-zero exit: the run that should have brought it back
+            # did not, and that is the one outcome here nobody should miss.
+            nodes = [n for n in args.uncordon_healthy.replace(",", " ").split() if n]
+            return 1 if uncordon_healthy(nodes, dry_run) else 0
+
         if args.settle_only:
             # Every node is already back and uncordoned; this is only the tidy
             # up the per-node jobs deliberately left undone.

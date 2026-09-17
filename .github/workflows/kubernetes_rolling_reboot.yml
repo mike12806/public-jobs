@@ -202,6 +202,39 @@ jobs:
           kubeconfig: ${{ secrets.KUBECONFIG }}
           hostname: github-runner-k8s-reboot-report
 
+      # Before the settle, and unconditionally. A node job killed at its
+      # wall-clock limit, or cancelled because a sibling failed, stops between
+      # the cordon and the uncordon and leaves a healthy node refusing pods
+      # with nothing to say so. This is the only step that repairs that, so it
+      # cannot be the one that gets skipped when something upstream went wrong.
+      #
+      # It runs first because a cordoned node is one Longhorn will not schedule
+      # replicas onto by default -- settling around one is waiting for a
+      # rebuild that cannot start.
+      #
+      # Scoped to this run's own nodes, and only when planning succeeded. The
+      # planning preflight refuses to start when anything is already cordoned,
+      # so a cordon seen here is one this run placed; if it failed, the cordon
+      # predates the run and belongs to whoever set it.
+      - name: Uncordon anything left cordoned but healthy
+        if: always() && needs.plan.result == 'success'
+        env:
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
+          # `|| '[]'` so an unset output can never make fromJSON blow up the
+          # one step whose whole job is to run when things went wrong.
+          RUN_NODES: >-
+            ${{ join(fromJSON(needs.plan.outputs.workers || '[]'), ' ') }}
+            ${{ join(fromJSON(needs.plan.outputs.control_plane || '[]'), ' ') }}
+        run: |
+          if [ -z "${RUN_NODES// /}" ]; then
+            echo "No nodes were planned; nothing could have been left cordoned."
+            exit 0
+          fi
+          # A node left cordoned AND unhealthy exits non-zero on purpose: the
+          # run that should have brought it back did not, and the mail below
+          # keys off this job failing.
+          python3 scripts/k8s_rolling_reboot.py --uncordon-healthy "$RUN_NODES"
+
       # Only worth doing when every node actually came back. After a failure
       # the cluster is not something to wait an hour on -- it is something to
       # look at, which is what the summary and the mail below are for.
@@ -234,8 +267,16 @@ jobs:
       # the mail next to the work would lose it in exactly the case worth
       # mailing about. `contains(needs.*.result, ...)` catches the failure and
       # every sibling cancelled because of it.
+      #
+      # `failure()` is here for something needs.* cannot see: a step of this
+      # job failing. The uncordon sweep above exits non-zero when it finds a
+      # node cordoned and unhealthy, which is a cluster that needs a human
+      # whether or not any node job reported it.
       - name: Email on failure
-        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        if: >-
+          failure()
+          || contains(needs.*.result, 'failure')
+          || contains(needs.*.result, 'cancelled')
         uses: dawidd6/action-send-mail@ca8dbb4d4f91ca7f75e7f2feea5339e76ce70c90 # v7.0.0
         with:
           server_address: ${{ secrets.SMTP_SERVER }}
