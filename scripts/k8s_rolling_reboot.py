@@ -127,6 +127,13 @@ FAULT_GRACE = 600            # 10m of re-checks before a FAULTED volume is
                              # returning from a reboot produces transiently.
                              # A genuine fault outlives ten minutes easily.
 FAULT_POLL = 30              # re-check cadence inside that window
+# Stamped on a node when this job cordons it, removed when it uncordons.
+# kubectl records no author for a cordon, so without this there is no way to
+# tell one this job abandoned from one a person set deliberately -- and the
+# end-of-run sweep has to tell them apart: it must clear up after a run that
+# died mid-node, and must never undo a drain somebody started by hand. The
+# sweep touches nothing without this mark.
+CORDON_MARK = "rolling-reboot.mfaherty.net/cordoned-by"
 REBUILD_STALL = 1200         # 20m of no rebuild gaining any ground before a
                              # wait stops waiting. SETTLE_TIMEOUT alone cannot
                              # tell "slow" from "stuck": it spends the same
@@ -260,6 +267,30 @@ def kubectl(*args: str, check: bool = True, timeout: int = 120,
 
 def kubectl_json(*args: str, **kw) -> dict:
     return json.loads(kubectl(*args, "-o", "json", **kw))
+
+
+def cordon_node(node: str) -> None:
+    """Cordon `node`, marked as this job's doing.
+
+    Marked before it is cordoned, not after. Of the two ways a crash between
+    the calls can leave things, a mark on an uncordoned node is the harmless
+    one -- the sweep ignores it and clears it on sight -- while a cordon with
+    no mark is precisely what the sweep refuses to touch. The order puts the
+    survivable failure first.
+    """
+    who = os.environ.get("GITHUB_RUN_ID", "manual")
+    when = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # Advisory: failing to record who cordoned a node is not a reason to skip
+    # rebooting it, it only costs the sweep its claim on that node later.
+    kubectl("annotate", "node", node, "--overwrite",
+            f"{CORDON_MARK}={who}@{when}", check=False)
+    kubectl("cordon", node)
+
+
+def uncordon_node(node: str, check: bool = True) -> None:
+    """Uncordon `node` and drop this job's claim on it."""
+    kubectl("uncordon", node, check=check)
+    kubectl("annotate", "node", node, f"{CORDON_MARK}-", check=False)
 
 
 def node_ready(name: str) -> bool | None:
@@ -1418,11 +1449,11 @@ def process_node(node: str, vm: VmRef, dry_run: bool, forced: bool = False,
         return True
 
     log("    cordon + drain")
-    kubectl("cordon", node)
+    cordon_node(node)
     try:
         drain_node(node)
     except (Abort, subprocess.TimeoutExpired) as exc:
-        kubectl("uncordon", node, check=False)
+        uncordon_node(node, check=False)
         raise Abort(f"drain of {node} failed ({exc}); uncordoned, stopping run")
 
     reboot_node(node, vm, dry_run)
@@ -1434,7 +1465,7 @@ def process_node(node: str, vm: VmRef, dry_run: bool, forced: bool = False,
     storage = storage_back(node, ("longhorn-csi-plugin",), control_plane)
 
     log("    uncordon")
-    kubectl("uncordon", node)
+    uncordon_node(node)
 
     # Only now can this be asked for. Longhorn does not place an
     # instance-manager on a cordoned node, and the drain deleted the one that
@@ -1515,6 +1546,93 @@ def preflight(hosts: list[PveHost], strict: bool = True) -> Plan:
         # hypervisor there is no rescue if they wedge mid-reboot.
         log(f"  WARNING: no usable Proxmox mapping for {plan.unmapped} -- skipping")
     return plan
+
+
+def uncordon_healthy(dry_run: bool) -> int:
+    """Put back every node this job left cordoned that can serve again.
+
+    A cordon is half of a pair. Every path that sets one is supposed to clear
+    it, but the ways a run ends are not all paths: a job killed at its
+    wall-clock limit, or cancelled when a sibling failed, stops between the two
+    halves and leaves a healthy node refusing pods until somebody notices. The
+    cluster is down capacity for no reason and nothing says so.
+
+    This is the last thing a run does, and it asks the cluster, not the run.
+    That distinction is the point. Scoping it to the nodes this run planned
+    would have left the worst case unfixable: a run dies mid-node, the next
+    night's preflight refuses to start *because* that node is cordoned, so no
+    plan exists, so a sweep that needed one never runs -- the gate that blocks
+    the run and the repair that would unblock it, disabled by the same fact.
+    Reading the cluster instead means a cordon left by any previous run is
+    cleaned up by the next one to get this far.
+
+    What keeps that safe is CORDON_MARK rather than a node list. kubectl
+    records no author for a cordon, so the annotation is the only thing that
+    distinguishes one this job abandoned from one a person set on purpose --
+    and a node without it is never touched, however healthy it looks. Undoing
+    somebody's deliberate drain is worse than leaving a stray cordon set.
+
+    Healthy means Ready, and storage back where Longhorn runs. Uncordoning a
+    node that cannot mount a volume does not fix an outage, it moves it: pods
+    schedule there and sit in ContainerCreating. A node that is cordoned,
+    marked, and unhealthy stays cordoned and is counted -- that is a run that
+    did not bring a node back, and somebody should hear about it.
+
+    Never raises. It runs after everything has had its turn, failures included,
+    so a repair pass that could itself end the job would be one more thing to
+    go wrong at the worst possible moment.
+    """
+    log("Last check: nodes left cordoned by this job")
+    try:
+        nodes = kubectl_json("get", "nodes")["items"]
+    except Abort as exc:
+        log(f"  could not list nodes ({exc}) -- skipping the sweep")
+        return 0
+
+    stuck = healed = 0
+    for n in nodes:
+        name = n["metadata"]["name"]
+        marked = CORDON_MARK in (n["metadata"].get("annotations") or {})
+        cordoned = bool(n.get("spec", {}).get("unschedulable"))
+
+        if marked and not cordoned:
+            # Our mark outlived our cordon: an uncordon that landed while the
+            # annotation removal did not. Harmless now, but a stale claim on a
+            # node somebody cordons later, so drop it while we are here.
+            if not dry_run:
+                kubectl("annotate", "node", name, f"{CORDON_MARK}-", check=False)
+            continue
+        if not cordoned:
+            continue
+        if not marked:
+            log(f"  {name}: cordoned, but not by this job -- leaving it alone")
+            continue
+
+        if node_ready(name) is not True:
+            log(f"  {name}: cordoned by this job and NOT Ready -- staying "
+                f"cordoned, this one needs a look")
+            stuck += 1
+            continue
+        if longhorn_manages(name) and not wait_for_storage(
+                name, ("longhorn-csi-plugin", "instance-manager"), STORAGE_TIMEOUT):
+            log(f"  {name}: cordoned by this job and Ready, but Longhorn has "
+                f"not come back -- staying cordoned rather than taking pods it "
+                f"cannot serve")
+            stuck += 1
+            continue
+
+        if dry_run:
+            log(f"  DRY-RUN: would uncordon {name} (cordoned by this job, "
+                f"Ready, storage back)")
+            continue
+        log(f"  {name}: cordoned by this job and healthy -- uncordoning "
+            f"(a run ended between the cordon and the uncordon)")
+        uncordon_node(name, check=False)
+        healed += 1
+
+    if not stuck and not healed:
+        log("  nothing left cordoned by this job")
+    return stuck
 
 
 def resolve(args, dry_run: bool,
@@ -1600,6 +1718,13 @@ def main() -> int:
     ap.add_argument("--settle-only", action="store_true",
                     help="skip straight to the end-of-run Longhorn settle and "
                          "report; for the job that follows per-node jobs")
+    ap.add_argument("--uncordon-healthy", action="store_true",
+                    help="the last check of a run: uncordon every node this "
+                         "job left cordoned that is Ready with its storage "
+                         "back, and report any that are cordoned and not. "
+                         "Reads the cluster, not the run, so it also clears up "
+                         "after a run that timed out or was cancelled before "
+                         "it could uncordon")
     ap.add_argument("--deadline", default=os.environ.get("REBOOT_DEADLINE_UTC", ""),
                     help="HH:MM UTC after which no new node is started")
     ap.add_argument("--force-nodes",
@@ -1617,6 +1742,15 @@ def main() -> int:
             f"(it is now {datetime.now(timezone.utc):%H:%M} UTC)")
 
     try:
+        if args.uncordon_healthy:
+            # No preflight, no plan, no Proxmox. This has to work when the rest
+            # of the run did not -- including when the preflight is the thing
+            # refusing, because a leftover cordon is exactly what it refuses
+            # over. A node left cordoned AND unhealthy exits non-zero: the run
+            # that should have brought it back did not, and that is the one
+            # outcome here nobody should miss.
+            return 1 if uncordon_healthy(dry_run) else 0
+
         if args.settle_only:
             # Every node is already back and uncordoned; this is only the tidy
             # up the per-node jobs deliberately left undone.

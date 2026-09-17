@@ -229,13 +229,63 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # This has to live here, not in the node jobs. fail-fast cancels the
-      # queued ones, and a cancelled job skips `if: failure()` -- so putting
-      # the mail next to the work would lose it in exactly the case worth
-      # mailing about. `contains(needs.*.result, ...)` catches the failure and
-      # every sibling cancelled because of it.
+  # The absolute last thing the workflow does, and a job of its own rather than
+  # a step of `report`, for one reason: `report` can die too. Its settle can
+  # run long and take the job's limit with it, and a step after that would
+  # never run. A separate job with `if: always()` survives report failing,
+  # timing out, or being cancelled -- which is the whole set of cases this
+  # exists for.
+  #
+  # Unconditional on purpose. It does not need the plan, and must not: a run
+  # that died mid-node leaves a cordon, the next night's preflight refuses to
+  # start *because* of it, so there is no plan -- and a sweep that waited for
+  # one would never run in the only case that matters. It reads the cluster
+  # instead, and the annotation this job stamps on a node when it cordons it is
+  # what keeps that safe: no mark, no touch, so a drain somebody started by
+  # hand is never undone.
+  uncordon:
+    name: Last check - uncordon healthy nodes
+    needs: [plan, workers, control-plane, report]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout public-jobs
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Reach the cluster
+        uses: ./.github/actions/k8s-access
+        with:
+          ts-oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          ts-oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          kubeconfig: ${{ secrets.KUBECONFIG }}
+          hostname: github-runner-k8s-reboot-uncordon
+
+      - name: Uncordon anything this job left cordoned but healthy
+        env:
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
+        run: python3 scripts/k8s_rolling_reboot.py --uncordon-healthy
+
+      - name: Report cluster state
+        if: always()
+        run: |
+          {
+            echo "### Final node state"
+            echo '```'
+            kubectl get nodes 2>&1 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Last job, so the mail sees everything -- including its own sweep, which
+      # `needs.*` cannot report on. It has to live outside the node jobs at
+      # all: fail-fast cancels the queued ones and a cancelled job skips
+      # `if: failure()`, so mailing from beside the work would lose it in
+      # exactly the case worth mailing about.
       - name: Email on failure
-        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        if: >-
+          failure()
+          || contains(needs.*.result, 'failure')
+          || contains(needs.*.result, 'cancelled')
         uses: dawidd6/action-send-mail@ca8dbb4d4f91ca7f75e7f2feea5339e76ce70c90 # v7.0.0
         with:
           server_address: ${{ secrets.SMTP_SERVER }}
@@ -249,7 +299,9 @@ jobs:
             The nightly Kubernetes rolling reboot aborted.
 
             Remaining nodes were deliberately left untouched, so the cluster
-            should still be serving - but a node may be cordoned or mid-reboot.
+            should still be serving. Any node this job left cordoned has been
+            uncordoned if it was healthy; one still cordoned was not healthy
+            enough to take pods, and is worth looking at first.
 
             Check node and Longhorn state before the next run:
               kubectl get nodes
