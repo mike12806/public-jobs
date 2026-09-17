@@ -1455,7 +1455,25 @@ def process_node(node: str, vm: VmRef, dry_run: bool, forced: bool = False,
 
 
 # --- main ---------------------------------------------------------------------
-def preflight(hosts: list[PveHost]) -> Plan:
+def preflight(hosts: list[PveHost], strict: bool = True) -> Plan:
+    """Refuse to start from a state this run did not create.
+
+    `strict` is what separates "starting a run" from "continuing one". A whole
+    run begins with the cluster spotless, so anything degraded at that point
+    predates it and is not this job's to reboot through -- that is the check
+    that has kept it honest.
+
+    Continuing is a different question with the same words. A node that just
+    came back leaves Longhorn degraded and rebuilding by definition, so asking
+    a later node to start from spotless asks for something no rolling reboot
+    can ever supply: it would abort every time, on exactly the state the run
+    itself produced one node ago. Redundancy is still gated, just by the gate
+    that asks the useful question -- wait_safe_to_reboot, which reads what
+    losing *this* node would cost rather than whether the cluster is tidy.
+
+    Ready and uncordoned stay non-negotiable either way: the first says the
+    last node came back, the second says nothing was left half-done.
+    """
     log("Preflight")
     nodes = kubectl_json("get", "nodes")["items"]
     names, not_ready, cordoned = [], [], []
@@ -1474,13 +1492,19 @@ def preflight(hosts: list[PveHost]) -> Plan:
     if cordoned:
         raise Abort(f"nodes already cordoned: {cordoned} -- resolve first")
 
-    degraded, rebuilding, faulted = longhorn_state()
-    if degraded or rebuilding or faulted:
-        raise Abort(
-            f"Longhorn not healthy: degraded={degraded} rebuilding={rebuilding} "
-            f"faulted={faulted} -- refusing to start"
-        )
-    log(f"  {len(names)} nodes Ready, Longhorn healthy")
+    if strict:
+        degraded, rebuilding, faulted = longhorn_state()
+        if degraded or rebuilding or faulted:
+            raise Abort(
+                f"Longhorn not healthy: degraded={degraded} "
+                f"rebuilding={rebuilding} faulted={faulted} -- refusing to start"
+            )
+        log(f"  {len(names)} nodes Ready, Longhorn healthy")
+    else:
+        degraded, rebuilding, faulted = longhorn_state()
+        log(f"  {len(names)} nodes Ready, none cordoned (Longhorn "
+            f"degraded={degraded} rebuilding={rebuilding} faulted={faulted}; "
+            f"mid-run, so gated per node rather than required spotless)")
 
     plan = discover(hosts, names)
     log(f"  mapped {len(plan.vms)}/{len(names)} nodes to Proxmox VMs")
@@ -1493,10 +1517,89 @@ def preflight(hosts: list[PveHost]) -> Plan:
     return plan
 
 
+def resolve(args, dry_run: bool,
+            strict: bool) -> tuple[Plan, list[str], set[str], set[str]]:
+    """Preflight, then work out which nodes to reboot and in what order.
+
+    One implementation for every entry point, because the order is a safety
+    property: control-plane last, so the API this script is talking through
+    outlives the workers. A planning pass that ordered nodes differently from
+    the pass that reboots them would be a bug nobody would see until the API
+    went away mid-run.
+    """
+    force_all, force_names = parse_forced(args.force_nodes)
+    hosts = load_hosts()
+    plan = preflight(hosts, strict=strict)
+
+    if force_all or force_names:
+        log("FORCE OVERRIDE ACTIVE -- faking the host reboot sentinel for "
+            + ("every mapped node" if force_all else f"{sorted(force_names)}"))
+        log("  this is a test affordance; every other safety gate still applies")
+        unknown = force_names - set(plan.nodes)
+        if unknown:
+            raise Abort(f"force list names unknown node(s): {sorted(unknown)}")
+        unmapped = force_names & set(plan.unmapped)
+        if unmapped:
+            raise Abort(
+                f"force list names node(s) with no Proxmox mapping: "
+                f"{sorted(unmapped)} -- there would be no way to rescue them "
+                "if they wedged mid-reboot"
+            )
+        if not dry_run:
+            log("  NOT a dry run: these nodes WILL be cordoned, drained "
+                "and rebooted for real")
+
+    log("Checking which nodes need a reboot")
+    candidates, unreachable = [], []
+    for name in plan.nodes:
+        if name not in plan.vms:
+            continue
+        if force_all or name in force_names:
+            candidates.append(name)
+            continue
+        needs = reboot_required(name)
+        if needs is None:
+            unreachable.append(name)
+        elif needs:
+            candidates.append(name)
+
+    if unreachable:
+        raise Abort(
+            f"could not read reboot sentinel on {unreachable} -- these need "
+            "recovery, not patching; stopping rather than guessing"
+        )
+
+    # Control-plane last: keep the API (and this script's kubectl) alive as
+    # long as possible. The same set tells process_node which nodes to skip
+    # the Longhorn waits on -- storage is kept off the control plane here.
+    cp = set()
+    for n in kubectl_json("get", "nodes")["items"]:
+        labels = n["metadata"].get("labels", {})
+        if "node-role.kubernetes.io/control-plane" in labels:
+            cp.add(n["metadata"]["name"])
+    candidates.sort(key=lambda n: (n in cp, n))
+    # Which of them are here because the override said so rather than because
+    # the host asked. Only process_node's logging cares, but a node rebooted
+    # on a test affordance should say so in the run log.
+    forced = {n for n in candidates if force_all or n in force_names}
+    return plan, candidates, cp, forced
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true",
                     help="report what would happen; touch nothing")
+    ap.add_argument("--plan-json", action="store_true",
+                    help="print the nodes needing a reboot as JSON and exit, "
+                         "split into workers and control_plane so a caller can "
+                         "drive them as two ordered phases. Touches nothing.")
+    ap.add_argument("--only", default=os.environ.get("REBOOT_ONLY_NODE", ""),
+                    help="reboot exactly this one node and stop. For running a "
+                         "cluster one node per CI job, where each job carries "
+                         "its own wall-clock limit instead of sharing one")
+    ap.add_argument("--settle-only", action="store_true",
+                    help="skip straight to the end-of-run Longhorn settle and "
+                         "report; for the job that follows per-node jobs")
     ap.add_argument("--deadline", default=os.environ.get("REBOOT_DEADLINE_UTC", ""),
                     help="HH:MM UTC after which no new node is started")
     ap.add_argument("--force-nodes",
@@ -1514,60 +1617,47 @@ def main() -> int:
             f"(it is now {datetime.now(timezone.utc):%H:%M} UTC)")
 
     try:
-        force_all, force_names = parse_forced(args.force_nodes)
-        hosts = load_hosts()
-        plan = preflight(hosts)
-
-        if force_all or force_names:
-            log("FORCE OVERRIDE ACTIVE -- faking the host reboot sentinel for "
-                + ("every mapped node" if force_all else f"{sorted(force_names)}"))
-            log("  this is a test affordance; every other safety gate still applies")
-            unknown = force_names - set(plan.nodes)
-            if unknown:
-                raise Abort(f"force list names unknown node(s): {sorted(unknown)}")
-            unmapped = force_names & set(plan.unmapped)
-            if unmapped:
-                raise Abort(
-                    f"force list names node(s) with no Proxmox mapping: "
-                    f"{sorted(unmapped)} -- there would be no way to rescue them "
-                    "if they wedged mid-reboot"
-                )
+        if args.settle_only:
+            # Every node is already back and uncordoned; this is only the tidy
+            # up the per-node jobs deliberately left undone.
+            log("Settling Longhorn after the per-node jobs")
             if not dry_run:
-                log("  NOT a dry run: these nodes WILL be cordoned, drained "
-                    "and rebooted for real")
+                wait_longhorn_settled(SETTLE_TIMEOUT, budget_left=RUN_BUDGET)
+            log("Run complete. Cluster healthy.")
+            return 0
 
-        log("Checking which nodes need a reboot")
-        candidates, unreachable = [], []
-        for name in plan.nodes:
-            if name not in plan.vms:
-                continue
-            if force_all or name in force_names:
-                candidates.append(name)
-                continue
-            needs = reboot_required(name)
-            if needs is None:
-                unreachable.append(name)
-            elif needs:
-                candidates.append(name)
+        # A single node is a continuation, not a start: the nodes before it
+        # left Longhorn rebuilding, and requiring spotless would abort on the
+        # run's own work. See preflight().
+        plan, candidates, cp, forced = resolve(args, dry_run,
+                                              strict=not args.only)
 
-        if unreachable:
-            raise Abort(
-                f"could not read reboot sentinel on {unreachable} -- these need "
-                "recovery, not patching; stopping rather than guessing"
-            )
+        if args.plan_json:
+            # Two phases rather than one list: the caller runs workers to
+            # completion before any control-plane node, which keeps the
+            # ordering a structural guarantee rather than something a job
+            # scheduler is trusted to preserve.
+            print(json.dumps({
+                "workers": [n for n in candidates if n not in cp],
+                "control_plane": [n for n in candidates if n in cp],
+            }))
+            return 0
+
         if not candidates:
             log("No nodes require a reboot. Nothing to do.")
             return 0
 
-        # Control-plane last: keep the API (and this script's kubectl) alive as
-        # long as possible. The same set tells process_node which nodes to skip
-        # the Longhorn waits on -- storage is kept off the control plane here.
-        cp = set()
-        for n in kubectl_json("get", "nodes")["items"]:
-            labels = n["metadata"].get("labels", {})
-            if "node-role.kubernetes.io/control-plane" in labels:
-                cp.add(n["metadata"]["name"])
-        candidates.sort(key=lambda n: (n in cp, n))
+        if args.only:
+            if args.only not in candidates:
+                # Not an error: the sentinel can clear between planning and
+                # here (someone rebooted it by hand), and a node that no longer
+                # needs rebooting is a job well done, not a job to fail.
+                log(f"{args.only} is not in the reboot set {candidates} -- "
+                    f"nothing to do for it")
+                return 0
+            candidates = [args.only]
+            log(f"Single-node mode: {args.only}")
+
         log(f"Nodes to reboot ({len(candidates)}): {candidates}")
 
         # Budgeting on NODE_WORST_CASE would be useless here: 11 nodes at the
@@ -1586,7 +1676,13 @@ def main() -> int:
                     break
             left = RUN_BUDGET - (time.time() - started)
             need = max(done) * PACE_MARGIN if done else NODE_WORST_CASE
-            if not dry_run and left < need:
+            # The pace gate decides whether to start *another* node inside a
+            # shared budget. With one node to a job there is no "another", and
+            # `done` is always empty so `need` is always the worst case -- it
+            # would refuse to start any node under a per-node budget smaller
+            # than the ceiling, which is every sensible per-node budget. The
+            # budget still bounds the waits inside the node; see budget_left.
+            if not dry_run and not args.only and left < need:
                 log(f"Stopping before {name}: {left / 60:.0f}m of budget left, "
                     f"a node is costing up to {need / PACE_MARGIN / 60:.0f}m. "
                     f"Better to end clean than be killed mid-node. "
@@ -1595,7 +1691,7 @@ def main() -> int:
 
             t0 = time.time()
             if not process_node(name, plan.vms[name], dry_run,
-                                forced=force_all or name in force_names,
+                                forced=name in forced,
                                 budget_left=None if dry_run else left,
                                 control_plane=name in cp):
                 no_storage.append(name)
@@ -1608,7 +1704,12 @@ def main() -> int:
         # Per-node gating lets the run move on while rebuilds finish, so the
         # last one can still be in flight. Settle once here, because "Cluster
         # healthy" has to be true when it is printed.
-        if not dry_run:
+        if not dry_run and not args.only:
+            # Skipped in single-node mode on purpose: settling is a property of
+            # the whole run, and a per-node job that settled would pay for it
+            # once per node while the next node's own redundancy gate already
+            # waits for exactly as much as it needs. The run's final settle is
+            # --settle-only, in the job that follows them all.
             log("All nodes done; waiting for Longhorn to finish rebuilding")
             # Capped like every other wait: at an hour, this one can outlast the
             # job's own 360m limit, and being killed here means no failure mail

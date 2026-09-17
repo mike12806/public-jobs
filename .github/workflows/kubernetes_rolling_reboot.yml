@@ -5,6 +5,23 @@ name: Kubernetes Rolling Node Reboot
 # aborting rather than continuing if a node or the storage it is carrying
 # cannot come back.
 #
+# One node per job, because GitHub's 360m limit is per job. Eleven nodes
+# sharing one job ran out of time around the eighth and left the rest for the
+# next night; eleven jobs get eleven limits and the run finishes. This buys
+# clocks, not concurrency: max-parallel is 1 throughout, since two nodes down
+# together is the exact thing the replica floor exists to prevent.
+#
+# Workers and control-plane are separate phases rather than one matrix. The
+# ordering is a safety property -- the API this job talks through has to
+# outlive the workers -- and a dependency between jobs guarantees it, where
+# the order of a matrix is only ever observed behaviour.
+#
+# Nothing is remembered between jobs, deliberately. Every job re-derives what
+# it needs from the cluster: which nodes are Ready and uncordoned, what
+# Longhorn holds where, and which hosts have /var/run/reboot-required. The
+# cluster is the state store, so there is no run state to get out of sync with
+# it and no second source of truth to reconcile.
+#
 # Required secrets:
 #   KUBECONFIG         base64-encoded kubeconfig (same as the other k8s jobs)
 #   PVE_TOKEN_ID  / PVE_SECRET    credentials for https://pve.mfaherty.net
@@ -61,38 +78,31 @@ concurrency:
   cancel-in-progress: false # never interrupt a node mid-reboot
 
 jobs:
-  rolling-reboot:
+  plan:
+    name: Plan
     runs-on: ubuntu-latest
-    timeout-minutes: 360
-
+    timeout-minutes: 30
+    outputs:
+      workers: ${{ steps.plan.outputs.workers }}
+      control_plane: ${{ steps.plan.outputs.control_plane }}
     steps:
       - name: Checkout public-jobs
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Connect to Tailscale
-        uses: tailscale/github-action@780049a30b6ff5c378a9e7b389d15ece7a204888 # v4.1.3
+      - name: Reach the cluster
+        uses: ./.github/actions/k8s-access
         with:
-          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
-          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
-          tags: tag:ci
-          hostname: github-runner-k8s-rolling-reboot
-          version: latest
+          ts-oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          ts-oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          kubeconfig: ${{ secrets.KUBECONFIG }}
+          hostname: github-runner-k8s-reboot-plan
 
-      - name: Setup kubectl
-        uses: azure/setup-kubectl@829323503d1be3d00ca8346e5391ca0b07a9ab0d # v5.1.0
-        with:
-          version: "latest"
-
-      - name: Set up kubeconfig
-        run: |
-          mkdir -p "$HOME/.kube"
-          base64 -d > "$HOME/.kube/config" << 'EOF'
-          ${{ secrets.KUBECONFIG }}
-          EOF
-          chmod 600 "$HOME/.kube/config"
-          kubectl cluster-info || { echo "cannot reach cluster"; exit 1; }
-
-      - name: Rolling reboot
+      # The only place the strict preflight runs: a whole run starts from a
+      # spotless cluster or not at all. The per-node jobs that follow cannot
+      # ask for that -- the node before them left Longhorn rebuilding by
+      # definition -- so they gate on redundancy instead. See preflight().
+      - name: Work out which nodes need a reboot
+        id: plan
         env:
           PVE_DOMAIN: mfaherty.net
           PVE_HOST_COUNT: "7"
@@ -110,35 +120,123 @@ jobs:
           PVE6_SECRET: ${{ secrets.PVE6_SECRET }}
           PVE7_TOKEN_ID: ${{ secrets.PVE7_TOKEN_ID }}
           PVE7_SECRET: ${{ secrets.PVE7_SECRET }}
-          # Scheduled runs are live; manual runs default to dry-run.
-          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
-          # Inverted on purpose: `event == dispatch && inputs.x || default` is
-          # the usual idiom, but it cannot express "manual run, no deadline" --
-          # a blank input is falsy, so it would fall through to the default and
-          # silently reimpose 09:00. Branch on the schedule instead.
-          REBOOT_DEADLINE_UTC: ${{ github.event_name == 'schedule' && '09:00' || inputs.deadline_utc }}
           # Deliberately bound to the manual input only: a scheduled run can
           # never fake the sentinel, it reboots what genuinely needs rebooting.
           FORCE_REBOOT_NODES: ${{ github.event_name == 'workflow_dispatch' && inputs.force_reboot_nodes || '' }}
-        run: python3 scripts/k8s_rolling_reboot.py
+        run: |
+          set -o pipefail
+          # Log goes to the console, the JSON is the last line.
+          python3 scripts/k8s_rolling_reboot.py --plan-json | tee /tmp/plan.out
+          json="$(tail -n 1 /tmp/plan.out)"
+          workers="$(printf '%s' "$json" | jq -c '.workers')"
+          cp="$(printf '%s' "$json" | jq -c '.control_plane')"
+          echo "workers=$workers" >> "$GITHUB_OUTPUT"
+          echo "control_plane=$cp" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Plan"
+            echo "- workers: \`$workers\`"
+            echo "- control-plane: \`$cp\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Workers first, and all of them, before the API servers are touched.
+  workers:
+    name: Worker
+    needs: plan
+    if: needs.plan.outputs.workers != '[]'
+    strategy:
+      max-parallel: 1 # never two nodes down at once
+      fail-fast: true # a node that fails stops the rest; nothing continues and hopes
+      matrix:
+        node: ${{ fromJSON(needs.plan.outputs.workers) }}
+    uses: ./.github/workflows/_k8s_reboot_node.yml
+    secrets: inherit
+    with:
+      node: ${{ matrix.node }}
+      dry_run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
+      # Inverted on purpose: `event == dispatch && inputs.x || default` is the
+      # usual idiom, but it cannot express "manual run, no deadline" -- a blank
+      # input is falsy, so it would fall through to the default and silently
+      # reimpose 09:00. Branch on the schedule instead.
+      deadline_utc: ${{ github.event_name == 'schedule' && '09:00' || inputs.deadline_utc }}
+      force_reboot_nodes: ${{ github.event_name == 'workflow_dispatch' && inputs.force_reboot_nodes || '' }}
+
+  # Control-plane last: keep the API this workflow is talking through alive as
+  # long as there is other work to do. Runs even when there were no workers,
+  # which is why the guard accepts 'skipped' as well as 'success'.
+  control-plane:
+    name: Control plane
+    needs: [plan, workers]
+    if: >-
+      always()
+      && needs.plan.outputs.control_plane != '[]'
+      && needs.plan.result == 'success'
+      && (needs.workers.result == 'success' || needs.workers.result == 'skipped')
+    strategy:
+      max-parallel: 1
+      fail-fast: true
+      matrix:
+        node: ${{ fromJSON(needs.plan.outputs.control_plane) }}
+    uses: ./.github/workflows/_k8s_reboot_node.yml
+    secrets: inherit
+    with:
+      node: ${{ matrix.node }}
+      dry_run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
+      deadline_utc: ${{ github.event_name == 'schedule' && '09:00' || inputs.deadline_utc }}
+      force_reboot_nodes: ${{ github.event_name == 'workflow_dispatch' && inputs.force_reboot_nodes || '' }}
+
+  report:
+    name: Settle and report
+    needs: [plan, workers, control-plane]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout public-jobs
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Reach the cluster
+        uses: ./.github/actions/k8s-access
+        with:
+          ts-oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          ts-oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          kubeconfig: ${{ secrets.KUBECONFIG }}
+          hostname: github-runner-k8s-reboot-report
+
+      # Only worth doing when every node actually came back. After a failure
+      # the cluster is not something to wait an hour on -- it is something to
+      # look at, which is what the summary and the mail below are for.
+      - name: Settle Longhorn
+        if: >-
+          needs.plan.result == 'success'
+          && (needs.workers.result == 'success' || needs.workers.result == 'skipped')
+          && (needs.control-plane.result == 'success' || needs.control-plane.result == 'skipped')
+          && !(github.event_name == 'workflow_dispatch' && inputs.dry_run)
+        run: python3 scripts/k8s_rolling_reboot.py --settle-only
 
       - name: Report cluster state
         if: always()
         run: |
-          echo "### Node state" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          kubectl get nodes 2>&1 >> "$GITHUB_STEP_SUMMARY" || true
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          echo "### Longhorn volumes by robustness" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          kubectl get volumes.longhorn.io -n longhorn-system \
-            -o jsonpath='{range .items[*]}{.status.robustness}{"\n"}{end}' 2>/dev/null \
-            | sort | uniq -c >> "$GITHUB_STEP_SUMMARY" || true
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### Node state"
+            echo '```'
+            kubectl get nodes 2>&1 || true
+            echo '```'
+            echo "### Longhorn volumes by robustness"
+            echo '```'
+            kubectl get volumes.longhorn.io -n longhorn-system \
+              -o jsonpath='{range .items[*]}{.status.robustness}{"\n"}{end}' \
+                2>/dev/null | sort | uniq -c || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
+      # This has to live here, not in the node jobs. fail-fast cancels the
+      # queued ones, and a cancelled job skips `if: failure()` -- so putting
+      # the mail next to the work would lose it in exactly the case worth
+      # mailing about. `contains(needs.*.result, ...)` catches the failure and
+      # every sibling cancelled because of it.
       - name: Email on failure
-        if: failure()
-        uses: dawidd6/action-send-mail@ca8dbb4d4f91ca7f75e7f2feea5339e76ce70c90 # v20
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        uses: dawidd6/action-send-mail@ca8dbb4d4f91ca7f75e7f2feea5339e76ce70c90 # v7.0.0
         with:
           server_address: ${{ secrets.SMTP_SERVER }}
           server_port: ${{ secrets.SMTP_PORT }}
