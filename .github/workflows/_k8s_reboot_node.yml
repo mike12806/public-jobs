@@ -1,0 +1,101 @@
+name: Reboot one Kubernetes node
+
+# One node, one job, one 360m clock.
+#
+# GitHub's job limit is per job, not per workflow run, which is the whole
+# reason this exists: eleven nodes sharing a single 360m job ran out of time
+# around the eighth, so the rest waited for the next night. Eleven jobs get
+# eleven limits, and the run finishes.
+#
+# It buys clocks, not concurrency. Two nodes must never be down together --
+# that is what the Longhorn replica floor exists to prevent -- so the caller
+# runs this with max-parallel: 1. Every job still re-derives safety from the
+# live cluster before touching anything, so serialisation is enforced twice:
+# by the scheduler, and by the redundancy gate that would refuse anyway.
+
+on:
+  workflow_call:
+    inputs:
+      node:
+        description: "The single node to reboot"
+        required: true
+        type: string
+      dry_run:
+        type: boolean
+        default: false
+      deadline_utc:
+        description: "HH:MM UTC after which this node is left alone"
+        type: string
+        default: ""
+      force_reboot_nodes:
+        description: "Passed through so a forced rehearsal still fakes the sentinel"
+        type: string
+        default: ""
+      budget_min:
+        description: >-
+          Minutes this node may spend. Not the job limit: it bounds the waits
+          inside the node, and a rebuild that keeps making progress is allowed
+          to run to it. Well under 360 on purpose, so one grinding node cannot
+          spend the whole job.
+        type: number
+        default: 180
+
+permissions:
+  contents: read
+
+jobs:
+  reboot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout public-jobs
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Reach the cluster
+        uses: ./.github/actions/k8s-access
+        with:
+          ts-oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          ts-oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          kubeconfig: ${{ secrets.KUBECONFIG }}
+          hostname: github-runner-k8s-reboot-${{ inputs.node }}
+
+      - name: Reboot ${{ inputs.node }}
+        env:
+          PVE_DOMAIN: mfaherty.net
+          PVE_HOST_COUNT: "7"
+          PVE_TOKEN_ID: ${{ secrets.PVE_TOKEN_ID }}
+          PVE_SECRET: ${{ secrets.PVE_SECRET }}
+          PVE2_TOKEN_ID: ${{ secrets.PVE2_TOKEN_ID }}
+          PVE2_SECRET: ${{ secrets.PVE2_SECRET }}
+          PVE3_TOKEN_ID: ${{ secrets.PVE3_TOKEN_ID }}
+          PVE3_SECRET: ${{ secrets.PVE3_SECRET }}
+          PVE4_TOKEN_ID: ${{ secrets.PVE4_TOKEN_ID }}
+          PVE4_SECRET: ${{ secrets.PVE4_SECRET }}
+          PVE5_TOKEN_ID: ${{ secrets.PVE5_TOKEN_ID }}
+          PVE5_SECRET: ${{ secrets.PVE5_SECRET }}
+          PVE6_TOKEN_ID: ${{ secrets.PVE6_TOKEN_ID }}
+          PVE6_SECRET: ${{ secrets.PVE6_SECRET }}
+          PVE7_TOKEN_ID: ${{ secrets.PVE7_TOKEN_ID }}
+          PVE7_SECRET: ${{ secrets.PVE7_SECRET }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          REBOOT_DEADLINE_UTC: ${{ inputs.deadline_utc }}
+          FORCE_REBOOT_NODES: ${{ inputs.force_reboot_nodes }}
+          REBOOT_RUN_BUDGET_MIN: ${{ inputs.budget_min }}
+        run: python3 scripts/k8s_rolling_reboot.py --only "${{ inputs.node }}"
+
+      - name: Report node state
+        if: always()
+        run: |
+          {
+            echo "### ${{ inputs.node }}"
+            echo '```'
+            kubectl get node "${{ inputs.node }}" 2>&1 || true
+            echo '```'
+            echo "### Longhorn volumes by robustness"
+            echo '```'
+            kubectl get volumes.longhorn.io -n longhorn-system \
+              -o jsonpath='{range .items[*]}{.status.robustness}{"\n"}{end}' \
+                2>/dev/null | sort | uniq -c || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
