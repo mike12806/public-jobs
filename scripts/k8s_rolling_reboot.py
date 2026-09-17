@@ -35,15 +35,24 @@ Per node, in sequence:
      even there, volumes still rebuilding above the floor finish the run
      rather than fail it.
 
-That wait is bounded by whether Longhorn is making progress, not only by the
-clock. Engines publish the percentage the UI shows for a rebuild in flight, so
-the wait watches those percentages climb: a rebuild that is moving gets the
-full hour, and one that has gained nothing for REBUILD_STALL stops the run
-there rather than at the end of a window it was never going to finish. A
-volume Longhorn cannot schedule a replica for at all is terminal and treated
-as such after a much shorter window -- it is not slow, it has nowhere to go.
-Both say which volume and what it was doing, because "still short after
-3600s" names a symptom and neither names a cause.
+That wait ends on whether Longhorn is making progress, not on a fixed clock.
+Engines publish the percentage the UI shows for a rebuild in flight, so the
+wait watches those percentages climb. A rebuild still gaining ground keeps the
+wait alive -- past SETTLE_TIMEOUT, up to whatever the run budget can spare --
+because a volume five minutes from safe is not a reason to fail a run, and the
+old fixed hour failed exactly those. A rebuild that has gained nothing for
+REBUILD_STALL ends it instead, since nothing is being waited for.
+
+The run budget is what actually bounds the wait now. That limit is real: the
+job is killed at 360m and a node cordoned at that moment stays cordoned, so
+the wait extends only into budget the reboot it precedes will not need.
+
+Why nothing is moving is reported, never acted on. A volume Longhorn cannot
+place reads as unschedulable, but this job cordons a node at a time and
+Longhorn will not schedule onto a cordoned node by default, so that condition
+is one the run itself produces and clears. It belongs in the message that
+explains a stall, not in a rule that causes one -- "still short after 3600s"
+named a symptom, and the point of the percentages is to name a cause.
 
 A volume reading FAULTED mid-run is re-checked for ten minutes before it stops
 anything: a node coming back through a reboot can fault a volume transiently
@@ -125,9 +134,10 @@ REBUILD_STALL = 1200         # 20m of no rebuild gaining any ground before a
                              # rebuild that is never going to finish and too
                              # short for a large one that would have. Longhorn
                              # publishes the percentage the UI shows, so ask
-                             # the question directly -- is anything copying --
-                             # and let a rebuild that is genuinely moving have
-                             # the full hour.
+                             # the question directly -- is anything copying.
+                             # This is also how much runway a wait is given
+                             # each time something does move, which is what
+                             # lets a slow rebuild outlast SETTLE_TIMEOUT.
                              # Twenty minutes rather than ten because Longhorn
                              # legitimately does nothing for a while after a
                              # node goes away: replica-replenishment-wait-
@@ -137,15 +147,6 @@ REBUILD_STALL = 1200         # 20m of no rebuild gaining any ground before a
                              # touches. A window under that would call the
                              # cluster stalled while it was only being patient.
                              # Raise this if that setting is raised.
-UNSCHEDULABLE_GRACE = 120    # 2m before a volume Longhorn cannot place is
-                             # believed. Unlike a stalled rebuild this one is
-                             # terminal by construction: there is nowhere to
-                             # put the replica, so no amount of waiting
-                             # produces one. The window is short because it is
-                             # only here to ride out the moment between a
-                             # replica failing and Longhorn finding it a home,
-                             # not to give the condition a chance to fix
-                             # itself the way FAULT_GRACE does.
 POLL = 15
 HEARTBEAT = 60               # never go longer than this without saying
                              # something. A wait that polls silently for
@@ -159,6 +160,12 @@ HEARTBEAT = 60               # never go longer than this without saying
 NODE_WORST_CASE = (DRAIN_TIMEOUT + DRAIN_FORCE_TIMEOUT + GRACEFUL_WAIT
                    + HARD_STOP_WAIT + RETURN_TIMEOUT + 2 * STORAGE_TIMEOUT
                    + SETTLE_TIMEOUT + FAULT_GRACE)
+# What a node still needs after its redundancy wait returns: everything in the
+# worst case except the wait itself. The wait is allowed to run long while
+# rebuilds are progressing, so it has to leave this much of the run budget
+# behind -- waiting until the budget is gone and then cordoning a node is how
+# you get killed at GitHub's 360m limit with a node half rebooted.
+REBOOT_RESERVE = NODE_WORST_CASE - SETTLE_TIMEOUT
 # GitHub caps a job at 360 minutes and kills it mid-step, which here could mean
 # a node left cordoned or half-rebooted with no failure email (a cancelled job
 # skips if: failure()). So stop starting nodes before that can happen. The
@@ -644,13 +651,43 @@ def unsafe_volumes(node: str) -> dict[str, str]:
 
 def wait_safe_to_reboot(node: str, timeout: int,
                         budget_left: float | None = None) -> None:
-    """Block until taking `node` down leaves every volume above the floor."""
+    """Block until taking `node` down leaves every volume above the floor.
+
+    Two clocks, and which one stops the wait is the whole point.
+
+    `timeout` is patience with a cluster that is not visibly doing anything.
+    It no longer ends a wait on its own: a rebuild that is still copying gets
+    the deadline pushed out, because the question this wait exists to answer
+    is "will the volumes be safe", and a rebuild gaining ground is the cluster
+    answering yes slowly. Cutting it off at a fixed hour failed runs that were
+    minutes from clearing, which is what the old fixed deadline did.
+
+    The run budget is the clock that does stop it. That one is real -- GitHub
+    kills the job at 360m and a node cordoned when that happens stays cordoned
+    -- so the wait may extend only while REBOOT_RESERVE of budget remains for
+    the reboot it is waiting to start. When neither clock is available (a dry
+    run passes no budget), `timeout` stands in as the ceiling.
+
+    Nothing gaining ground for REBUILD_STALL ends it too, and that is the only
+    genuinely new way to stop: no rebuild anywhere moved, so waiting longer is
+    not waiting for anything.
+    """
     if not longhorn_installed():
         return
-    if budget_left is not None and budget_left < timeout:
-        timeout = max(int(budget_left), 60)
-        log(f"    (redundancy wait capped at {timeout // 60}m by the run budget)")
-    deadline = time.time() + timeout
+    started = time.time()
+    # `base` is what this wait always got: `timeout`, cut down when the run is
+    # short on time. `ceiling` is how far progress may push it -- only into
+    # budget the reboot itself will not need. Never below `base`, because the
+    # caller admits a node on its observed pace while REBOOT_RESERVE is a
+    # worst case, so the subtraction goes negative on a cluster rebooting
+    # briskly. Extending must never shorten.
+    base = timeout if budget_left is None else max(min(timeout, budget_left), 60)
+    ceiling = started + (base if budget_left is None
+                         else max(base, budget_left - REBOOT_RESERVE))
+    if base < timeout:
+        log(f"    (redundancy wait capped at {int(base) // 60}m "
+            f"by the run budget)")
+    deadline = started + base
     grace_given = 0.0
     bad: dict[str, str] = {}
     said = False
@@ -658,7 +695,6 @@ def wait_safe_to_reboot(node: str, timeout: int,
     seen = rebuild_progress()   # rebuilds in flight as of the last reading
     short = -1                  # how many volumes were short at that reading
     moved = time.time()         # when either of those last improved
-    blocked: dict[str, float] = {}   # unschedulable volume -> first seen
     while time.time() < deadline:
         degraded, rebuilding, faulted = longhorn_state()
         if faulted:
@@ -673,7 +709,11 @@ def wait_safe_to_reboot(node: str, timeout: int,
             # stretch look like a rebuild that died. Progress actually made
             # during the window is still seen: the next reading is compared
             # against the one from before it.
+            # Credited from the grace granted, before the budget claws any of
+            # it back below: whether the deadline had room for that window has
+            # no bearing on whether the cluster was rebuilding during it.
             moved += deadline - was
+            deadline = min(deadline, ceiling)   # the budget outranks the grace
             if faulted:
                 raise Abort(f"{faulted} Longhorn volume(s) still FAULTED after "
                             f"{FAULT_GRACE // 60}m -- stopping")
@@ -681,34 +721,30 @@ def wait_safe_to_reboot(node: str, timeout: int,
         if not bad:
             return
 
-        # Terminal, and cheap to tell apart from slow: a volume Longhorn cannot
-        # place is not going to gain a replica by being waited on. Only the
-        # ones this node is actually waiting for count -- a placement problem
-        # on a volume that already has its copies elsewhere is somebody's
-        # problem, but not this run's.
+        # Why nothing is rebuilding, when nothing is. Reported, never acted on:
+        # this job cordons a node at a time, and Longhorn stops scheduling onto
+        # a cordoned node by default, so a volume can read unschedulable purely
+        # because of what this run is doing and clear on the uncordon. Treating
+        # that as terminal would fail runs over a condition the run created.
+        # As a line in the stall message it is exactly what is wanted -- the
+        # reason the percentages were not moving.
         cannot = {v: why for v, why in unschedulable_volumes().items() if v in bad}
-        blocked = {v: blocked.get(v, time.time()) for v in cannot}
-        stuck = [v for v, since in blocked.items()
-                 if time.time() - since >= UNSCHEDULABLE_GRACE]
-        if stuck:
-            raise Abort(
-                f"Longhorn cannot place a replica for {len(stuck)} volume(s) "
-                f"{node} is waiting on, and has not for "
-                f"{UNSCHEDULABLE_GRACE // 60}m -- waiting will not fix that: "
-                f"{shortfalls({v: cannot[v] for v in stuck}, 3)}"
-            )
 
         now = rebuild_progress()
         if short < 0 or len(bad) < short or rebuilds_advanced(seen, now):
             moved = time.time()
+            # Ground gained buys more waiting, up to what the run can spare.
+            deadline = min(max(deadline, time.time() + REBUILD_STALL), ceiling)
         seen, short = now, len(bad)
         idle = time.time() - moved
         if idle >= REBUILD_STALL:
+            why = (f"; Longhorn cannot place a replica for "
+                   f"{shortfalls(cannot, 3)}" if cannot else "")
             raise Abort(
                 f"no Longhorn rebuild has gained ground in "
                 f"{REBUILD_STALL // 60}m and {len(bad)} volume(s) are still "
                 f"short of {REPLICA_FLOOR} copies; not taking {node} down: "
-                f"{shortfalls(bad, 3)}{rebuild_detail(now)}"
+                f"{shortfalls(bad, 3)}{rebuild_detail(now)}{why}"
             )
 
         if not said:
@@ -730,13 +766,20 @@ def wait_safe_to_reboot(node: str, timeout: int,
             beat = time.time()
             stalling = (f"; nothing moved for {int(idle)}s of {REBUILD_STALL}s"
                         if idle >= HEARTBEAT else "")
+            unplaceable = (f"; unschedulable: {shortfalls(cannot, 2)}"
+                           if cannot else "")
             log(f"      still {len(bad)} volume(s) short before {node} "
                 f"(degraded={degraded} rebuilding={rebuilding}"
-                f"{rebuild_detail(now)}{stalling}); "
-                f"{int(deadline - time.time())}s left")
+                f"{rebuild_detail(now)}{stalling}{unplaceable}); "
+                f"{int(deadline - time.time())}s left, "
+                f"{int(ceiling - time.time())}s of budget")
         time.sleep(30)
+    # Reached only by running out of budget, or out of `timeout` without ever
+    # seeing progress buy more. Either way the volumes never got there.
+    waited = int(time.time() - started)
     raise Abort(
-        f"volumes still short of {REPLICA_FLOOR} copies after {timeout}s; "
+        f"volumes still short of {REPLICA_FLOOR} copies after {waited}s "
+        f"({'run budget spent' if time.time() >= ceiling else 'no progress'}); "
         f"not taking {node} down: {shortfalls(bad, 3)}"
     )
 
@@ -749,7 +792,12 @@ def wait_longhorn_settled(timeout: int, budget_left: float | None = None) -> Non
         timeout = max(int(budget_left), 60)
         log(f"      (settle capped at {timeout // 60}m by the run budget)")
     started = time.time()
-    deadline = time.time() + timeout
+    # Same two clocks as the redundancy wait, and the same reason: a rebuild
+    # still copying is not a reason to stop waiting. Nothing follows this wait
+    # inside the run, so the budget itself is the ceiling -- no reserve.
+    ceiling = (started + max(budget_left, 60.0)
+               if budget_left is not None else started + timeout)
+    deadline = min(started + timeout, ceiling)
     grace_given = 0.0
     seen = rebuild_progress()
     moved = time.time()
@@ -772,6 +820,7 @@ def wait_longhorn_settled(timeout: int, budget_left: float | None = None) -> Non
         now = rebuild_progress()
         if rebuilds_advanced(seen, now):
             moved = time.time()
+            deadline = min(max(deadline, time.time() + REBUILD_STALL), ceiling)
         seen = now
         if time.time() - moved >= REBUILD_STALL:
             # Stop waiting, but do not decide anything here: this is the one
