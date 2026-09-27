@@ -1,0 +1,128 @@
+name: Check Renovate Health
+
+# Both self-hosted Renovate instances (namespace renovate for Gitea/hdc and
+# renovate-github for GitHub) run as Kubernetes CronJobs every 20 minutes.
+# From 2026-09-13 to 2026-09-26 every run crashed on start (Renovate 44.78.0
+# was missing its common-tags dependency), but the process exited 0, so each
+# Job showed Complete and nothing alerted for 13 days (gh_hdc #3650). Job status
+# can't catch that, so this reads the newest finished run's log in each
+# namespace and emails if it didn't complete a repository, crashed, or is
+# older than 90 minutes.
+
+on:
+  schedule:
+    - cron: '50 * * * *'  # hourly, at minute 50
+  workflow_dispatch:
+
+concurrency:
+  group: renovate-health-check
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@780049a30b6ff5c378a9e7b389d15ece7a204888  # v4.1.3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          hostname: github-runner-renovate-health
+          version: latest
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@829323503d1be3d00ca8346e5391ca0b07a9ab0d  # v5.1.0
+        with:
+          version: 'latest'
+
+      - name: Set up kubeconfig
+        run: |
+          mkdir -p $HOME/.kube
+          base64 -d > $HOME/.kube/config << 'EOF'
+          ${{ secrets.KUBECONFIG }}
+          EOF
+          chmod 600 $HOME/.kube/config
+          if ! python3 -c "import yaml; yaml.safe_load(open('$HOME/.kube/config'))" 2>/dev/null; then
+            echo "ERROR: kubeconfig is not valid YAML"
+            exit 1
+          fi
+
+      - name: Wait for the API server to accept our credentials
+        run: |
+          set -euo pipefail
+          export KUBECONFIG=$HOME/.kube/config
+          # Same probe as vault-sync-secrets.yml: ride out a short API blip
+          # instead of reporting it as a Renovate failure.
+          deadline=$((SECONDS + 180)); delay=5
+          until err=$(kubectl cluster-info 2>&1 >/dev/null); do
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::API server still rejecting or refusing kubectl after ${SECONDS}s"
+              printf '%s\n' "$err"; exit 1
+            fi
+            echo "API server not usable yet, retrying in ${delay}s"; sleep "$delay"
+            delay=$(( delay < 30 ? delay * 2 : 30 ))
+          done
+
+      - name: Check newest Renovate run in each namespace
+        id: check_renovate
+        env:
+          KUBECONFIG: /home/runner/.kube/config
+          MAX_AGE_MIN: '90'
+        run: |
+          set -uo pipefail
+          MAX_AGE_MIN=${MAX_AGE_MIN:-90}
+          now=$(date -u +%s)
+          failures=""
+          for ns in renovate renovate-github; do
+            pod_json=$(kubectl -n "$ns" get pods -o json 2>&1) || { failures+="- $ns: kubectl get pods failed: $pod_json\n"; continue; }
+            newest=$(jq -r '[.items[] | select(.status.phase=="Succeeded" or .status.phase=="Failed")
+                             | {name: .metadata.name, phase: .status.phase,
+                                done: (.status.containerStatuses[0].state.terminated.finishedAt // .status.startTime)}]
+                            | sort_by(.done) | last | if . == null then "" else "\(.name) \(.phase) \(.done)" end' <<<"$pod_json")
+            if [ -z "$newest" ]; then failures+="- $ns: no finished Renovate run retained in the namespace\n"; continue; fi
+            read -r pod phase done_at <<<"$newest"
+            age_min=$(( (now - $(date -u -d "$done_at" +%s 2>/dev/null || date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$done_at" +%s)) / 60 ))
+            logs=$(kubectl -n "$ns" logs "$pod" 2>&1) || { failures+="- $ns: could not read logs of $pod\n"; continue; }
+            finished=$(grep -c "Repository finished" <<<"$logs" || true)
+            crash=$(grep -m3 -E "unhandledRejection|FATAL|Renovate is exiting with a non-zero code|Cannot find (package|module)" <<<"$logs" | cut -c1-200 || true)
+            echo "$ns: newest finished run $pod ($phase) ${age_min}m ago; 'Repository finished' x$finished"
+            if [ "$age_min" -gt "$MAX_AGE_MIN" ]; then failures+="- $ns: newest finished run $pod is ${age_min} min old (limit ${MAX_AGE_MIN}); is the CronJob running?\n"; fi
+            if [ -n "$crash" ] || [ "$finished" -eq 0 ]; then
+              failures+="- $ns: run $pod did not complete a repository"
+              [ -n "$crash" ] && failures+=". First errors:\n$(sed 's/^/    /' <<<"$crash")"
+              failures+="\n"
+            fi
+          done
+          if [ -n "$failures" ]; then
+            printf '\nUNHEALTHY:\n%b' "$failures"
+            { echo "error<<EOF"; printf '%b' "$failures"; echo "EOF"; } >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          echo "All Renovate instances healthy."
+
+      - name: Send email on failure
+        # always(): otherwise skipped once the check step exits non-zero. Keyed
+        # on that step so a cluster-unreachable failure mails too.
+        if: always() && steps.check_renovate.conclusion == 'failure'
+        uses: dawidd6/action-send-mail@ca8dbb4d4f91ca7f75e7f2feea5339e76ce70c90  # v20
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "❌ Renovate is not completing runs"
+          body: |
+            The Renovate health check failed. Renovate may be crashing on every run
+            (its Jobs can still show Complete).
+
+            ${{ steps.check_renovate.outputs.error || 'The check step failed before it could report results - see the workflow run for details.' }}
+
+            Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          to: ${{ secrets.EMAIL_TO }}
+          from: ${{ secrets.EMAIL_FROM }}
