@@ -90,7 +90,10 @@ jobs:
             age_min=$(( (now - $(date -u -d "$done_at" +%s 2>/dev/null || date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$done_at" +%s)) / 60 ))
             logs=$(kubectl -n "$ns" logs "$pod" 2>&1) || { failures+="- $ns: could not read logs of $pod\n"; continue; }
             finished=$(grep -c "Repository finished" <<<"$logs" || true)
-            crash=$(grep -m3 -E "unhandledRejection|FATAL|Renovate is exiting with a non-zero code|Cannot find (package|module)" <<<"$logs" | cut -c1-200 || true)
+            # Only match Renovate's own log-line prefixes. At LOG_LEVEL debug the log
+            # also contains PR bodies, which can quote these words (a PR about this very
+            # crash did, and tripped the first version of this check).
+            crash=$(grep -m3 -E "^ *(FATAL: |ERROR: (unhandledRejection|uncaughtException)|(INFO|WARN|ERROR|FATAL): Renovate is exiting with a non-zero code)" <<<"$logs" | cut -c1-200 || true)
             echo "$ns: newest finished run $pod ($phase) ${age_min}m ago; 'Repository finished' x$finished"
             if [ "$age_min" -gt "$MAX_AGE_MIN" ]; then failures+="- $ns: newest finished run $pod is ${age_min} min old (limit ${MAX_AGE_MIN}); is the CronJob running?\n"; fi
             if [ -n "$crash" ] || [ "$finished" -eq 0 ]; then
