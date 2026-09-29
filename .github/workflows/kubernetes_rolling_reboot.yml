@@ -286,7 +286,7 @@ jobs:
           failure()
           || contains(needs.*.result, 'failure')
           || contains(needs.*.result, 'cancelled')
-        uses: dawidd6/action-send-mail@ca8dbb4d4f91ca7f75e7f2feea5339e76ce70c90 # v7.0.0
+        uses: dawidd6/action-send-mail@67ce3558d613188179559c61d3565140cf389968 # v22
         with:
           server_address: ${{ secrets.SMTP_SERVER }}
           server_port: ${{ secrets.SMTP_PORT }}
