@@ -1,0 +1,137 @@
+name: Redis Hosts
+
+# Runs gh_hdc's ansible/playbooks/playbook_redis_hosts.yaml against the shared
+# Redis Sentinel hosts (gh_hdc ansible/inventory/redis_hosts):
+#   1. refuses to run unless every sentinel agrees and Sentinel's master and
+#      replicas are exactly the inventory's [redis_data]
+#   2. raises each data node's LXC memory through the Proxmox API (never
+#      lowers it; no restart)
+#   3. sets maxmemory / maxmemory-policy in redis.conf and live (no restart)
+#   4. reports what the sentinel hosts run on 6379
+#
+# Manual only, and a dry run (--check) unless "apply" is ticked. No --diff:
+# redis.conf diffs can show requirepass in their context lines.
+#
+# This repo is public, so its logs are too. The playbook marks every task that
+# touches a Proxmox token or the Redis password no_log, and reads the Redis
+# password on each host from its own redis.conf, so no Redis secret is needed
+# here.
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: 'Apply changes (unticked = dry run with --check)'
+        type: boolean
+        default: false
+      gh_hdc_ref:
+        description: 'gh_hdc branch/ref to run the playbook from'
+        type: string
+        default: main
+
+concurrency:
+  group: redis_hosts
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  redis-hosts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout gh_hdc
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: mike12806/gh_hdc
+          ref: ${{ inputs.gh_hdc_ref }}
+          token: ${{ secrets.GH_HDC_PAT }}
+          path: gh_hdc
+
+      - name: Prefer IPv4 over IPv6
+        run: |
+          # Force IPv4 preference to avoid Tailscale IPv6 connectivity issues
+          echo 'precedence ::ffff:0:0/96 100' | sudo tee -a /etc/gai.conf
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd  # v4.2.0
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          hostname: github-runner-redis-hosts
+          version: latest
+
+      - name: Cache pipx and ansible
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: |
+            ~/.local/bin
+            ~/.local/pipx
+          key: ${{ runner.os }}-pipx-ansible-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pipx-ansible-
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y python3-pip python3 python3-venv pipx sshpass openssh-client
+          pipx ensurepath
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Write SSH Private Key to File
+        env:
+          SSH_KEY: ${{ secrets.MIKEYSSHKEYLINODE }}
+        run: |
+          printf '%s\n' "$SSH_KEY" | sed 's/\\n/\n/g' > /tmp/mike_ssh_key
+          chmod 600 /tmp/mike_ssh_key
+
+      - name: Run Ansible Playbook
+        working-directory: gh_hdc/ansible
+        env:
+          ANSIBLE_SSH_PASS: ${{ secrets.ANSIBLE_SSH_PASSWORD_1 }}
+          ANSIBLE_PYTHON_INTERPRETER: /usr/bin/python3
+          ANSIBLE_GATHERING: smart
+          ANSIBLE_TIMEOUT: 30
+          ANSIBLE_STDOUT_CALLBACK: ansible.builtin.default
+          ANSIBLE_CALLBACK_RESULT_FORMAT: yaml
+          ANSIBLE_HOST_KEY_CHECKING: false
+          # Same per-host Proxmox API tokens as kubernetes_rolling_reboot.yml.
+          PVE_DOMAIN: mfaherty.net
+          PVE_HOST_COUNT: "7"
+          PVE_TOKEN_ID: ${{ secrets.PVE_TOKEN_ID }}
+          PVE_SECRET: ${{ secrets.PVE_SECRET }}
+          PVE2_TOKEN_ID: ${{ secrets.PVE2_TOKEN_ID }}
+          PVE2_SECRET: ${{ secrets.PVE2_SECRET }}
+          PVE3_TOKEN_ID: ${{ secrets.PVE3_TOKEN_ID }}
+          PVE3_SECRET: ${{ secrets.PVE3_SECRET }}
+          PVE4_TOKEN_ID: ${{ secrets.PVE4_TOKEN_ID }}
+          PVE4_SECRET: ${{ secrets.PVE4_SECRET }}
+          PVE5_TOKEN_ID: ${{ secrets.PVE5_TOKEN_ID }}
+          PVE5_SECRET: ${{ secrets.PVE5_SECRET }}
+          PVE6_TOKEN_ID: ${{ secrets.PVE6_TOKEN_ID }}
+          PVE6_SECRET: ${{ secrets.PVE6_SECRET }}
+          PVE7_TOKEN_ID: ${{ secrets.PVE7_TOKEN_ID }}
+          PVE7_SECRET: ${{ secrets.PVE7_SECRET }}
+          APPLY: ${{ inputs.apply }}
+        run: |
+          mode=(--check)
+          if [ "$APPLY" = "true" ]; then
+            mode=()
+            echo "::notice::Applying changes."
+          else
+            echo "::notice::Dry run (--check). Re-run with 'apply' ticked to make changes."
+          fi
+          pipx run --spec ansible ansible-playbook playbooks/playbook_redis_hosts.yaml \
+            -i inventory/redis_hosts \
+            -u root \
+            --private-key=/tmp/mike_ssh_key \
+            "${mode[@]}" \
+            --extra-vars "ansible_ssh_pass=${ANSIBLE_SSH_PASS} ansible_ssh_common_args='-o StrictHostKeyChecking=no'"
+
+      - name: Cleanup Temporary Files
+        if: always()
+        run: |
+          rm -f /tmp/mike_ssh_key
