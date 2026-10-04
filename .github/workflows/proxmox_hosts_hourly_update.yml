@@ -78,11 +78,37 @@ jobs:
             -i inventory/proxmox_hosts \
             -u root \
             --private-key=/tmp/mike_ssh_key \
-            --extra-vars "ansible_ssh_pass=${ANSIBLE_SSH_PASS_3} ansible_ssh_common_args='-o StrictHostKeyChecking=no'"
+            --extra-vars "ansible_ssh_pass=${ANSIBLE_SSH_PASS_3} ansible_ssh_common_args='-o StrictHostKeyChecking=no'" \
+            --extra-vars "swap_thrash_report=${RUNNER_TEMP}/swap_thrash_report.txt"
+
+      # The playbook writes this report only when a host is swap thrashing.
+      - name: Check for swap thrashing
+        id: thrash
+        if: always()
+        run: |
+          if [ -s "$RUNNER_TEMP/swap_thrash_report.txt" ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Email swap thrashing report
+        if: always() && steps.thrash.outputs.found == 'true'
+        uses: dawidd6/action-send-mail@67ce3558d613188179559c61d3565140cf389968  # v22
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "⚠️ Swap thrashing on Proxmox host(s)"
+          body: file://${{ runner.temp }}/swap_thrash_report.txt
+          to: ${{ secrets.EMAIL_TO }}
+          from: ${{ secrets.EMAIL_FROM }}
 
       - name: Cleanup
         if: always()
         run: |
           rm -f /tmp/mike_ssh_key
+          rm -f "$RUNNER_TEMP/swap_thrash_report.txt"
           rm -rf ~/.ssh/authorized_keys
           rm -rf ~/.ssh
