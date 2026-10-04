@@ -1,0 +1,125 @@
+name: Proxmox Backup Check
+
+on:
+  schedule:
+    # Every 6 hours. The playbook looks back 7, so a delayed run leaves no gap.
+    - cron: "23 */6 * * *"
+  workflow_dispatch:  # Allows manual triggering from the GitHub Actions UI
+    inputs:
+      window_hours:
+        description: "Hours to look back for failed backup tasks"
+        required: false
+        default: "7"
+      include_warnings:
+        description: "Also report tasks that finished with WARNINGS"
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  group: proxmox_backup_checker
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check-backups:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout gh_hdc
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: mike12806/gh_hdc
+          token: ${{ secrets.GH_HDC_PAT }}
+          path: gh_hdc
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd  # v4.2.0
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          hostname: github-runner-proxmox-backup
+          version: latest
+
+      - name: Cache pipx and ansible
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: |
+            ~/.local/bin
+            ~/.local/pipx
+          key: ${{ runner.os }}-pipx-ansible-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pipx-ansible-
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y python3-pip python3 python3-venv pipx sshpass openssh-client
+          pipx install ansible-core==2.13.0
+          pipx ensurepath
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Write SSH Private Key to File
+        run: |
+          echo "${{ secrets.MIKEYSSHKEYLINODE }}" | sed 's/\\n/\n/g' > /tmp/mike_ssh_key
+          chmod 600 /tmp/mike_ssh_key
+
+      - name: Run Ansible Playbook
+        working-directory: gh_hdc/ansible
+        env:
+          ANSIBLE_SSH_PASS_3: ${{ secrets.ANSIBLE_SSH_PASSWORD_3 }}
+          ANSIBLE_PYTHON_INTERPRETER: /usr/bin/python3
+          ANSIBLE_GATHERING: smart
+          ANSIBLE_TIMEOUT: 30
+          ANSIBLE_STDOUT_CALLBACK: ansible.builtin.default
+          ANSIBLE_CALLBACK_RESULT_FORMAT: yaml
+          ANSIBLE_HOST_KEY_CHECKING: false
+          WINDOW_HOURS: ${{ inputs.window_hours || '7' }}
+          INCLUDE_WARNINGS: ${{ inputs.include_warnings || false }}
+        run: |
+          if ! [[ "$WINDOW_HOURS" =~ ^[0-9]+$ ]] || [ "$WINDOW_HOURS" -lt 1 ]; then
+            echo "window_hours must be a whole number of hours, got '$WINDOW_HOURS'" >&2
+            exit 1
+          fi
+          pipx run --spec ansible ansible-playbook playbooks/playbook_proxmox_backup_check.yaml \
+            -i inventory/proxmox_hosts \
+            -u root \
+            --private-key=/tmp/mike_ssh_key \
+            --extra-vars "ansible_ssh_pass=${ANSIBLE_SSH_PASS_3} ansible_ssh_common_args='-o StrictHostKeyChecking=no'" \
+            --extra-vars "backup_check_report=${RUNNER_TEMP}/backup_report.txt" \
+            --extra-vars "backup_check_window_hours=${WINDOW_HOURS} backup_check_include_warnings=${INCLUDE_WARNINGS}"
+
+      # The playbook writes this report only when a backup task failed or a
+      # host could not be checked.
+      - name: Check for failed backups
+        id: backups
+        if: always()
+        run: |
+          if [ -s "$RUNNER_TEMP/backup_report.txt" ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Email failed backup report
+        if: always() && steps.backups.outputs.found == 'true'
+        uses: dawidd6/action-send-mail@67ce3558d613188179559c61d3565140cf389968  # v22
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "❌ Proxmox backup failures"
+          body: file://${{ runner.temp }}/backup_report.txt
+          to: ${{ secrets.EMAIL_TO }}
+          from: ${{ secrets.EMAIL_FROM }}
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -f /tmp/mike_ssh_key
+          rm -f "$RUNNER_TEMP/backup_report.txt"
