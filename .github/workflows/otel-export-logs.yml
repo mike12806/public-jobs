@@ -167,6 +167,17 @@ jobs:
                   }
 
 
+          # Never let the Access credentials reach the log. http.client puts a bad
+          # header value in its exception text, so reject bad values here with a
+          # message that doesn't include them.
+          CF_ID = os.environ["CF_ACCESS_CLIENT_ID"].strip()
+          CF_SECRET = os.environ["CF_ACCESS_CLIENT_SECRET"].strip()
+          for name, value in (("OTEL_CF_ACCESS_CLIENT_ID", CF_ID), ("OTEL_CF_ACCESS_CLIENT_SECRET", CF_SECRET)):
+              if not value or any(ord(c) < 0x21 or ord(c) > 0x7e for c in value):
+                  sys.exit(f"secret {name} is empty or contains spaces, line breaks or other"
+                           " characters that can't go in an HTTP header; set it again as one line")
+
+
           def post(resource, recs):
               body = gzip.compress(json.dumps({"resourceLogs": [{
                   "resource": {"attributes": resource},
@@ -178,10 +189,8 @@ jobs:
                   # Cloudflare's Browser Integrity Check / bot rules 403 the
                   # default Python-urllib agent before Access sees the token.
                   "User-Agent": "mfaherty-gha-otel-export/1.0",
-                  # strip(): a secret pasted with a trailing newline is an
-                  # invalid header value and http.client refuses to send it.
-                  "CF-Access-Client-Id": os.environ["CF_ACCESS_CLIENT_ID"].strip(),
-                  "CF-Access-Client-Secret": os.environ["CF_ACCESS_CLIENT_SECRET"].strip(),
+                  "CF-Access-Client-Id": CF_ID,
+                  "CF-Access-Client-Secret": CF_SECRET,
               })
               for attempt in range(5):
                   try:
