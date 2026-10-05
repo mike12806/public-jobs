@@ -178,8 +178,10 @@ jobs:
                   # Cloudflare's Browser Integrity Check / bot rules 403 the
                   # default Python-urllib agent before Access sees the token.
                   "User-Agent": "mfaherty-gha-otel-export/1.0",
-                  "CF-Access-Client-Id": os.environ["CF_ACCESS_CLIENT_ID"],
-                  "CF-Access-Client-Secret": os.environ["CF_ACCESS_CLIENT_SECRET"],
+                  # strip(): a secret pasted with a trailing newline is an
+                  # invalid header value and http.client refuses to send it.
+                  "CF-Access-Client-Id": os.environ["CF_ACCESS_CLIENT_ID"].strip(),
+                  "CF-Access-Client-Secret": os.environ["CF_ACCESS_CLIENT_SECRET"].strip(),
               })
               for attempt in range(5):
                   try:
