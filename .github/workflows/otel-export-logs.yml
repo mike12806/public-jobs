@@ -175,8 +175,13 @@ jobs:
               req = urllib.request.Request(ENDPOINT, data=body, method="POST", headers={
                   "Content-Type": "application/json",
                   "Content-Encoding": "gzip",
-                  "CF-Access-Client-Id": os.environ["CF_ACCESS_CLIENT_ID"],
-                  "CF-Access-Client-Secret": os.environ["CF_ACCESS_CLIENT_SECRET"],
+                  # Cloudflare's Browser Integrity Check / bot rules 403 the
+                  # default Python-urllib agent before Access sees the token.
+                  "User-Agent": "mfaherty-gha-otel-export/1.0",
+                  # strip(): a secret pasted with a trailing newline is an
+                  # invalid header value and http.client refuses to send it.
+                  "CF-Access-Client-Id": os.environ["CF_ACCESS_CLIENT_ID"].strip(),
+                  "CF-Access-Client-Secret": os.environ["CF_ACCESS_CLIENT_SECRET"].strip(),
               })
               for attempt in range(5):
                   try:
@@ -187,7 +192,13 @@ jobs:
                       # A redirect here is Access bouncing us to its login page:
                       # the service token is missing or not allowed by the policy.
                       if e.code < 500 and e.code != 429:
-                          sys.exit(f"otel endpoint rejected batch: HTTP {e.code} {e.reason}")
+                          # Cloudflare's error page says whether it was Access
+                          # (bad/unauthorised token) or a WAF/bot rule.
+                          detail = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ",
+                                          e.read(2000).decode("utf-8", "replace"))).strip()
+                          sys.exit(f"otel endpoint rejected batch: HTTP {e.code} {e.reason}"
+                                   f" (cf-ray {e.headers.get('cf-ray')}, cf-mitigated"
+                                   f" {e.headers.get('cf-mitigated')}): {detail[:400]}")
                       err = f"HTTP {e.code}"
                   except OSError as e:
                       err = str(e)
