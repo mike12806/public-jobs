@@ -126,6 +126,8 @@ jobs:
 
           LINE = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?Z (.*)$")
           MARKER = re.compile(r"^##\[(error|warning|notice|debug)\]")
+          # Terminal colour/cursor codes; the runner leaves them in the raw log.
+          ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
           SEVERITY = {  # text, OTel severityNumber
               "error": ("ERROR", 17), "warning": ("WARN", 13),
               "notice": ("INFO", 9), "debug": ("DEBUG", 5), None: ("INFO", 9),
@@ -136,6 +138,7 @@ jobs:
               steps = sorted(((iso_ns(s["started_at"]), s) for s in job.get("steps") or []
                               if s.get("started_at")), key=lambda t: t[0])
               last_ns = 0
+              group = None
               for raw in text.lstrip("\ufeff").splitlines():
                   m = LINE.match(raw)
                   if m:
@@ -145,6 +148,19 @@ jobs:
                       last_ns = ns
                   else:
                       ns, line = last_ns, raw
+                  line = ANSI.sub("", line).rstrip()
+                  # ##[group]/##[endgroup] are the UI's fold markers. Keep the
+                  # group title as an attribute on every line inside it (so e.g.
+                  # the "Run ..." script echo can be filtered out) and drop the
+                  # markers and blank lines themselves.
+                  if line.startswith("##[group]"):
+                      group = line[len("##[group]"):].strip() or None
+                      line = group or ""
+                  elif line == "##[endgroup]":
+                      group = None
+                      continue
+                  if not line:
+                      continue
                   mk = MARKER.match(line)
                   level = mk.group(1) if mk else None
                   if mk:
@@ -163,6 +179,7 @@ jobs:
                       "attributes": attrs({
                           "cicd.pipeline.task.step.name": step and step["name"],
                           "cicd.pipeline.task.step.number": step and step["number"],
+                          "github.log.group": group,
                       }),
                   }
 
@@ -203,8 +220,9 @@ jobs:
                       if e.code < 500 and e.code != 429:
                           # Cloudflare's error page says whether it was Access
                           # (bad/unauthorised token) or a WAF/bot rule.
-                          detail = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ",
-                                          e.read(2000).decode("utf-8", "replace"))).strip()
+                          page = e.read(8000).decode("utf-8", "replace")
+                          page = re.sub(r"(?is)<(style|script)\b.*?</\1>", " ", page)
+                          detail = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", page)).strip()
                           sys.exit(f"otel endpoint rejected batch: HTTP {e.code} {e.reason}"
                                    f" (cf-ray {e.headers.get('cf-ray')}, cf-mitigated"
                                    f" {e.headers.get('cf-mitigated')}): {detail[:400]}")
