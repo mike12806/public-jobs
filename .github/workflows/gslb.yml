@@ -1,0 +1,175 @@
+name: GSLB
+
+# Runs gh_hdc's ansible/playbooks/playbook_gslb.yaml against the GSLB nodes
+# (gh_hdc ansible/inventory/gslb_hosts: gslb-1..4, VIP 192.168.1.113, which is
+# the LAN's DNS, the shared Redis and the Kubernetes API endpoint).
+#
+#   - Nightly: dry run (--check). Emails a report if any node's HAProxy,
+#     dnsdist or keepalived config has drifted from gh_hdc, or if the run
+#     fails (for example preflight finding two VIP holders, or the Redis
+#     master failing the health check).
+#   - Manual: dry run unless "apply" is ticked. Applying changes one node at
+#     a time, the VIP holder last, checking the VIP after each node and
+#     rolling that node back if anything fails (see the playbook header).
+#
+# This repo is public, so its logs are too. The playbook reads the Redis and
+# VRRP passwords from the nodes (no extra secrets here), keeps them out of the
+# output (no_log) and prints its own redacted diffs, so this runs without
+# --diff.
+
+on:
+  schedule:
+    - cron: "17 8 * * *"  # 04:17 EDT
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: 'Apply changes (unticked = dry run with --check)'
+        type: boolean
+        default: false
+      gh_hdc_ref:
+        description: 'gh_hdc branch/ref to run the playbook from'
+        type: string
+        default: main
+
+concurrency:
+  group: gslb
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  gslb:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout gh_hdc
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: mike12806/gh_hdc
+          ref: ${{ inputs.gh_hdc_ref || 'main' }}
+          token: ${{ secrets.GH_HDC_PAT }}
+          path: gh_hdc
+
+      - name: Prefer IPv4 over IPv6
+        run: |
+          # Force IPv4 preference to avoid Tailscale IPv6 connectivity issues
+          echo 'precedence ::ffff:0:0/96 100' | sudo tee -a /etc/gai.conf
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd  # v4.2.0
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          hostname: github-runner-gslb
+          version: latest
+
+      - name: Cache pipx and ansible
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: |
+            ~/.local/bin
+            ~/.local/pipx
+          key: ${{ runner.os }}-pipx-ansible-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pipx-ansible-
+
+      # dnsutils: the playbook checks DNS on the VIP with dig.
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y python3-pip python3 python3-venv pipx sshpass openssh-client dnsutils
+          pipx ensurepath
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Write SSH Private Key to File
+        env:
+          SSH_KEY: ${{ secrets.MIKEYSSHKEYLINODE }}
+        run: |
+          printf '%s\n' "$SSH_KEY" | sed 's/\\n/\n/g' > /tmp/mike_ssh_key
+          chmod 600 /tmp/mike_ssh_key
+
+      - name: Run Ansible Playbook
+        id: playbook
+        working-directory: gh_hdc/ansible
+        env:
+          ANSIBLE_SSH_PASS: ${{ secrets.ANSIBLE_SSH_PASSWORD_1 }}
+          ANSIBLE_PYTHON_INTERPRETER: /usr/bin/python3
+          ANSIBLE_GATHERING: smart
+          ANSIBLE_TIMEOUT: 30
+          ANSIBLE_STDOUT_CALLBACK: ansible.builtin.default
+          ANSIBLE_CALLBACK_RESULT_FORMAT: yaml
+          ANSIBLE_HOST_KEY_CHECKING: false
+          APPLY: ${{ github.event_name == 'workflow_dispatch' && inputs.apply }}
+        run: |
+          set -o pipefail
+          mode=(--check)
+          if [ "$APPLY" = "true" ]; then
+            mode=()
+            echo "::notice::Applying changes."
+          else
+            echo "::notice::Dry run (--check). Re-run with 'apply' ticked to make changes."
+          fi
+          pipx run --spec ansible ansible-playbook playbooks/playbook_gslb.yaml \
+            -i inventory/gslb_hosts \
+            -u root \
+            --private-key=/tmp/mike_ssh_key \
+            "${mode[@]}" \
+            --extra-vars "ansible_ssh_pass=${ANSIBLE_SSH_PASS} ansible_ssh_common_args='-o StrictHostKeyChecking=no'" \
+            | tee "$RUNNER_TEMP/gslb.log"
+
+      # In a dry run the playbook only counts the three config files as
+      # changes, so any changed=N > 0 in the recap is drift from gh_hdc.
+      - name: Check for drift
+        id: drift
+        if: always() && steps.playbook.outcome != 'skipped'
+        env:
+          APPLY: ${{ github.event_name == 'workflow_dispatch' && inputs.apply }}
+          OUTCOME: ${{ steps.playbook.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          log="$RUNNER_TEMP/gslb.log"
+          report="$RUNNER_TEMP/gslb_report.txt"
+          drifted=$(sed -n '/^PLAY RECAP/,$p' "$log" | grep -oE '^gslb-[0-9]+ .*changed=[1-9][0-9]*' | awk '{print $1}' | tr '\n' ' ')
+          if [ "$OUTCOME" = "failure" ]; then
+            {
+              echo "The GSLB playbook run failed. Nothing was changed by a dry run."
+              echo "Run: $RUN_URL"
+              echo
+              tail -n 80 "$log"
+            } > "$report"
+            echo "subject=❌ GSLB playbook failed" >> "$GITHUB_OUTPUT"
+          elif [ "$APPLY" != "true" ] && [ -n "$drifted" ]; then
+            {
+              echo "These GSLB nodes' configs differ from gh_hdc: $drifted"
+              echo "Apply with the 'GSLB' workflow (tick apply), or update gh_hdc if the change on the node is wanted."
+              echo "Run: $RUN_URL"
+              echo
+              echo "Redacted diffs:"
+              awk '/^TASK \[Show what would change/{f=1; next} /^TASK \[/{f=0} f' "$log"
+              echo
+              sed -n '/^PLAY RECAP/,$p' "$log"
+            } > "$report"
+            echo "subject=⚠️ GSLB config drift: $drifted" >> "$GITHUB_OUTPUT"
+            echo "::warning::Config drift on: $drifted"
+          fi
+
+      - name: Email the report
+        if: always() && github.event_name == 'schedule' && steps.drift.outputs.subject != ''
+        uses: dawidd6/action-send-mail@67ce3558d613188179559c61d3565140cf389968  # v22
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: ${{ steps.drift.outputs.subject }}
+          body: file://${{ runner.temp }}/gslb_report.txt
+          to: ${{ secrets.EMAIL_TO }}
+          from: ${{ secrets.EMAIL_FROM }}
+
+      - name: Cleanup Temporary Files
+        if: always()
+        run: |
+          rm -f /tmp/mike_ssh_key "$RUNNER_TEMP/gslb.log" "$RUNNER_TEMP/gslb_report.txt"
