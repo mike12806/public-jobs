@@ -1,0 +1,159 @@
+name: Vault cluster
+
+# Runs gh_hdc's ansible/playbooks/playbook_vault_cluster.yaml: creates the
+# Vault LXCs on Proxmox (DHCP, local-lvm, start on boot, tagged
+# ansible-provisioned, PBS backup jobs like the seed's), then installs Vault,
+# migrates the seed (vault-1, 192.168.1.177) from file storage to Raft, joins
+# the new nodes and sets up auto-unseal. See the playbooks' headers.
+#
+# Manual only, and a dry run (--check) unless "apply" is ticked. Migrating
+# the seed stops Vault for about a minute, so it also needs "migrate_seed".
+# The run summary lists each new node's IP and MAC to reserve in the router.
+#
+# This repo is public, so its logs are too. The playbooks read the unseal
+# key shares and Cloudflare credentials from the seed and keep them, and the
+# Proxmox tokens, out of the output (no_log); no --diff.
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: 'Apply changes (unticked = dry run with --check)'
+        type: boolean
+        default: false
+      migrate_seed:
+        description: 'Allow migrating the seed from file storage to Raft (Vault down ~1 min)'
+        type: boolean
+        default: false
+      gh_hdc_ref:
+        description: 'gh_hdc branch/ref to run the playbook from'
+        type: string
+        default: main
+
+concurrency:
+  group: vault_cluster
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  vault-cluster:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout gh_hdc
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: mike12806/gh_hdc
+          ref: ${{ inputs.gh_hdc_ref }}
+          token: ${{ secrets.GH_HDC_PAT }}
+          path: gh_hdc
+
+      - name: Prefer IPv4 over IPv6
+        run: |
+          # Force IPv4 preference to avoid Tailscale IPv6 connectivity issues
+          echo 'precedence ::ffff:0:0/96 100' | sudo tee -a /etc/gai.conf
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd  # v4.2.0
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          hostname: github-runner-vault-cluster
+          version: latest
+
+      - name: Cache pipx and ansible
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: |
+            ~/.local/bin
+            ~/.local/pipx
+          key: ${{ runner.os }}-pipx-ansible-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pipx-ansible-
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y python3-pip python3 python3-venv pipx sshpass openssh-client
+          pipx ensurepath
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      # New containers get this key's public half as root's authorized key.
+      - name: Write SSH Private Key to File
+        env:
+          SSH_KEY: ${{ secrets.MIKEYSSHKEYLINODE }}
+        run: |
+          printf '%s\n' "$SSH_KEY" | sed 's/\\n/\n/g' > /tmp/mike_ssh_key
+          chmod 600 /tmp/mike_ssh_key
+
+      - name: Run Ansible Playbook
+        working-directory: gh_hdc/ansible
+        env:
+          ANSIBLE_SSH_PASS: ${{ secrets.ANSIBLE_SSH_PASSWORD_1 }}
+          ANSIBLE_PRIVATE_KEY_FILE: /tmp/mike_ssh_key
+          ANSIBLE_PYTHON_INTERPRETER: /usr/bin/python3
+          ANSIBLE_GATHERING: smart
+          ANSIBLE_TIMEOUT: 30
+          ANSIBLE_STDOUT_CALLBACK: ansible.builtin.default
+          ANSIBLE_CALLBACK_RESULT_FORMAT: yaml
+          ANSIBLE_HOST_KEY_CHECKING: false
+          # Same per-host Proxmox API tokens as kubernetes_rolling_reboot.yml.
+          PVE_DOMAIN: mfaherty.net
+          PVE_HOST_COUNT: "7"
+          PVE_TOKEN_ID: ${{ secrets.PVE_TOKEN_ID }}
+          PVE_SECRET: ${{ secrets.PVE_SECRET }}
+          PVE2_TOKEN_ID: ${{ secrets.PVE2_TOKEN_ID }}
+          PVE2_SECRET: ${{ secrets.PVE2_SECRET }}
+          PVE3_TOKEN_ID: ${{ secrets.PVE3_TOKEN_ID }}
+          PVE3_SECRET: ${{ secrets.PVE3_SECRET }}
+          PVE4_TOKEN_ID: ${{ secrets.PVE4_TOKEN_ID }}
+          PVE4_SECRET: ${{ secrets.PVE4_SECRET }}
+          PVE5_TOKEN_ID: ${{ secrets.PVE5_TOKEN_ID }}
+          PVE5_SECRET: ${{ secrets.PVE5_SECRET }}
+          PVE6_TOKEN_ID: ${{ secrets.PVE6_TOKEN_ID }}
+          PVE6_SECRET: ${{ secrets.PVE6_SECRET }}
+          PVE7_TOKEN_ID: ${{ secrets.PVE7_TOKEN_ID }}
+          PVE7_SECRET: ${{ secrets.PVE7_SECRET }}
+          # Optional: only used to check Raft voters at the end.
+          VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
+          APPLY: ${{ inputs.apply }}
+          MIGRATE_SEED: ${{ inputs.migrate_seed }}
+        run: |
+          set -o pipefail
+          mode=(--check)
+          if [ "$APPLY" = "true" ]; then
+            mode=(-e "vault_migrate_seed=${MIGRATE_SEED}")
+            echo "::notice::Applying changes (migrate_seed=${MIGRATE_SEED})."
+          else
+            echo "::notice::Dry run (--check). Re-run with 'apply' ticked to make changes."
+          fi
+          pipx run --spec ansible ansible-playbook playbooks/playbook_vault_cluster.yaml \
+            -i inventory/vault_hosts \
+            -u root \
+            --private-key=/tmp/mike_ssh_key \
+            "${mode[@]}" \
+            --extra-vars "ansible_ssh_pass=${ANSIBLE_SSH_PASS} ansible_ssh_common_args='-o StrictHostKeyChecking=no'" \
+            | tee "$RUNNER_TEMP/vault.log"
+
+      - name: Summarize addresses to reserve
+        if: always()
+        run: |
+          {
+            echo "### Vault nodes: reserve these in the router"
+            echo
+            echo '| Node | IP, MAC (host/VMID) |'
+            echo '|---|---|'
+            # Matches the playbook's "Reserve these addresses" lines in either
+            # result format (JSON or YAML).
+            grep -oE 'vault-[0-9]+: [0-9.]+, MAC [0-9A-Fa-f:?]+ \([^)]*\)' "$RUNNER_TEMP/vault.log" \
+              | sed -E 's/^(vault-[0-9]+): (.*)$/| \1 | \2 |/' | sort -u
+          } >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+
+      - name: Cleanup Temporary Files
+        if: always()
+        run: |
+          rm -f /tmp/mike_ssh_key "$RUNNER_TEMP/vault.log"
