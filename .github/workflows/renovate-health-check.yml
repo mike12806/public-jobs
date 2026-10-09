@@ -77,7 +77,7 @@ jobs:
         run: |
           set -euo pipefail
           export KUBECONFIG=$HOME/.kube/config
-          # Same probe as vault-sync-secrets.yml: ride out a short API blip
+          # Ride out a short API blip
           # instead of reporting it as a Renovate failure.
           deadline=$((SECONDS + 180)); delay=5
           until err=$(kubectl cluster-info 2>&1 >/dev/null); do
