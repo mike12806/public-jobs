@@ -10,6 +10,7 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
+  id-token: write  # log in to Vault through GitHub OIDC
   contents: read
 
 jobs:
@@ -18,14 +19,6 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - name: Checkout gh_hdc
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-        with:
-          repository: mike12806/gh_hdc
-          token: ${{ secrets.GH_HDC_PAT }}
-          path: gh_hdc
-          fetch-depth: 0
-
       - name: Connect to Tailscale
         uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd  # v4.2.0
         with:
@@ -34,6 +27,30 @@ jobs:
           tags: tag:ci
           hostname: github-runner-nfs-ip-updater
           version: latest
+
+      # Secrets come from Vault (kv/ci/*), logged in through GitHub OIDC with
+      # the role below (gh_hdc vault/), so they're no longer GitHub secrets.
+      - name: Read secrets from Vault
+        uses: hashicorp/vault-action@892a26828f195e65540a40b4768ae4571f51ebfc  # v4.0.0
+        with:
+          url: https://vault.mfaherty.net
+          method: jwt
+          path: github-actions
+          role: public-jobs
+          jwtGithubAudience: https://vault.mfaherty.net
+          secrets: |
+            kv/data/ci/github GH_HDC_PAT | GH_HDC_PAT ;
+            kv/data/ci/kubernetes KUBECONFIG | KUBECONFIG_B64 ;
+            kv/data/ci/truenas TRUENAS_API_KEY | TRUENAS_API_KEY ;
+            kv/data/ci/truenas TRUENAS_API_URL | TRUENAS_API_URL
+
+      - name: Checkout gh_hdc
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: mike12806/gh_hdc
+          token: ${{ env.GH_HDC_PAT }}
+          path: gh_hdc
+          fetch-depth: 0
 
       - name: Install dependencies
         run: |
@@ -75,7 +92,7 @@ jobs:
         run: |
           mkdir -p $HOME/.kube
           base64 -d > $HOME/.kube/config << 'EOF'
-          ${{ secrets.KUBECONFIG }}
+          ${{ env.KUBECONFIG_B64 }}
           EOF
           chmod 600 $HOME/.kube/config
           # Verify kubectl can connect to the cluster
@@ -242,12 +259,12 @@ jobs:
         run: |
           # Get NFS shares from TrueNAS API
           # Convert HTTP(S) URL to WebSocket URI with /api/current endpoint
-          API_URI="${{ secrets.TRUENAS_API_URL }}"
+          API_URI="${{ env.TRUENAS_API_URL }}"
           API_URI="${API_URI/http:/ws:}"
           API_URI="${API_URI/https:/wss:}"
           API_URI="${API_URI}/api/current"
           
-          API_KEY="${{ secrets.TRUENAS_API_KEY }}"
+          API_KEY="${{ env.TRUENAS_API_KEY }}"
           
           # Call TrueNAS API using official client
           RESPONSE=$(python3 /tmp/truenas_api.py "$API_URI" "$API_KEY" "sharing.nfs.query" "[]")
@@ -279,12 +296,12 @@ jobs:
       - name: Patch NFS shares with new IPs
         run: |
           # Convert HTTP(S) URL to WebSocket URI with /api/current endpoint
-          API_URI="${{ secrets.TRUENAS_API_URL }}"
+          API_URI="${{ env.TRUENAS_API_URL }}"
           API_URI="${API_URI/http:/ws:}"
           API_URI="${API_URI/https:/wss:}"
           API_URI="${API_URI}/api/current"
           
-          API_KEY="${{ secrets.TRUENAS_API_KEY }}"
+          API_KEY="${{ env.TRUENAS_API_KEY }}"
           
           # Parse comma-separated lists into arrays
           IFS=',' read -ra IDS <<< "${{ steps.get_share_ids.outputs.share_ids }}"

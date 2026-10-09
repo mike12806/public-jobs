@@ -34,6 +34,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
+  id-token: write  # log in to Vault through GitHub OIDC
   contents: read
 
 jobs:
@@ -42,14 +43,6 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - name: Checkout gh_hdc
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-        with:
-          repository: mike12806/gh_hdc
-          ref: ${{ inputs.gh_hdc_ref }}
-          token: ${{ secrets.GH_HDC_PAT }}
-          path: gh_hdc
-
       - name: Prefer IPv4 over IPv6
         run: |
           # Force IPv4 preference to avoid Tailscale IPv6 connectivity issues
@@ -63,6 +56,43 @@ jobs:
           tags: tag:ci
           hostname: github-runner-redis-hosts
           version: latest
+
+      # Secrets come from Vault (kv/ci/*), logged in through GitHub OIDC with
+      # the role below (gh_hdc vault/), so they're no longer GitHub secrets.
+      - name: Read secrets from Vault
+        uses: hashicorp/vault-action@892a26828f195e65540a40b4768ae4571f51ebfc  # v4.0.0
+        with:
+          url: https://vault.mfaherty.net
+          method: jwt
+          path: github-actions
+          role: public-jobs
+          jwtGithubAudience: https://vault.mfaherty.net
+          secrets: |
+            kv/data/ci/github GH_HDC_PAT | GH_HDC_PAT ;
+            kv/data/ci/proxmox PVE2_SECRET | PVE2_SECRET ;
+            kv/data/ci/proxmox PVE2_TOKEN_ID | PVE2_TOKEN_ID ;
+            kv/data/ci/proxmox PVE3_SECRET | PVE3_SECRET ;
+            kv/data/ci/proxmox PVE3_TOKEN_ID | PVE3_TOKEN_ID ;
+            kv/data/ci/proxmox PVE4_SECRET | PVE4_SECRET ;
+            kv/data/ci/proxmox PVE4_TOKEN_ID | PVE4_TOKEN_ID ;
+            kv/data/ci/proxmox PVE5_SECRET | PVE5_SECRET ;
+            kv/data/ci/proxmox PVE5_TOKEN_ID | PVE5_TOKEN_ID ;
+            kv/data/ci/proxmox PVE6_SECRET | PVE6_SECRET ;
+            kv/data/ci/proxmox PVE6_TOKEN_ID | PVE6_TOKEN_ID ;
+            kv/data/ci/proxmox PVE7_SECRET | PVE7_SECRET ;
+            kv/data/ci/proxmox PVE7_TOKEN_ID | PVE7_TOKEN_ID ;
+            kv/data/ci/proxmox PVE_SECRET | PVE_SECRET ;
+            kv/data/ci/proxmox PVE_TOKEN_ID | PVE_TOKEN_ID ;
+            kv/data/ci/ssh ANSIBLE_SSH_PASSWORD_1 | ANSIBLE_SSH_PASSWORD_1 ;
+            kv/data/ci/ssh MIKEYSSHKEYLINODE | MIKEYSSHKEYLINODE
+
+      - name: Checkout gh_hdc
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: mike12806/gh_hdc
+          ref: ${{ inputs.gh_hdc_ref }}
+          token: ${{ env.GH_HDC_PAT }}
+          path: gh_hdc
 
       - name: Cache pipx and ansible
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
@@ -83,7 +113,7 @@ jobs:
 
       - name: Write SSH Private Key to File
         env:
-          SSH_KEY: ${{ secrets.MIKEYSSHKEYLINODE }}
+          SSH_KEY: ${{ env.MIKEYSSHKEYLINODE }}
         run: |
           printf '%s\n' "$SSH_KEY" | sed 's/\\n/\n/g' > /tmp/mike_ssh_key
           chmod 600 /tmp/mike_ssh_key
@@ -91,7 +121,7 @@ jobs:
       - name: Run Ansible Playbook
         working-directory: gh_hdc/ansible
         env:
-          ANSIBLE_SSH_PASS: ${{ secrets.ANSIBLE_SSH_PASSWORD_1 }}
+          ANSIBLE_SSH_PASS: ${{ env.ANSIBLE_SSH_PASSWORD_1 }}
           ANSIBLE_PYTHON_INTERPRETER: /usr/bin/python3
           ANSIBLE_GATHERING: smart
           ANSIBLE_TIMEOUT: 30
@@ -101,20 +131,20 @@ jobs:
           # Same per-host Proxmox API tokens as kubernetes_rolling_reboot.yml.
           PVE_DOMAIN: mfaherty.net
           PVE_HOST_COUNT: "7"
-          PVE_TOKEN_ID: ${{ secrets.PVE_TOKEN_ID }}
-          PVE_SECRET: ${{ secrets.PVE_SECRET }}
-          PVE2_TOKEN_ID: ${{ secrets.PVE2_TOKEN_ID }}
-          PVE2_SECRET: ${{ secrets.PVE2_SECRET }}
-          PVE3_TOKEN_ID: ${{ secrets.PVE3_TOKEN_ID }}
-          PVE3_SECRET: ${{ secrets.PVE3_SECRET }}
-          PVE4_TOKEN_ID: ${{ secrets.PVE4_TOKEN_ID }}
-          PVE4_SECRET: ${{ secrets.PVE4_SECRET }}
-          PVE5_TOKEN_ID: ${{ secrets.PVE5_TOKEN_ID }}
-          PVE5_SECRET: ${{ secrets.PVE5_SECRET }}
-          PVE6_TOKEN_ID: ${{ secrets.PVE6_TOKEN_ID }}
-          PVE6_SECRET: ${{ secrets.PVE6_SECRET }}
-          PVE7_TOKEN_ID: ${{ secrets.PVE7_TOKEN_ID }}
-          PVE7_SECRET: ${{ secrets.PVE7_SECRET }}
+          PVE_TOKEN_ID: ${{ env.PVE_TOKEN_ID }}
+          PVE_SECRET: ${{ env.PVE_SECRET }}
+          PVE2_TOKEN_ID: ${{ env.PVE2_TOKEN_ID }}
+          PVE2_SECRET: ${{ env.PVE2_SECRET }}
+          PVE3_TOKEN_ID: ${{ env.PVE3_TOKEN_ID }}
+          PVE3_SECRET: ${{ env.PVE3_SECRET }}
+          PVE4_TOKEN_ID: ${{ env.PVE4_TOKEN_ID }}
+          PVE4_SECRET: ${{ env.PVE4_SECRET }}
+          PVE5_TOKEN_ID: ${{ env.PVE5_TOKEN_ID }}
+          PVE5_SECRET: ${{ env.PVE5_SECRET }}
+          PVE6_TOKEN_ID: ${{ env.PVE6_TOKEN_ID }}
+          PVE6_SECRET: ${{ env.PVE6_SECRET }}
+          PVE7_TOKEN_ID: ${{ env.PVE7_TOKEN_ID }}
+          PVE7_SECRET: ${{ env.PVE7_SECRET }}
           APPLY: ${{ inputs.apply }}
         run: |
           mode=(--check)

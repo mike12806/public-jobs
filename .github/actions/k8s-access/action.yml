@@ -10,8 +10,16 @@ inputs:
   ts-oauth-secret:
     required: true
   kubeconfig:
-    description: "base64-encoded kubeconfig"
-    required: true
+    description: >-
+      base64-encoded kubeconfig. Leave empty to read it from Vault
+      (kv/ci/kubernetes), which needs `id-token: write` in the calling
+      workflow.
+    required: false
+    default: ""
+  vault-role:
+    description: Vault GitHub-OIDC role (gh_hdc vault/) used to read the kubeconfig.
+    required: false
+    default: public-jobs
   hostname:
     description: >-
       Tailscale hostname for this runner. Distinct per job so a node left in
@@ -34,6 +42,18 @@ runs:
         retry: 5
         use-cache: true
 
+    # After Tailscale: vault.mfaherty.net is only reachable on the tailnet.
+    - name: Read the kubeconfig from Vault
+      if: inputs.kubeconfig == ''
+      uses: hashicorp/vault-action@892a26828f195e65540a40b4768ae4571f51ebfc # v4.0.0
+      with:
+        url: https://vault.mfaherty.net
+        method: jwt
+        path: github-actions
+        role: ${{ inputs.vault-role }}
+        jwtGithubAudience: https://vault.mfaherty.net
+        secrets: kv/data/ci/kubernetes KUBECONFIG | KUBECONFIG_B64
+
     - name: Setup kubectl
       uses: azure/setup-kubectl@bda439f5f36b99b262ebdcd3613869bddb064c8e # v5.2.0
       with:
@@ -42,7 +62,7 @@ runs:
     - name: Set up kubeconfig
       shell: bash
       env:
-        KUBECONFIG_B64: ${{ inputs.kubeconfig }}
+        KUBECONFIG_B64: ${{ inputs.kubeconfig || env.KUBECONFIG_B64 }}
       run: |
         mkdir -p "$HOME/.kube"
         printf '%s' "$KUBECONFIG_B64" | base64 -d > "$HOME/.kube/config"

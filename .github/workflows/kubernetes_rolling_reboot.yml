@@ -48,6 +48,7 @@ name: Kubernetes Rolling Node Reboot
 # applies, and the run still aborts rather than continuing past a failure.
 
 permissions:
+  id-token: write  # log in to Vault through GitHub OIDC (here and in k8s-access)
   contents: read
 
 on:
@@ -94,9 +95,33 @@ jobs:
         with:
           ts-oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           ts-oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
-          kubeconfig: ${{ secrets.KUBECONFIG }}
           hostname: github-runner-k8s-reboot-plan
 
+      # Secrets come from Vault (kv/ci/*), logged in through GitHub OIDC with
+      # the role below (gh_hdc vault/), so they're no longer GitHub secrets.
+      - name: Read secrets from Vault
+        uses: hashicorp/vault-action@892a26828f195e65540a40b4768ae4571f51ebfc  # v4.0.0
+        with:
+          url: https://vault.mfaherty.net
+          method: jwt
+          path: github-actions
+          role: public-jobs
+          jwtGithubAudience: https://vault.mfaherty.net
+          secrets: |
+            kv/data/ci/proxmox PVE2_SECRET | PVE2_SECRET ;
+            kv/data/ci/proxmox PVE2_TOKEN_ID | PVE2_TOKEN_ID ;
+            kv/data/ci/proxmox PVE3_SECRET | PVE3_SECRET ;
+            kv/data/ci/proxmox PVE3_TOKEN_ID | PVE3_TOKEN_ID ;
+            kv/data/ci/proxmox PVE4_SECRET | PVE4_SECRET ;
+            kv/data/ci/proxmox PVE4_TOKEN_ID | PVE4_TOKEN_ID ;
+            kv/data/ci/proxmox PVE5_SECRET | PVE5_SECRET ;
+            kv/data/ci/proxmox PVE5_TOKEN_ID | PVE5_TOKEN_ID ;
+            kv/data/ci/proxmox PVE6_SECRET | PVE6_SECRET ;
+            kv/data/ci/proxmox PVE6_TOKEN_ID | PVE6_TOKEN_ID ;
+            kv/data/ci/proxmox PVE7_SECRET | PVE7_SECRET ;
+            kv/data/ci/proxmox PVE7_TOKEN_ID | PVE7_TOKEN_ID ;
+            kv/data/ci/proxmox PVE_SECRET | PVE_SECRET ;
+            kv/data/ci/proxmox PVE_TOKEN_ID | PVE_TOKEN_ID
       # The only place the strict preflight runs: a whole run starts from a
       # spotless cluster or not at all. The per-node jobs that follow cannot
       # ask for that -- the node before them left Longhorn rebuilding by
@@ -106,20 +131,20 @@ jobs:
         env:
           PVE_DOMAIN: mfaherty.net
           PVE_HOST_COUNT: "7"
-          PVE_TOKEN_ID: ${{ secrets.PVE_TOKEN_ID }}
-          PVE_SECRET: ${{ secrets.PVE_SECRET }}
-          PVE2_TOKEN_ID: ${{ secrets.PVE2_TOKEN_ID }}
-          PVE2_SECRET: ${{ secrets.PVE2_SECRET }}
-          PVE3_TOKEN_ID: ${{ secrets.PVE3_TOKEN_ID }}
-          PVE3_SECRET: ${{ secrets.PVE3_SECRET }}
-          PVE4_TOKEN_ID: ${{ secrets.PVE4_TOKEN_ID }}
-          PVE4_SECRET: ${{ secrets.PVE4_SECRET }}
-          PVE5_TOKEN_ID: ${{ secrets.PVE5_TOKEN_ID }}
-          PVE5_SECRET: ${{ secrets.PVE5_SECRET }}
-          PVE6_TOKEN_ID: ${{ secrets.PVE6_TOKEN_ID }}
-          PVE6_SECRET: ${{ secrets.PVE6_SECRET }}
-          PVE7_TOKEN_ID: ${{ secrets.PVE7_TOKEN_ID }}
-          PVE7_SECRET: ${{ secrets.PVE7_SECRET }}
+          PVE_TOKEN_ID: ${{ env.PVE_TOKEN_ID }}
+          PVE_SECRET: ${{ env.PVE_SECRET }}
+          PVE2_TOKEN_ID: ${{ env.PVE2_TOKEN_ID }}
+          PVE2_SECRET: ${{ env.PVE2_SECRET }}
+          PVE3_TOKEN_ID: ${{ env.PVE3_TOKEN_ID }}
+          PVE3_SECRET: ${{ env.PVE3_SECRET }}
+          PVE4_TOKEN_ID: ${{ env.PVE4_TOKEN_ID }}
+          PVE4_SECRET: ${{ env.PVE4_SECRET }}
+          PVE5_TOKEN_ID: ${{ env.PVE5_TOKEN_ID }}
+          PVE5_SECRET: ${{ env.PVE5_SECRET }}
+          PVE6_TOKEN_ID: ${{ env.PVE6_TOKEN_ID }}
+          PVE6_SECRET: ${{ env.PVE6_SECRET }}
+          PVE7_TOKEN_ID: ${{ env.PVE7_TOKEN_ID }}
+          PVE7_SECRET: ${{ env.PVE7_SECRET }}
           # Deliberately bound to the manual input only: a scheduled run can
           # never fake the sentinel, it reboots what genuinely needs rebooting.
           FORCE_REBOOT_NODES: ${{ github.event_name == 'workflow_dispatch' && inputs.force_reboot_nodes || '' }}
@@ -199,7 +224,6 @@ jobs:
         with:
           ts-oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           ts-oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
-          kubeconfig: ${{ secrets.KUBECONFIG }}
           hostname: github-runner-k8s-reboot-report
 
       # Only worth doing when every node actually came back. After a failure
@@ -258,8 +282,25 @@ jobs:
         with:
           ts-oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           ts-oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
-          kubeconfig: ${{ secrets.KUBECONFIG }}
           hostname: github-runner-k8s-reboot-uncordon
+
+      # Secrets come from Vault (kv/ci/*), logged in through GitHub OIDC with
+      # the role below (gh_hdc vault/), so they're no longer GitHub secrets.
+      - name: Read secrets from Vault
+        uses: hashicorp/vault-action@892a26828f195e65540a40b4768ae4571f51ebfc  # v4.0.0
+        with:
+          url: https://vault.mfaherty.net
+          method: jwt
+          path: github-actions
+          role: public-jobs
+          jwtGithubAudience: https://vault.mfaherty.net
+          secrets: |
+            kv/data/ci/smtp EMAIL_FROM | EMAIL_FROM ;
+            kv/data/ci/smtp EMAIL_TO | EMAIL_TO ;
+            kv/data/ci/smtp SMTP_PASSWORD | SMTP_PASSWORD ;
+            kv/data/ci/smtp SMTP_PORT | SMTP_PORT ;
+            kv/data/ci/smtp SMTP_SERVER | SMTP_SERVER ;
+            kv/data/ci/smtp SMTP_USERNAME | SMTP_USERNAME
 
       - name: Uncordon anything this job left cordoned but healthy
         env:
@@ -288,13 +329,13 @@ jobs:
           || contains(needs.*.result, 'cancelled')
         uses: dawidd6/action-send-mail@67ce3558d613188179559c61d3565140cf389968 # v22
         with:
-          server_address: ${{ secrets.SMTP_SERVER }}
-          server_port: ${{ secrets.SMTP_PORT }}
-          username: ${{ secrets.SMTP_USERNAME }}
-          password: ${{ secrets.SMTP_PASSWORD }}
+          server_address: ${{ env.SMTP_SERVER }}
+          server_port: ${{ env.SMTP_PORT }}
+          username: ${{ env.SMTP_USERNAME }}
+          password: ${{ env.SMTP_PASSWORD }}
           subject: "[k8s] Rolling reboot ABORTED - cluster needs attention"
-          to: ${{ secrets.EMAIL_TO }}
-          from: ${{ secrets.EMAIL_FROM }}
+          to: ${{ env.EMAIL_TO }}
+          from: ${{ env.EMAIL_FROM }}
           body: |
             The nightly Kubernetes rolling reboot aborted.
 
