@@ -10,6 +10,7 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
+  id-token: write  # log in to Vault through GitHub OIDC
   contents: read
 
 jobs:
@@ -18,13 +19,6 @@ jobs:
     timeout-minutes: 90
 
     steps:
-      - name: Checkout gh_hdc
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-        with:
-          repository: mike12806/gh_hdc
-          token: ${{ secrets.GH_HDC_PAT }}
-          path: gh_hdc
-
       - name: Connect to Tailscale
         uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd  # v4.2.0
         with:
@@ -33,6 +27,29 @@ jobs:
           tags: tag:ci
           hostname: github-runner-docker-hosts-update
           version: latest
+
+      # Secrets come from Vault (kv/ci/*), logged in through GitHub OIDC with
+      # the role below (gh_hdc vault/), so they're no longer GitHub secrets.
+      - name: Read secrets from Vault
+        uses: hashicorp/vault-action@892a26828f195e65540a40b4768ae4571f51ebfc  # v4.0.0
+        with:
+          url: https://vault.mfaherty.net
+          method: jwt
+          path: github-actions
+          role: public-jobs
+          jwtGithubAudience: https://vault.mfaherty.net
+          secrets: |
+            kv/data/ci/github GH_HDC_PAT | GH_HDC_PAT ;
+            kv/data/ci/ssh ANSIBLE_SSH_PASSWORD_1 | ANSIBLE_SSH_PASSWORD_1 ;
+            kv/data/ci/ssh MIKESSHKEYLINODEPUB | MIKESSHKEYLINODEPUB ;
+            kv/data/ci/ssh MIKEYSSHKEYLINODE | MIKEYSSHKEYLINODE
+
+      - name: Checkout gh_hdc
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: mike12806/gh_hdc
+          token: ${{ env.GH_HDC_PAT }}
+          path: gh_hdc
 
       - name: Cache pipx and ansible
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
@@ -54,19 +71,19 @@ jobs:
 
       - name: Write SSH Private Key to File
         run: |
-          echo "${{ secrets.MIKEYSSHKEYLINODE }}" | sed 's/\\n/\n/g' > /tmp/mike_ssh_key
+          echo "${{ env.MIKEYSSHKEYLINODE }}" | sed 's/\\n/\n/g' > /tmp/mike_ssh_key
           chmod 600 /tmp/mike_ssh_key
 
       - name: Write SSH Public Key to File
         run: |
           mkdir -p ~/.ssh
-          echo "${{ secrets.MIKESSHKEYLINODEPUB }}" | sed 's/\\n/\n/g' >> ~/.ssh/authorized_keys
+          echo "${{ env.MIKESSHKEYLINODEPUB }}" | sed 's/\\n/\n/g' >> ~/.ssh/authorized_keys
           chmod 600 ~/.ssh/authorized_keys
 
       - name: Run Ansible Playbook
         working-directory: gh_hdc/ansible  # Correct path
         env:
-          ANSIBLE_SSH_PASS: ${{ secrets.ANSIBLE_SSH_PASSWORD_1 }}
+          ANSIBLE_SSH_PASS: ${{ env.ANSIBLE_SSH_PASSWORD_1 }}
           ANSIBLE_PYTHON_INTERPRETER: /usr/bin/python3
           ANSIBLE_GATHERING: smart
           ANSIBLE_TIMEOUT: 30

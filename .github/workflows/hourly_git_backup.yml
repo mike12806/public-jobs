@@ -6,28 +6,14 @@ on:
   workflow_dispatch:      # Allow manual trigger
 
 permissions:
+  id-token: write  # log in to Vault through GitHub OIDC
   contents: read
-
-env:
-  B2_APPLICATION_KEY_ID: ${{ secrets.B2_KEY_ID }}
-  B2_APPLICATION_KEY:    ${{ secrets.B2_APP_KEY }}
-  ENCRYPTION_KEY:        ${{ secrets.BACKUP_ENCRYPTION_KEY }}
-  PRIVATE_GIT_USERNAME:  ${{ secrets.PRIVATE_GIT_USERNAME }}
-  PRIVATE_GITHUB_TOKEN:  ${{ secrets.PRIVATE_GITHUB_TOKEN }}
-  PRIVATE_GIT_TOKEN:     ${{ secrets.PRIVATE_GIT_TOKEN }}
 
 jobs:
   backup:
     runs-on: ubuntu-24.04
 
     steps:
-      - name: Checkout gh_hdc
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-        with:
-          repository: mike12806/gh_hdc
-          token: ${{ secrets.GH_HDC_PAT }}
-          path: gh_hdc
-
       - name: Prefer IPv4 for Tailscale
         run: echo 'precedence ::ffff:0:0/96 100' | sudo tee -a /etc/gai.conf
 
@@ -39,6 +25,32 @@ jobs:
           tags: tag:ci
           hostname: github-runner-git-backup
           version: latest
+
+      # Secrets come from Vault (kv/ci/*), logged in through GitHub OIDC with
+      # the role below (gh_hdc vault/), so they're no longer GitHub secrets.
+      - name: Read secrets from Vault
+        uses: hashicorp/vault-action@892a26828f195e65540a40b4768ae4571f51ebfc  # v4.0.0
+        with:
+          url: https://vault.mfaherty.net
+          method: jwt
+          path: github-actions
+          role: public-jobs
+          jwtGithubAudience: https://vault.mfaherty.net
+          secrets: |
+            kv/data/ci/backup B2_APP_KEY | B2_APPLICATION_KEY ;
+            kv/data/ci/backup B2_KEY_ID | B2_APPLICATION_KEY_ID ;
+            kv/data/ci/backup BACKUP_ENCRYPTION_KEY | ENCRYPTION_KEY ;
+            kv/data/ci/github GH_HDC_PAT | GH_HDC_PAT ;
+            kv/data/ci/github PRIVATE_GITHUB_TOKEN | PRIVATE_GITHUB_TOKEN ;
+            kv/data/ci/github PRIVATE_GIT_TOKEN | PRIVATE_GIT_TOKEN ;
+            kv/data/ci/github PRIVATE_GIT_USERNAME | PRIVATE_GIT_USERNAME
+
+      - name: Checkout gh_hdc
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: mike12806/gh_hdc
+          token: ${{ env.GH_HDC_PAT }}
+          path: gh_hdc
 
       - name: Cache B2 CLI
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0

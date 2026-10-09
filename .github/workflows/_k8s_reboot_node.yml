@@ -41,6 +41,7 @@ on:
         default: 180
 
 permissions:
+  id-token: write  # log in to Vault through GitHub OIDC (here and in k8s-access)
   contents: read
 
 jobs:
@@ -57,27 +58,52 @@ jobs:
         with:
           ts-oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           ts-oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
-          kubeconfig: ${{ secrets.KUBECONFIG }}
           hostname: github-runner-k8s-reboot-${{ inputs.node }}
+
+      # Secrets come from Vault (kv/ci/*), logged in through GitHub OIDC with
+      # the role below (gh_hdc vault/), so they're no longer GitHub secrets.
+      - name: Read secrets from Vault
+        uses: hashicorp/vault-action@892a26828f195e65540a40b4768ae4571f51ebfc  # v4.0.0
+        with:
+          url: https://vault.mfaherty.net
+          method: jwt
+          path: github-actions
+          role: public-jobs
+          jwtGithubAudience: https://vault.mfaherty.net
+          secrets: |
+            kv/data/ci/proxmox PVE2_SECRET | PVE2_SECRET ;
+            kv/data/ci/proxmox PVE2_TOKEN_ID | PVE2_TOKEN_ID ;
+            kv/data/ci/proxmox PVE3_SECRET | PVE3_SECRET ;
+            kv/data/ci/proxmox PVE3_TOKEN_ID | PVE3_TOKEN_ID ;
+            kv/data/ci/proxmox PVE4_SECRET | PVE4_SECRET ;
+            kv/data/ci/proxmox PVE4_TOKEN_ID | PVE4_TOKEN_ID ;
+            kv/data/ci/proxmox PVE5_SECRET | PVE5_SECRET ;
+            kv/data/ci/proxmox PVE5_TOKEN_ID | PVE5_TOKEN_ID ;
+            kv/data/ci/proxmox PVE6_SECRET | PVE6_SECRET ;
+            kv/data/ci/proxmox PVE6_TOKEN_ID | PVE6_TOKEN_ID ;
+            kv/data/ci/proxmox PVE7_SECRET | PVE7_SECRET ;
+            kv/data/ci/proxmox PVE7_TOKEN_ID | PVE7_TOKEN_ID ;
+            kv/data/ci/proxmox PVE_SECRET | PVE_SECRET ;
+            kv/data/ci/proxmox PVE_TOKEN_ID | PVE_TOKEN_ID
 
       - name: Reboot ${{ inputs.node }}
         env:
           PVE_DOMAIN: mfaherty.net
           PVE_HOST_COUNT: "7"
-          PVE_TOKEN_ID: ${{ secrets.PVE_TOKEN_ID }}
-          PVE_SECRET: ${{ secrets.PVE_SECRET }}
-          PVE2_TOKEN_ID: ${{ secrets.PVE2_TOKEN_ID }}
-          PVE2_SECRET: ${{ secrets.PVE2_SECRET }}
-          PVE3_TOKEN_ID: ${{ secrets.PVE3_TOKEN_ID }}
-          PVE3_SECRET: ${{ secrets.PVE3_SECRET }}
-          PVE4_TOKEN_ID: ${{ secrets.PVE4_TOKEN_ID }}
-          PVE4_SECRET: ${{ secrets.PVE4_SECRET }}
-          PVE5_TOKEN_ID: ${{ secrets.PVE5_TOKEN_ID }}
-          PVE5_SECRET: ${{ secrets.PVE5_SECRET }}
-          PVE6_TOKEN_ID: ${{ secrets.PVE6_TOKEN_ID }}
-          PVE6_SECRET: ${{ secrets.PVE6_SECRET }}
-          PVE7_TOKEN_ID: ${{ secrets.PVE7_TOKEN_ID }}
-          PVE7_SECRET: ${{ secrets.PVE7_SECRET }}
+          PVE_TOKEN_ID: ${{ env.PVE_TOKEN_ID }}
+          PVE_SECRET: ${{ env.PVE_SECRET }}
+          PVE2_TOKEN_ID: ${{ env.PVE2_TOKEN_ID }}
+          PVE2_SECRET: ${{ env.PVE2_SECRET }}
+          PVE3_TOKEN_ID: ${{ env.PVE3_TOKEN_ID }}
+          PVE3_SECRET: ${{ env.PVE3_SECRET }}
+          PVE4_TOKEN_ID: ${{ env.PVE4_TOKEN_ID }}
+          PVE4_SECRET: ${{ env.PVE4_SECRET }}
+          PVE5_TOKEN_ID: ${{ env.PVE5_TOKEN_ID }}
+          PVE5_SECRET: ${{ env.PVE5_SECRET }}
+          PVE6_TOKEN_ID: ${{ env.PVE6_TOKEN_ID }}
+          PVE6_SECRET: ${{ env.PVE6_SECRET }}
+          PVE7_TOKEN_ID: ${{ env.PVE7_TOKEN_ID }}
+          PVE7_SECRET: ${{ env.PVE7_SECRET }}
           DRY_RUN: ${{ inputs.dry_run }}
           REBOOT_DEADLINE_UTC: ${{ inputs.deadline_utc }}
           FORCE_REBOOT_NODES: ${{ inputs.force_reboot_nodes }}

@@ -36,6 +36,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
+  id-token: write  # log in to Vault through GitHub OIDC
   contents: read
 
 jobs:
@@ -44,14 +45,6 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - name: Checkout gh_hdc
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-        with:
-          repository: mike12806/gh_hdc
-          ref: ${{ inputs.gh_hdc_ref || 'main' }}
-          token: ${{ secrets.GH_HDC_PAT }}
-          path: gh_hdc
-
       - name: Prefer IPv4 over IPv6
         run: |
           # Force IPv4 preference to avoid Tailscale IPv6 connectivity issues
@@ -65,6 +58,35 @@ jobs:
           tags: tag:ci
           hostname: github-runner-gslb
           version: latest
+
+      # Secrets come from Vault (kv/ci/*), logged in through GitHub OIDC with
+      # the role below (gh_hdc vault/), so they're no longer GitHub secrets.
+      - name: Read secrets from Vault
+        uses: hashicorp/vault-action@892a26828f195e65540a40b4768ae4571f51ebfc  # v4.0.0
+        with:
+          url: https://vault.mfaherty.net
+          method: jwt
+          path: github-actions
+          role: public-jobs
+          jwtGithubAudience: https://vault.mfaherty.net
+          secrets: |
+            kv/data/ci/github GH_HDC_PAT | GH_HDC_PAT ;
+            kv/data/ci/smtp EMAIL_FROM | EMAIL_FROM ;
+            kv/data/ci/smtp EMAIL_TO | EMAIL_TO ;
+            kv/data/ci/smtp SMTP_PASSWORD | SMTP_PASSWORD ;
+            kv/data/ci/smtp SMTP_PORT | SMTP_PORT ;
+            kv/data/ci/smtp SMTP_SERVER | SMTP_SERVER ;
+            kv/data/ci/smtp SMTP_USERNAME | SMTP_USERNAME ;
+            kv/data/ci/ssh ANSIBLE_SSH_PASSWORD_1 | ANSIBLE_SSH_PASSWORD_1 ;
+            kv/data/ci/ssh MIKEYSSHKEYLINODE | MIKEYSSHKEYLINODE
+
+      - name: Checkout gh_hdc
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: mike12806/gh_hdc
+          ref: ${{ inputs.gh_hdc_ref || 'main' }}
+          token: ${{ env.GH_HDC_PAT }}
+          path: gh_hdc
 
       - name: Cache pipx and ansible
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
@@ -86,7 +108,7 @@ jobs:
 
       - name: Write SSH Private Key to File
         env:
-          SSH_KEY: ${{ secrets.MIKEYSSHKEYLINODE }}
+          SSH_KEY: ${{ env.MIKEYSSHKEYLINODE }}
         run: |
           printf '%s\n' "$SSH_KEY" | sed 's/\\n/\n/g' > /tmp/mike_ssh_key
           chmod 600 /tmp/mike_ssh_key
@@ -95,7 +117,7 @@ jobs:
         id: playbook
         working-directory: gh_hdc/ansible
         env:
-          ANSIBLE_SSH_PASS: ${{ secrets.ANSIBLE_SSH_PASSWORD_1 }}
+          ANSIBLE_SSH_PASS: ${{ env.ANSIBLE_SSH_PASSWORD_1 }}
           ANSIBLE_PYTHON_INTERPRETER: /usr/bin/python3
           ANSIBLE_GATHERING: smart
           ANSIBLE_TIMEOUT: 30
@@ -160,14 +182,14 @@ jobs:
         if: always() && github.event_name == 'schedule' && steps.drift.outputs.subject != ''
         uses: dawidd6/action-send-mail@67ce3558d613188179559c61d3565140cf389968  # v22
         with:
-          server_address: ${{ secrets.SMTP_SERVER }}
-          server_port: ${{ secrets.SMTP_PORT }}
-          username: ${{ secrets.SMTP_USERNAME }}
-          password: ${{ secrets.SMTP_PASSWORD }}
+          server_address: ${{ env.SMTP_SERVER }}
+          server_port: ${{ env.SMTP_PORT }}
+          username: ${{ env.SMTP_USERNAME }}
+          password: ${{ env.SMTP_PASSWORD }}
           subject: ${{ steps.drift.outputs.subject }}
           body: file://${{ runner.temp }}/gslb_report.txt
-          to: ${{ secrets.EMAIL_TO }}
-          from: ${{ secrets.EMAIL_FROM }}
+          to: ${{ env.EMAIL_TO }}
+          from: ${{ env.EMAIL_FROM }}
 
       - name: Cleanup Temporary Files
         if: always()

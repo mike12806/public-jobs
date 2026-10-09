@@ -10,6 +10,7 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
+  id-token: write  # log in to Vault through GitHub OIDC
   contents: read
 
 jobs:
@@ -26,6 +27,20 @@ jobs:
           tags: tag:ci
           hostname: github-runner-tailscale-dns-sync
           version: latest
+
+      # Secrets come from Vault (kv/ci/*), logged in through GitHub OIDC with
+      # the role below (gh_hdc vault/), so they're no longer GitHub secrets.
+      - name: Read secrets from Vault
+        uses: hashicorp/vault-action@892a26828f195e65540a40b4768ae4571f51ebfc  # v4.0.0
+        with:
+          url: https://vault.mfaherty.net
+          method: jwt
+          path: github-actions
+          role: public-jobs
+          jwtGithubAudience: https://vault.mfaherty.net
+          secrets: |
+            kv/data/ci/pihole PRIMARY_PIHOLE_IP_AND_PORT | PRIMARY_PIHOLE_IP_AND_PORT ;
+            kv/data/ci/pihole PRIMARY_PIHOLE_TOKEN | PRIMARY_PIHOLE_TOKEN
 
       - name: Install dependencies
         run: |
@@ -99,8 +114,8 @@ jobs:
           DNS_RECORDS=$(echo "${{ steps.tailscale_dns.outputs.records }}" | base64 -d)
           
           # Pi-hole host and password
-          PIHOLE_HOST="${{ secrets.PRIMARY_PIHOLE_IP_AND_PORT }}"
-          PIHOLE_PASSWORD="${{ secrets.PRIMARY_PIHOLE_TOKEN }}"
+          PIHOLE_HOST="${{ env.PRIMARY_PIHOLE_IP_AND_PORT }}"
+          PIHOLE_PASSWORD="${{ env.PRIMARY_PIHOLE_TOKEN }}"
           
           echo "Authenticating with Pi-hole v6..."
           

@@ -10,6 +10,7 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
+  id-token: write  # log in to Vault through GitHub OIDC
   contents: read
 
 jobs:
@@ -18,14 +19,6 @@ jobs:
     timeout-minutes: 90
 
     steps:
-      - name: Checkout gh_hdc
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-        with:
-          repository: mike12806/gh_hdc
-          token: ${{ secrets.GH_HDC_PAT }}
-          path: gh_hdc
-          fetch-depth: 0
-
       - name: Connect to Tailscale
         uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd  # v4.2.0
         with:
@@ -34,6 +27,30 @@ jobs:
           tags: tag:ci
           hostname: github-runner-linode-backup
           version: latest
+
+      # Secrets come from Vault (kv/ci/*), logged in through GitHub OIDC with
+      # the role below (gh_hdc vault/), so they're no longer GitHub secrets.
+      - name: Read secrets from Vault
+        uses: hashicorp/vault-action@892a26828f195e65540a40b4768ae4571f51ebfc  # v4.0.0
+        with:
+          url: https://vault.mfaherty.net
+          method: jwt
+          path: github-actions
+          role: public-jobs
+          jwtGithubAudience: https://vault.mfaherty.net
+          secrets: |
+            kv/data/ci/github GH_HDC_PAT | GH_HDC_PAT ;
+            kv/data/ci/linode LINODE_CLI_TOKEN | LINODE_CLI_TOKEN ;
+            kv/data/ci/linode LINODE_ID_1 | LINODE_ID_1 ;
+            kv/data/ci/linode LINODE_ID_2 | LINODE_ID_2
+
+      - name: Checkout gh_hdc
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: mike12806/gh_hdc
+          token: ${{ env.GH_HDC_PAT }}
+          path: gh_hdc
+          fetch-depth: 0
 
       - name: Cache pipx and linode-cli
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
@@ -59,14 +76,14 @@ jobs:
           /bin/mkdir -p ~/.config/linode
           /bin/echo -e "[DEFAULT]\ntoken = $LINODE_CLI_TOKEN\nregion = us-east" > ~/.config/linode/linode-cli
         env:
-          LINODE_CLI_TOKEN: ${{ secrets.LINODE_CLI_TOKEN }}
+          LINODE_CLI_TOKEN: ${{ env.LINODE_CLI_TOKEN }}
 
       - name: Check Linode Backups
         run: |
           export PATH="$PATH:$HOME/.local/bin"
           # Get Linode IDs from secrets
-          LINODE_ID_1="${{ secrets.LINODE_ID_1 }}"
-          LINODE_ID_2="${{ secrets.LINODE_ID_2 }}"
+          LINODE_ID_1="${{ env.LINODE_ID_1 }}"
+          LINODE_ID_2="${{ env.LINODE_ID_2 }}"
 
           # Get current date minus 5 days (ISO format) using absolute path for date
           five_days_ago=$(/bin/date -d "-5 days" --iso-8601=seconds)
@@ -123,7 +140,7 @@ jobs:
             exit 0
           fi
         env:
-          LINODE_CLI_TOKEN: ${{ secrets.LINODE_CLI_TOKEN }}
+          LINODE_CLI_TOKEN: ${{ env.LINODE_CLI_TOKEN }}
 
       - name: Cleanup
         if: always()
