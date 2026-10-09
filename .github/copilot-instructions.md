@@ -326,10 +326,12 @@ spec:
 6. Add cleanup steps with `if: always()`
 
 ### Managing Secrets
-1. Store secret in HashiCorp Vault
-2. Update vault-sync-secrets workflow if needed
-3. Reference secret in Kubernetes manifests as needed
-4. Never commit plaintext secrets to Git
+1. Kubernetes Secrets: store the values in Vault at `kv/kubernetes/<namespace>/<name>`
+   and add an ExternalSecret under gh_hdc `kubernetes/external-secrets/secrets/<namespace>/`;
+   the External Secrets Operator keeps the Secret in sync (this repo no longer pushes Secrets)
+2. Workflow secrets: store them in Vault under `kv/ci/<group>` and read them with
+   `hashicorp/vault-action` through GitHub OIDC (role defined in gh_hdc `vault/github-roles/`)
+3. Never commit plaintext secrets to Git
 
 ## Troubleshooting
 
