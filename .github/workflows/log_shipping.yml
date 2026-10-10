@@ -1,0 +1,197 @@
+name: Log shipping
+
+# Runs gh_hdc's ansible/playbooks/playbook_log_shipping.yaml: Fluent Bit on
+# every LXC and Ubuntu VM (inventories non_docker_lxc,
+# non_kubernetes_ubuntu_vm_and_lxc and kubernetes_hosts) shipping the systemd
+# journal, Docker logs and Vault's audit log to log-ingest.mfaherty.net/v1/hosts
+# -> Redpanda -> Elasticsearch (ks-logstash-log, source:host).
+#
+#   - Nightly: dry run (--check). Emails a report if any host's Fluent Bit
+#     setup has drifted from gh_hdc (for example a new host in an inventory
+#     that isn't shipping yet), or if the run fails.
+#   - Manual: dry run unless "apply" is ticked.
+#
+# The ingest token comes from Vault (kv/kubernetes/logging/host-log-ingest).
+# This repo is public, so its logs are too: the playbook keeps the token out
+# of the output (no_log) and this runs without --diff.
+
+on:
+  schedule:
+    - cron: "37 8 * * *"  # 04:37 EDT, after the GSLB check
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: 'Apply changes (unticked = dry run with --check)'
+        type: boolean
+        default: false
+      gh_hdc_ref:
+        description: 'gh_hdc branch/ref to run the playbook from'
+        type: string
+        default: main
+
+concurrency:
+  group: log-shipping
+  cancel-in-progress: false
+
+permissions:
+  id-token: write  # log in to Vault through GitHub OIDC
+  contents: read
+
+jobs:
+  log-shipping:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Prefer IPv4 over IPv6
+        run: |
+          # Force IPv4 preference to avoid Tailscale IPv6 connectivity issues
+          echo 'precedence ::ffff:0:0/96 100' | sudo tee -a /etc/gai.conf
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd  # v4.2.0
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          hostname: github-runner-log-shipping
+          version: latest
+
+      # Secrets come from Vault (kv/ci/*), logged in through GitHub OIDC with
+      # the role below (gh_hdc vault/), so they're no longer GitHub secrets.
+      - name: Read secrets from Vault
+        uses: hashicorp/vault-action@892a26828f195e65540a40b4768ae4571f51ebfc  # v4.0.0
+        with:
+          url: https://vault.mfaherty.net
+          method: jwt
+          path: github-actions
+          role: public-jobs
+          jwtGithubAudience: https://vault.mfaherty.net
+          secrets: |
+            kv/data/ci/github GH_HDC_PAT | GH_HDC_PAT ;
+            kv/data/ci/smtp EMAIL_FROM | EMAIL_FROM ;
+            kv/data/ci/smtp EMAIL_TO | EMAIL_TO ;
+            kv/data/ci/smtp SMTP_PASSWORD | SMTP_PASSWORD ;
+            kv/data/ci/smtp SMTP_PORT | SMTP_PORT ;
+            kv/data/ci/smtp SMTP_SERVER | SMTP_SERVER ;
+            kv/data/ci/smtp SMTP_USERNAME | SMTP_USERNAME ;
+            kv/data/ci/ssh ANSIBLE_SSH_PASSWORD_1 | ANSIBLE_SSH_PASSWORD_1 ;
+            kv/data/ci/ssh MIKEYSSHKEYLINODE | MIKEYSSHKEYLINODE ;
+            kv/data/kubernetes/logging/host-log-ingest token | LOG_INGEST_TOKEN
+
+      - name: Checkout gh_hdc
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: mike12806/gh_hdc
+          ref: ${{ inputs.gh_hdc_ref || 'main' }}
+          token: ${{ env.GH_HDC_PAT }}
+          path: gh_hdc
+
+      - name: Cache pipx and ansible
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: |
+            ~/.local/bin
+            ~/.local/pipx
+          key: ${{ runner.os }}-pipx-ansible-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pipx-ansible-
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y python3-pip python3 python3-venv pipx sshpass openssh-client
+          pipx ensurepath
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Write SSH Private Key to File
+        env:
+          SSH_KEY: ${{ env.MIKEYSSHKEYLINODE }}
+        run: |
+          printf '%s\n' "$SSH_KEY" | sed 's/\\n/\n/g' > /tmp/mike_ssh_key
+          chmod 600 /tmp/mike_ssh_key
+
+      - name: Run Ansible Playbook
+        id: playbook
+        working-directory: gh_hdc/ansible
+        env:
+          ANSIBLE_SSH_PASS: ${{ env.ANSIBLE_SSH_PASSWORD_1 }}
+          ANSIBLE_PYTHON_INTERPRETER: /usr/bin/python3
+          ANSIBLE_GATHERING: smart
+          ANSIBLE_TIMEOUT: 30
+          ANSIBLE_STDOUT_CALLBACK: ansible.builtin.default
+          ANSIBLE_CALLBACK_RESULT_FORMAT: yaml
+          ANSIBLE_HOST_KEY_CHECKING: false
+          ANSIBLE_FORKS: 10
+          APPLY: ${{ github.event_name == 'workflow_dispatch' && inputs.apply }}
+        run: |
+          set -o pipefail
+          mode=(--check)
+          if [ "$APPLY" = "true" ]; then
+            mode=()
+            echo "::notice::Applying changes."
+          else
+            echo "::notice::Dry run (--check). Re-run with 'apply' ticked to make changes."
+          fi
+          pipx run --spec ansible ansible-playbook playbooks/playbook_log_shipping.yaml \
+            -i inventory/non_docker_lxc \
+            -i inventory/non_kubernetes_ubuntu_vm_and_lxc \
+            -i inventory/kubernetes_hosts \
+            -u root \
+            --private-key=/tmp/mike_ssh_key \
+            "${mode[@]}" \
+            --extra-vars "ansible_ssh_pass=${ANSIBLE_SSH_PASS} ansible_ssh_common_args='-o StrictHostKeyChecking=no'" \
+            | tee "$RUNNER_TEMP/log_shipping.log"
+
+      # In a dry run any changed=N > 0 in the recap means a host's Fluent Bit
+      # setup differs from gh_hdc (not installed yet, or config drifted).
+      - name: Check for drift
+        id: drift
+        if: always() && steps.playbook.outcome != 'skipped'
+        env:
+          APPLY: ${{ github.event_name == 'workflow_dispatch' && inputs.apply }}
+          OUTCOME: ${{ steps.playbook.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          log="$RUNNER_TEMP/log_shipping.log"
+          report="$RUNNER_TEMP/log_shipping_report.txt"
+          recap=$(sed -n '/^PLAY RECAP/,$p' "$log")
+          drifted=$(grep -E 'changed=[1-9]' <<<"$recap" | awk '{print $1}' | tr '\n' ' ')
+          failed=$(grep -E '(unreachable|failed)=[1-9]' <<<"$recap" | awk '{print $1}' | tr '\n' ' ')
+          if [ "$OUTCOME" = "failure" ]; then
+            {
+              echo "The log shipping playbook failed on: ${failed:-see the run}"
+              echo "Run: $RUN_URL"
+              echo
+              echo "$recap"
+            } > "$report"
+            echo "subject=❌ Log shipping playbook failed: ${failed}" >> "$GITHUB_OUTPUT"
+          elif [ "$APPLY" != "true" ] && [ -n "$drifted" ]; then
+            {
+              echo "These hosts' Fluent Bit setup differs from gh_hdc: $drifted"
+              echo "Apply with the 'Log shipping' workflow (tick apply)."
+              echo "Run: $RUN_URL"
+              echo
+              echo "$recap"
+            } > "$report"
+            echo "subject=⚠️ Log shipping drift: $drifted" >> "$GITHUB_OUTPUT"
+            echo "::warning::Drift on: $drifted"
+          fi
+
+      - name: Email the report
+        if: always() && github.event_name == 'schedule' && steps.drift.outputs.subject != ''
+        uses: dawidd6/action-send-mail@67ce3558d613188179559c61d3565140cf389968  # v22
+        with:
+          server_address: ${{ env.SMTP_SERVER }}
+          server_port: ${{ env.SMTP_PORT }}
+          username: ${{ env.SMTP_USERNAME }}
+          password: ${{ env.SMTP_PASSWORD }}
+          subject: ${{ steps.drift.outputs.subject }}
+          body: file://${{ runner.temp }}/log_shipping_report.txt
+          to: ${{ env.EMAIL_TO }}
+          from: ${{ env.EMAIL_FROM }}
+
+      - name: Cleanup Temporary Files
+        if: always()
+        run: |
+          rm -f /tmp/mike_ssh_key "$RUNNER_TEMP/log_shipping.log" "$RUNNER_TEMP/log_shipping_report.txt"
