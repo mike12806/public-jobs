@@ -1,8 +1,10 @@
 name: Log shipping
 
 # Runs gh_hdc's ansible/playbooks/playbook_log_shipping.yaml: Fluent Bit on
-# every LXC and Ubuntu VM (inventories non_docker_lxc,
-# non_kubernetes_ubuntu_vm_and_lxc and kubernetes_hosts) shipping the systemd
+# every LXC and Ubuntu VM (inventories non_docker_lxc and
+# non_kubernetes_ubuntu_vm_and_lxc; the Kubernetes nodes, kubernetes_hosts,
+# come once a day of real volume from these is measured, since kubelet and
+# containerd can be chatty) shipping the systemd
 # journal, Docker logs and Vault's audit log to log-ingest.mfaherty.net/v1/hosts
 # -> Redpanda -> Elasticsearch (ks-logstash-log, source:host).
 #
@@ -136,7 +138,6 @@ jobs:
           pipx run --spec ansible ansible-playbook playbooks/playbook_log_shipping.yaml \
             -i inventory/non_docker_lxc \
             -i inventory/non_kubernetes_ubuntu_vm_and_lxc \
-            -i inventory/kubernetes_hosts \
             -u root \
             --private-key=/tmp/mike_ssh_key \
             "${mode[@]}" \
