@@ -1,0 +1,58 @@
+name: Read secrets from Vault
+description: >-
+  Joins the tailnet as tag:ci-vault through Tailscale workload identity
+  federation (GitHub OIDC, no stored secret), reads the given secrets from
+  Vault with the caller's GitHub OIDC role, exports them as masked env vars,
+  then leaves the tailnet before any of the caller's own code runs.
+  tag:ci-vault reaches only Vault and the tailnet DNS resolvers (gh_hdc
+  kubernetes/tailscale-operator/tailscale.json, rule 1.7); the Vault role
+  (gh_hdc vault/github-roles/) decides what the run may read. Used by
+  gh_hdc and the Cloudflare Pages repos, so it lives in this public repo.
+  The calling job needs `permissions: id-token: write`.
+
+inputs:
+  role:
+    description: Vault GitHub-OIDC role (gh_hdc vault/github-roles/<role>.json).
+    required: true
+  secrets:
+    description: hashicorp/vault-action `secrets` lines, e.g. `kv/data/github/<repo>/cloudflare CF_API_TOKEN | CF_API_TOKEN ;`
+    required: true
+  hostname:
+    description: Tailscale hostname for this runner, so a node left behind is traceable.
+    required: false
+    default: github-runner-vault
+  tailscale-client-id:
+    description: Client ID of the tag:ci-vault trust credential (not a secret).
+    required: false
+    default: T9GJo4CXk621CNTRL-kek3ub1Mdr11CNTRL
+  tailscale-audience:
+    description: Audience of the tag:ci-vault trust credential (not a secret).
+    required: false
+    default: api.tailscale.com/T9GJo4CXk621CNTRL-kek3ub1Mdr11CNTRL
+
+runs:
+  using: composite
+  steps:
+    - name: Connect to Tailscale (tag:ci-vault)
+      uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd # v4.2.0
+      with:
+        oauth-client-id: ${{ inputs.tailscale-client-id }}
+        audience: ${{ inputs.tailscale-audience }}
+        tags: tag:ci-vault
+        hostname: ${{ inputs.hostname }}
+        version: latest
+
+    - name: Read secrets from Vault
+      uses: hashicorp/vault-action@892a26828f195e65540a40b4768ae4571f51ebfc # v4.0.0
+      with:
+        url: https://vault.mfaherty.net
+        method: jwt
+        path: github-actions
+        role: ${{ inputs.role }}
+        jwtGithubAudience: https://vault.mfaherty.net
+        secrets: ${{ inputs.secrets }}
+
+    # Off the tailnet before the caller installs and runs third-party code.
+    - name: Disconnect from Tailscale
+      shell: bash
+      run: sudo tailscale down && echo "Left the tailnet"
