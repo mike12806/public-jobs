@@ -159,28 +159,21 @@ spec:
 - Use concurrency groups to prevent conflicts
 
 #### Kubernetes Access Pattern
+Use the `k8s-access` composite action: it joins Tailscale, installs kubectl
+and writes the kubeconfig, read from Vault (`kv/ci/kubernetes`). The job needs
+`permissions: id-token: write`.
 ```yaml
-- name: Connect to Tailscale
-  uses: tailscale/github-action@v4
+- uses: ./.github/actions/k8s-access
   with:
-    oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
-    oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
-
-- name: Setup kubectl
-  uses: azure/setup-kubectl@v4
-
-- name: Set up kubeconfig
-  run: |
-    mkdir -p $HOME/.kube
-    base64 -d > $HOME/.kube/config << 'EOF'
-    ${{ secrets.KUBECONFIG }}
-    EOF
-    chmod 600 $HOME/.kube/config
+    ts-oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+    ts-oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
 ```
 
 #### Secret Handling
 - Never log secrets or sensitive output
-- Use GitHub secrets for all credentials
+- Credentials live in Vault and are read with `hashicorp/vault-action` through
+  GitHub OIDC (role in gh_hdc `vault/github-roles/`). The only GitHub secrets
+  are `TS_OAUTH_CLIENT_ID` / `TS_OAUTH_SECRET`, needed to reach Vault
 - Clear secrets from disk in cleanup steps
 - Use `if: always()` for cleanup steps
 
