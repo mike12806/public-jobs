@@ -1,10 +1,10 @@
 name: Log shipping
 
 # Runs gh_hdc's ansible/playbooks/playbook_log_shipping.yaml: Fluent Bit on
-# every LXC and Ubuntu VM (inventories non_docker_lxc and
-# non_kubernetes_ubuntu_vm_and_lxc; the Kubernetes nodes, kubernetes_hosts,
-# come once a day of real volume from these is measured, since kubelet and
-# containerd can be chatty) shipping the systemd
+# every LXC, Ubuntu VM, Kubernetes node and Proxmox host (inventories
+# non_docker_lxc, non_kubernetes_ubuntu_vm_and_lxc, kubernetes_hosts and
+# proxmox_hosts; Proxmox has its own SSH password, so it's a second pass)
+# shipping the systemd
 # journal, Docker logs and Vault's audit log to log-ingest.mfaherty.net/v1/hosts
 # -> Redpanda -> Elasticsearch (ks-logstash-log, source:host).
 #
@@ -78,6 +78,7 @@ jobs:
             kv/data/ci/smtp SMTP_SERVER | SMTP_SERVER ;
             kv/data/ci/smtp SMTP_USERNAME | SMTP_USERNAME ;
             kv/data/ci/ssh ANSIBLE_SSH_PASSWORD_1 | ANSIBLE_SSH_PASSWORD_1 ;
+            kv/data/ci/ssh ANSIBLE_SSH_PASSWORD_3 | ANSIBLE_SSH_PASSWORD_3 ;
             kv/data/ci/ssh MIKEYSSHKEYLINODE | MIKEYSSHKEYLINODE ;
             kv/data/kubernetes/logging/host-log-ingest token | LOG_INGEST_TOKEN
 
@@ -118,6 +119,7 @@ jobs:
         working-directory: gh_hdc/ansible
         env:
           ANSIBLE_SSH_PASS: ${{ env.ANSIBLE_SSH_PASSWORD_1 }}
+          PROXMOX_SSH_PASS: ${{ env.ANSIBLE_SSH_PASSWORD_3 }}
           ANSIBLE_PYTHON_INTERPRETER: /usr/bin/python3
           ANSIBLE_GATHERING: smart
           ANSIBLE_TIMEOUT: 30
@@ -135,14 +137,22 @@ jobs:
           else
             echo "::notice::Dry run (--check). Re-run with 'apply' ticked to make changes."
           fi
-          pipx run --spec ansible ansible-playbook playbooks/playbook_log_shipping.yaml \
-            -i inventory/non_docker_lxc \
-            -i inventory/non_kubernetes_ubuntu_vm_and_lxc \
-            -u root \
-            --private-key=/tmp/mike_ssh_key \
-            "${mode[@]}" \
-            --extra-vars "ansible_ssh_pass=${ANSIBLE_SSH_PASS} ansible_ssh_common_args='-o StrictHostKeyChecking=no'" \
-            | tee "$RUNNER_TEMP/log_shipping.log"
+          run() {
+            local pass=$1; shift
+            pipx run --spec ansible ansible-playbook playbooks/playbook_log_shipping.yaml \
+              "$@" \
+              -u root \
+              --private-key=/tmp/mike_ssh_key \
+              "${mode[@]}" \
+              --extra-vars "ansible_ssh_pass=${pass} ansible_ssh_common_args='-o StrictHostKeyChecking=no'"
+          }
+          # Both passes run even if the first fails; the step fails if either did.
+          rc=0
+          run "${ANSIBLE_SSH_PASS}" -i inventory/non_docker_lxc -i inventory/non_kubernetes_ubuntu_vm_and_lxc -i inventory/kubernetes_hosts \
+            | tee "$RUNNER_TEMP/log_shipping.log" || rc=1
+          run "${PROXMOX_SSH_PASS}" -i inventory/proxmox_hosts \
+            | tee -a "$RUNNER_TEMP/log_shipping.log" || rc=1
+          exit $rc
 
       # In a dry run any changed=N > 0 in the recap means a host's Fluent Bit
       # setup differs from gh_hdc (not installed yet, or config drifted).
@@ -156,7 +166,7 @@ jobs:
         run: |
           log="$RUNNER_TEMP/log_shipping.log"
           report="$RUNNER_TEMP/log_shipping_report.txt"
-          recap=$(sed -n '/^PLAY RECAP/,$p' "$log")
+          recap=$(awk '/^PLAY RECAP/{f=1; next} f && /^$/{f=0} f' "$log")
           drifted=$(grep -E 'changed=[1-9]' <<<"$recap" | awk '{print $1}' | tr '\n' ' ')
           failed=$(grep -E '(unreachable|failed)=[1-9]' <<<"$recap" | awk '{print $1}' | tr '\n' ' ')
           if [ "$OUTCOME" = "failure" ]; then
