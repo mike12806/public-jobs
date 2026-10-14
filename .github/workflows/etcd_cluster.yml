@@ -1,0 +1,242 @@
+name: etcd cluster
+
+# Runs gh_hdc's ansible/playbooks/playbook_etcd_cluster.yaml: the 5-member
+# etcd cluster on Proxmox LXCs that will be the k3s datastore (gh_hdc
+# ansible/inventory/etcd_hosts). Creates the missing containers (fixed MACs,
+# addresses reserved in UniFi), installs etcd, keeps the members'
+# certificates current, and bootstraps, joins or restarts members one at a
+# time without losing quorum. See the playbooks' headers.
+#
+#   - Nightly: dry run (--check). Emails a report if anything would change
+#     (a missing or stopped member, config drift, a certificate due for
+#     renewal) or if the run fails (for example a member unhealthy).
+#   - Manual: dry run unless "apply" is ticked.
+#
+# Runs on a GitHub-hosted runner and reaches the LAN through Tailscale, so it
+# works with the Kubernetes cluster down: that's the cluster this datastore
+# serves. For the same reason it reaches the Proxmox APIs by IP (the playbook
+# defaults; the pveN names go through the k8s gateway) and pins
+# vault.mfaherty.net to the GSLB VIP instead of resolving it through the
+# LAN's DNS.
+#
+# This repo is public, so its logs are too. The playbook keeps the Proxmox
+# tokens and the CA key out of the output (no_log); no --diff.
+
+on:
+  schedule:
+    - cron: "47 8 * * *"  # 04:47 EDT
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: 'Apply changes (unticked = dry run with --check)'
+        type: boolean
+        default: false
+      gh_hdc_ref:
+        description: 'gh_hdc branch/ref to run the playbook from'
+        type: string
+        default: main
+
+concurrency:
+  group: etcd_cluster
+  cancel-in-progress: false
+
+permissions:
+  id-token: write  # log in to Vault through GitHub OIDC
+  contents: read
+
+jobs:
+  etcd-cluster:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Prefer IPv4 over IPv6
+        run: |
+          # Force IPv4 preference to avoid Tailscale IPv6 connectivity issues
+          echo 'precedence ::ffff:0:0/96 100' | sudo tee -a /etc/gai.conf
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd  # v4.2.0
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          hostname: github-runner-etcd-cluster
+          version: latest
+
+      # vault.mfaherty.net is only in the LAN's DNS (Pi-hole), which partly
+      # runs on Kubernetes. The GSLB VIP's HAProxy passes TLS through to Vault,
+      # so the certificate is still checked against the name.
+      - name: Pin vault.mfaherty.net to the GSLB VIP
+        run: echo '192.168.1.113 vault.mfaherty.net' | sudo tee -a /etc/hosts
+
+      # Secrets come from Vault (kv/ci/*), logged in through GitHub OIDC with
+      # the role below (gh_hdc vault/), so they're no longer GitHub secrets.
+      - name: Read secrets from Vault
+        uses: hashicorp/vault-action@892a26828f195e65540a40b4768ae4571f51ebfc  # v4.0.0
+        with:
+          url: https://vault.mfaherty.net
+          method: jwt
+          path: github-actions
+          role: public-jobs
+          jwtGithubAudience: https://vault.mfaherty.net
+          secrets: |
+            kv/data/ci/github GH_HDC_PAT | GH_HDC_PAT ;
+            kv/data/ci/proxmox PVE2_SECRET | PVE2_SECRET ;
+            kv/data/ci/proxmox PVE2_TOKEN_ID | PVE2_TOKEN_ID ;
+            kv/data/ci/proxmox PVE3_SECRET | PVE3_SECRET ;
+            kv/data/ci/proxmox PVE3_TOKEN_ID | PVE3_TOKEN_ID ;
+            kv/data/ci/proxmox PVE4_SECRET | PVE4_SECRET ;
+            kv/data/ci/proxmox PVE4_TOKEN_ID | PVE4_TOKEN_ID ;
+            kv/data/ci/proxmox PVE5_SECRET | PVE5_SECRET ;
+            kv/data/ci/proxmox PVE5_TOKEN_ID | PVE5_TOKEN_ID ;
+            kv/data/ci/proxmox PVE6_SECRET | PVE6_SECRET ;
+            kv/data/ci/proxmox PVE6_TOKEN_ID | PVE6_TOKEN_ID ;
+            kv/data/ci/proxmox PVE7_SECRET | PVE7_SECRET ;
+            kv/data/ci/proxmox PVE7_TOKEN_ID | PVE7_TOKEN_ID ;
+            kv/data/ci/proxmox PVE_SECRET | PVE_SECRET ;
+            kv/data/ci/proxmox PVE_TOKEN_ID | PVE_TOKEN_ID ;
+            kv/data/ci/smtp EMAIL_FROM | EMAIL_FROM ;
+            kv/data/ci/smtp EMAIL_TO | EMAIL_TO ;
+            kv/data/ci/smtp SMTP_PASSWORD | SMTP_PASSWORD ;
+            kv/data/ci/smtp SMTP_PORT | SMTP_PORT ;
+            kv/data/ci/smtp SMTP_SERVER | SMTP_SERVER ;
+            kv/data/ci/smtp SMTP_USERNAME | SMTP_USERNAME ;
+            kv/data/ci/ssh ANSIBLE_SSH_PASSWORD_1 | ANSIBLE_SSH_PASSWORD_1 ;
+            kv/data/ci/ssh MIKEYSSHKEYLINODE | MIKEYSSHKEYLINODE
+
+      - name: Checkout gh_hdc
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: mike12806/gh_hdc
+          ref: ${{ inputs.gh_hdc_ref || 'main' }}
+          token: ${{ env.GH_HDC_PAT }}
+          path: gh_hdc
+
+      - name: Cache pipx and ansible
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: |
+            ~/.local/bin
+            ~/.local/pipx
+          key: ${{ runner.os }}-pipx-ansible-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pipx-ansible-
+
+      # iputils-ping: the playbook pings a new member's address before
+      # creating it, to catch a device still holding that lease.
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y python3-pip python3 python3-venv pipx sshpass openssh-client iputils-ping
+          pipx ensurepath
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      # New containers get this key's public half as root's authorized key.
+      - name: Write SSH Private Key to File
+        env:
+          SSH_KEY: ${{ env.MIKEYSSHKEYLINODE }}
+        run: |
+          printf '%s\n' "$SSH_KEY" | sed 's/\\n/\n/g' > /tmp/mike_ssh_key
+          chmod 600 /tmp/mike_ssh_key
+
+      - name: Run Ansible Playbook
+        id: playbook
+        working-directory: gh_hdc/ansible
+        env:
+          ANSIBLE_SSH_PASS: ${{ env.ANSIBLE_SSH_PASSWORD_1 }}
+          ANSIBLE_PRIVATE_KEY_FILE: /tmp/mike_ssh_key
+          ANSIBLE_PYTHON_INTERPRETER: /usr/bin/python3
+          ANSIBLE_GATHERING: smart
+          ANSIBLE_TIMEOUT: 30
+          ANSIBLE_STDOUT_CALLBACK: ansible.builtin.default
+          ANSIBLE_CALLBACK_RESULT_FORMAT: yaml
+          ANSIBLE_HOST_KEY_CHECKING: false
+          # Same per-host Proxmox API tokens as vault_cluster.yml. Endpoints
+          # come from the playbook (the hosts' IPs).
+          PVE_HOST_COUNT: "7"
+          PVE_TOKEN_ID: ${{ env.PVE_TOKEN_ID }}
+          PVE_SECRET: ${{ env.PVE_SECRET }}
+          PVE2_TOKEN_ID: ${{ env.PVE2_TOKEN_ID }}
+          PVE2_SECRET: ${{ env.PVE2_SECRET }}
+          PVE3_TOKEN_ID: ${{ env.PVE3_TOKEN_ID }}
+          PVE3_SECRET: ${{ env.PVE3_SECRET }}
+          PVE4_TOKEN_ID: ${{ env.PVE4_TOKEN_ID }}
+          PVE4_SECRET: ${{ env.PVE4_SECRET }}
+          PVE5_TOKEN_ID: ${{ env.PVE5_TOKEN_ID }}
+          PVE5_SECRET: ${{ env.PVE5_SECRET }}
+          PVE6_TOKEN_ID: ${{ env.PVE6_TOKEN_ID }}
+          PVE6_SECRET: ${{ env.PVE6_SECRET }}
+          PVE7_TOKEN_ID: ${{ env.PVE7_TOKEN_ID }}
+          PVE7_SECRET: ${{ env.PVE7_SECRET }}
+          APPLY: ${{ github.event_name == 'workflow_dispatch' && inputs.apply }}
+        run: |
+          set -o pipefail
+          mode=(--check)
+          if [ "$APPLY" = "true" ]; then
+            mode=()
+            echo "::notice::Applying changes."
+          else
+            echo "::notice::Dry run (--check). Re-run with 'apply' ticked to make changes."
+          fi
+          pipx run --spec ansible ansible-playbook playbooks/playbook_etcd_cluster.yaml \
+            -i inventory/etcd_hosts \
+            -u root \
+            --private-key=/tmp/mike_ssh_key \
+            "${mode[@]}" \
+            --extra-vars "ansible_ssh_pass=${ANSIBLE_SSH_PASS} ansible_ssh_common_args='-o StrictHostKeyChecking=no'" \
+            | tee "$RUNNER_TEMP/etcd.log"
+
+      # In a dry run the playbook counts only what it would change, so any
+      # changed=N > 0 in the recap is drift from gh_hdc.
+      - name: Check for drift
+        id: drift
+        if: always() && steps.playbook.outcome != 'skipped'
+        env:
+          APPLY: ${{ github.event_name == 'workflow_dispatch' && inputs.apply }}
+          OUTCOME: ${{ steps.playbook.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          log="$RUNNER_TEMP/etcd.log"
+          report="$RUNNER_TEMP/etcd_report.txt"
+          drifted=$(sed -n '/^PLAY RECAP/,$p' "$log" | grep -oE '^(etcd-[0-9]+|localhost) .*changed=[1-9][0-9]*' | awk '{print $1}' | sort -u | tr '\n' ' ')
+          if [ "$OUTCOME" = "failure" ]; then
+            {
+              echo "The etcd cluster playbook run failed. Nothing was changed by a dry run."
+              echo "Run: $RUN_URL"
+              echo
+              tail -n 80 "$log"
+            } > "$report"
+            echo "subject=❌ etcd cluster playbook failed" >> "$GITHUB_OUTPUT"
+          elif [ "$APPLY" != "true" ] && [ -n "$drifted" ]; then
+            {
+              echo "The etcd cluster differs from gh_hdc on: $drifted"
+              echo "Apply with the 'etcd cluster' workflow (tick apply), or update gh_hdc if the change is wanted."
+              echo "Run: $RUN_URL"
+              echo
+              echo "What would change:"
+              grep -E '(would|Would) ' "$log" | sed 's/^ *//' | sort -u
+              echo
+              sed -n '/^PLAY RECAP/,$p' "$log"
+            } > "$report"
+            echo "subject=⚠️ etcd cluster drift: $drifted" >> "$GITHUB_OUTPUT"
+            echo "::warning::Drift on: $drifted"
+          fi
+
+      - name: Email the report
+        if: always() && github.event_name == 'schedule' && steps.drift.outputs.subject != ''
+        uses: dawidd6/action-send-mail@67ce3558d613188179559c61d3565140cf389968  # v22
+        with:
+          server_address: ${{ env.SMTP_SERVER }}
+          server_port: ${{ env.SMTP_PORT }}
+          username: ${{ env.SMTP_USERNAME }}
+          password: ${{ env.SMTP_PASSWORD }}
+          subject: ${{ steps.drift.outputs.subject }}
+          body: file://${{ runner.temp }}/etcd_report.txt
+          to: ${{ env.EMAIL_TO }}
+          from: ${{ env.EMAIL_FROM }}
+
+      - name: Cleanup Temporary Files
+        if: always()
+        run: |
+          rm -f /tmp/mike_ssh_key "$RUNNER_TEMP/etcd.log" "$RUNNER_TEMP/etcd_report.txt"
