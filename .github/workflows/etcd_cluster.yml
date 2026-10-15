@@ -10,7 +10,9 @@ name: etcd cluster
 #   - Nightly: dry run (--check). Emails a report if anything would change
 #     (a missing or stopped member, config drift, a certificate due for
 #     renewal) or if the run fails (for example a member unhealthy).
-#   - Manual: dry run unless "apply" is ticked.
+#   - Manual: dry run unless "apply" is ticked. "reset_empty_cluster" =
+#     RESET (with apply) wipes and re-bootstraps the members, with a new CA;
+#     the playbook refuses unless the cluster holds no keys at all.
 #
 # Runs on a GitHub-hosted runner and reaches the LAN through Tailscale, so it
 # works with the Kubernetes cluster down: that's the cluster this datastore
@@ -31,6 +33,10 @@ on:
         description: 'Apply changes (unticked = dry run with --check)'
         type: boolean
         default: false
+      reset_empty_cluster:
+        description: 'Type RESET (with apply) to wipe and re-bootstrap the cluster; refused unless it holds no keys'
+        type: string
+        default: ''
       gh_hdc_ref:
         description: 'gh_hdc branch/ref to run the playbook from'
         type: string
@@ -170,12 +176,22 @@ jobs:
           PVE7_TOKEN_ID: ${{ env.PVE7_TOKEN_ID }}
           PVE7_SECRET: ${{ env.PVE7_SECRET }}
           APPLY: ${{ github.event_name == 'workflow_dispatch' && inputs.apply }}
+          RESET: ${{ github.event_name == 'workflow_dispatch' && inputs.reset_empty_cluster || '' }}
         run: |
           set -o pipefail
           mode=(--check)
+          if [ -n "$RESET" ] && [ "$RESET" != "RESET" ]; then
+            echo "::error::reset_empty_cluster must be exactly RESET (or empty)."
+            exit 1
+          fi
           if [ "$APPLY" = "true" ]; then
             mode=()
-            echo "::notice::Applying changes."
+            if [ "$RESET" = "RESET" ]; then
+              mode=(-e etcd_reset_empty_cluster=RESET)
+              echo "::notice::Applying with a reset of the (empty) cluster."
+            else
+              echo "::notice::Applying changes."
+            fi
           else
             echo "::notice::Dry run (--check). Re-run with 'apply' ticked to make changes."
           fi
