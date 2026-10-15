@@ -9,7 +9,12 @@ name: etcd cluster
 #
 #   - Nightly: dry run (--check). Emails a report if anything would change
 #     (a missing or stopped member, config drift, a certificate due for
-#     renewal) or if the run fails (for example a member unhealthy).
+#     renewal) or if the run fails (for example a member unhealthy, or the
+#     newest backup in B2 older than 3 hours).
+#
+# The B2 backup bucket, key and restic password come from Vault
+# kv/ci/etcd-backup (made by ~/etcd-backup-to-vault.sh); the playbook writes
+# them to the members root-only, never to the log.
 #   - Manual: dry run unless "apply" is ticked. "reset_empty_cluster" =
 #     RESET (with apply) wipes and re-bootstraps the members, with a new CA;
 #     the playbook refuses unless the cluster holds no keys at all.
@@ -88,6 +93,11 @@ jobs:
           jwtGithubAudience: https://vault.mfaherty.net
           secrets: |
             kv/data/ci/github GH_HDC_PAT | GH_HDC_PAT ;
+            kv/data/ci/etcd-backup ACCESS_KEY_ID | ETCD_BACKUP_ACCESS_KEY_ID ;
+            kv/data/ci/etcd-backup SECRET_ACCESS_KEY | ETCD_BACKUP_SECRET_ACCESS_KEY ;
+            kv/data/ci/etcd-backup BUCKET | ETCD_BACKUP_BUCKET ;
+            kv/data/ci/etcd-backup ENDPOINT | ETCD_BACKUP_ENDPOINT ;
+            kv/data/ci/etcd-backup RESTIC_PASSWORD | ETCD_BACKUP_RESTIC_PASSWORD ;
             kv/data/ci/proxmox PVE2_SECRET | PVE2_SECRET ;
             kv/data/ci/proxmox PVE2_TOKEN_ID | PVE2_TOKEN_ID ;
             kv/data/ci/proxmox PVE3_SECRET | PVE3_SECRET ;
