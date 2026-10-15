@@ -10,10 +10,10 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
+  id-token: write  # log in to Vault through GitHub OIDC
   contents: read
 
 env:
-  VAULT_ADDR: https://vault.mfaherty.net
   RESTIC_REPO_PATH: etcd-k3s
   MAX_AGE_HOURS: 3
 
@@ -23,6 +23,11 @@ jobs:
     timeout-minutes: 20
 
     steps:
+      - name: Prefer IPv4 over IPv6
+        run: |
+          # Force IPv4 preference to avoid Tailscale IPv6 connectivity issues
+          echo 'precedence ::ffff:0:0/96 100' | sudo tee -a /etc/gai.conf
+
       - name: Connect to Tailscale
         uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd  # v4.2.0
         with:
@@ -32,37 +37,40 @@ jobs:
           hostname: github-runner-etcd-backup-checker
           version: latest
 
+      # vault.mfaherty.net is only in the LAN's DNS (Pi-hole), which partly
+      # runs on Kubernetes. The GSLB VIP's HAProxy passes TLS through to Vault,
+      # so the certificate is still checked against the name.
+      - name: Pin vault.mfaherty.net to the GSLB VIP
+        run: echo '192.168.1.113 vault.mfaherty.net' | sudo tee -a /etc/hosts
+
+      # Secrets come from Vault (kv/ci/*), logged in through GitHub OIDC with
+      # the role below (gh_hdc vault/), so they're not GitHub secrets.
+      - name: Read secrets from Vault
+        uses: hashicorp/vault-action@892a26828f195e65540a40b4768ae4571f51ebfc  # v4.0.0
+        with:
+          url: https://vault.mfaherty.net
+          method: jwt
+          path: github-actions
+          role: public-jobs
+          jwtGithubAudience: https://vault.mfaherty.net
+          secrets: |
+            kv/data/ci/etcd-backup ACCESS_KEY_ID | AWS_ACCESS_KEY_ID ;
+            kv/data/ci/etcd-backup SECRET_ACCESS_KEY | AWS_SECRET_ACCESS_KEY ;
+            kv/data/ci/etcd-backup BUCKET | ETCD_BACKUP_BUCKET ;
+            kv/data/ci/etcd-backup ENDPOINT | ETCD_BACKUP_ENDPOINT ;
+            kv/data/ci/etcd-backup RESTIC_PASSWORD | RESTIC_PASSWORD ;
+            kv/data/ci/smtp EMAIL_FROM | EMAIL_FROM ;
+            kv/data/ci/smtp EMAIL_TO | EMAIL_TO ;
+            kv/data/ci/smtp SMTP_PASSWORD | SMTP_PASSWORD ;
+            kv/data/ci/smtp SMTP_PORT | SMTP_PORT ;
+            kv/data/ci/smtp SMTP_SERVER | SMTP_SERVER ;
+            kv/data/ci/smtp SMTP_USERNAME | SMTP_USERNAME
+
       - name: Install dependencies
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y jq curl restic
-
-      - name: Fetch etcd backup credentials from Vault
-        env:
-          VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
-        run: |
-          set -euo pipefail
-          vault_response=$(curl -sSL \
-            --header "X-Vault-Token: $VAULT_TOKEN" \
-            "$VAULT_ADDR/v1/kv/data/ci/etcd-backup")
-
-          if ! echo "$vault_response" | jq -e '.data.data.ACCESS_KEY_ID' > /dev/null 2>&1; then
-            echo "❌ Failed to fetch kv/ci/etcd-backup from Vault"
-            exit 1
-          fi
-
-          for key in ACCESS_KEY_ID SECRET_ACCESS_KEY RESTIC_PASSWORD; do
-            echo "::add-mask::$(echo "$vault_response" | jq -r ".data.data.$key")"
-          done
-
-          BUCKET=$(echo "$vault_response" | jq -r '.data.data.BUCKET')
-          ENDPOINT=$(echo "$vault_response" | jq -r '.data.data.ENDPOINT')
-          {
-            echo "AWS_ACCESS_KEY_ID=$(echo "$vault_response" | jq -r '.data.data.ACCESS_KEY_ID')"
-            echo "AWS_SECRET_ACCESS_KEY=$(echo "$vault_response" | jq -r '.data.data.SECRET_ACCESS_KEY')"
-            echo "RESTIC_PASSWORD=$(echo "$vault_response" | jq -r '.data.data.RESTIC_PASSWORD')"
-            echo "RESTIC_REPOSITORY=s3:https://${ENDPOINT}/${BUCKET}/${RESTIC_REPO_PATH}"
-          } >> "$GITHUB_ENV"
+          sudo apt-get install -y jq restic
+          echo "RESTIC_REPOSITORY=s3:https://${ETCD_BACKUP_ENDPOINT}/${ETCD_BACKUP_BUCKET}/${RESTIC_REPO_PATH}" >> "$GITHUB_ENV"
 
       - name: Check latest etcd snapshot
         id: check_etcd
@@ -110,13 +118,15 @@ jobs:
           echo "✅ Repo integrity check passed"
 
       - name: Send email on failure
-        if: failure()
-        uses: dawidd6/action-send-mail@d38f3f7cd391cdebfe0d38efc3998b935e951c4f  # v16
+        # Needs the SMTP settings from Vault, so a failure to read Vault
+        # itself only shows up as GitHub's own failed-run notification.
+        if: failure() && env.SMTP_SERVER != ''
+        uses: dawidd6/action-send-mail@67ce3558d613188179559c61d3565140cf389968  # v22
         with:
-          server_address: ${{ secrets.SMTP_SERVER }}
-          server_port: ${{ secrets.SMTP_PORT }}
-          username: ${{ secrets.SMTP_USERNAME }}
-          password: ${{ secrets.SMTP_PASSWORD }}
+          server_address: ${{ env.SMTP_SERVER }}
+          server_port: ${{ env.SMTP_PORT }}
+          username: ${{ env.SMTP_USERNAME }}
+          password: ${{ env.SMTP_PASSWORD }}
           subject: "❌ etcd Backup Check Failed"
           body: |
             etcd backup check failed for B2 restic repo (${{ env.RESTIC_REPO_PATH }}).
@@ -126,8 +136,8 @@ jobs:
             If no error is shown above, an earlier step failed (Tailscale, Vault, or dependency install).
 
             Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          to: ${{ secrets.EMAIL_TO }}
-          from: ${{ secrets.EMAIL_FROM }}
+          to: ${{ env.EMAIL_TO }}
+          from: ${{ env.EMAIL_FROM }}
 
       - name: Cleanup
         if: always()
