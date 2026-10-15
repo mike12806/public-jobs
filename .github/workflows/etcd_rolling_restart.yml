@@ -1,0 +1,191 @@
+name: etcd Rolling Restart
+
+# Runs gh_hdc's ansible/playbooks/playbook_etcd_rolling_restart.yaml against
+# the etcd LXCs (gh_hdc ansible/inventory/etcd_hosts): reboots only members
+# that need it (reboot-required, or processes on replaced libraries after the
+# hourly updates), one at a time, only while every member is healthy, handing
+# off leadership first and waiting for each to catch up before the next. Stops
+# at the first member that doesn't come back cleanly. See the playbook header.
+#
+# Like etcd_cluster.yml it runs on a GitHub-hosted runner over Tailscale, so it
+# doesn't depend on the Kubernetes cluster this datastore serves, and pins
+# vault.mfaherty.net to the GSLB VIP rather than the LAN's DNS.
+#
+# Shares etcd_cluster.yml's concurrency group, so it never overlaps that
+# playbook (which also restarts members). Saturday 10:23 UTC (06:23 EDT) is
+# clear of the nightly etcd_cluster dry run (08:47 UTC), the members' defrag
+# timers (03:15 local) and the k8s rolling reboot's start window (05:00-09:00
+# UTC).
+#
+# Manual runs are dry runs (--check) unless "apply" is ticked. force_members
+# ("all" or "etcd-2,etcd-4") reboots those regardless of need, to rehearse.
+
+on:
+  schedule:
+    - cron: "23 10 * * 6"
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: 'Reboot for real (unticked = dry run with --check)'
+        type: boolean
+        default: false
+      force_members:
+        description: "Reboot these regardless of need: 'all' or e.g. 'etcd-2,etcd-4'. Blank = only members that need it"
+        type: string
+        default: ''
+      gh_hdc_ref:
+        description: 'gh_hdc branch/ref to run the playbook from'
+        type: string
+        default: main
+
+concurrency:
+  group: etcd_cluster
+  cancel-in-progress: false  # never interrupt a member mid-reboot
+
+permissions:
+  id-token: write  # log in to Vault through GitHub OIDC
+  contents: read
+
+jobs:
+  etcd-rolling-restart:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Prefer IPv4 over IPv6
+        run: |
+          # Force IPv4 preference to avoid Tailscale IPv6 connectivity issues
+          echo 'precedence ::ffff:0:0/96 100' | sudo tee -a /etc/gai.conf
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd  # v4.2.0
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          hostname: github-runner-etcd-rolling-restart
+          version: latest
+
+      - name: Pin vault.mfaherty.net to the GSLB VIP
+        run: echo '192.168.1.113 vault.mfaherty.net' | sudo tee -a /etc/hosts
+
+      # Secrets come from Vault (kv/ci/*), logged in through GitHub OIDC with
+      # the role below (gh_hdc vault/), so they're no longer GitHub secrets.
+      - name: Read secrets from Vault
+        uses: hashicorp/vault-action@892a26828f195e65540a40b4768ae4571f51ebfc  # v4.0.0
+        with:
+          url: https://vault.mfaherty.net
+          method: jwt
+          path: github-actions
+          role: public-jobs
+          jwtGithubAudience: https://vault.mfaherty.net
+          secrets: |
+            kv/data/ci/github GH_HDC_PAT | GH_HDC_PAT ;
+            kv/data/ci/smtp EMAIL_FROM | EMAIL_FROM ;
+            kv/data/ci/smtp EMAIL_TO | EMAIL_TO ;
+            kv/data/ci/smtp SMTP_PASSWORD | SMTP_PASSWORD ;
+            kv/data/ci/smtp SMTP_PORT | SMTP_PORT ;
+            kv/data/ci/smtp SMTP_SERVER | SMTP_SERVER ;
+            kv/data/ci/smtp SMTP_USERNAME | SMTP_USERNAME ;
+            kv/data/ci/ssh ANSIBLE_SSH_PASSWORD_1 | ANSIBLE_SSH_PASSWORD_1 ;
+            kv/data/ci/ssh MIKEYSSHKEYLINODE | MIKEYSSHKEYLINODE
+
+      - name: Checkout gh_hdc
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: mike12806/gh_hdc
+          ref: ${{ inputs.gh_hdc_ref || 'main' }}
+          token: ${{ env.GH_HDC_PAT }}
+          path: gh_hdc
+
+      - name: Cache pipx and ansible
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: |
+            ~/.local/bin
+            ~/.local/pipx
+          key: ${{ runner.os }}-pipx-ansible-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pipx-ansible-
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y python3-pip python3 python3-venv pipx sshpass openssh-client
+          pipx ensurepath
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Write SSH Private Key to File
+        env:
+          SSH_KEY: ${{ env.MIKEYSSHKEYLINODE }}
+        run: |
+          printf '%s\n' "$SSH_KEY" | sed 's/\\n/\n/g' > /tmp/mike_ssh_key
+          chmod 600 /tmp/mike_ssh_key
+
+      - name: Run Ansible Playbook
+        id: playbook
+        working-directory: gh_hdc/ansible
+        env:
+          ANSIBLE_SSH_PASS: ${{ env.ANSIBLE_SSH_PASSWORD_1 }}
+          ANSIBLE_PRIVATE_KEY_FILE: /tmp/mike_ssh_key
+          ANSIBLE_PYTHON_INTERPRETER: /usr/bin/python3
+          ANSIBLE_GATHERING: smart
+          ANSIBLE_TIMEOUT: 30
+          ANSIBLE_STDOUT_CALLBACK: ansible.builtin.default
+          ANSIBLE_CALLBACK_RESULT_FORMAT: yaml
+          ANSIBLE_HOST_KEY_CHECKING: false
+          # A scheduled run is always live and never forced; a manual one is a
+          # dry run unless "apply" is ticked.
+          LIVE: ${{ github.event_name == 'schedule' || inputs.apply }}
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force_members || '' }}
+        run: |
+          set -o pipefail
+          mode=(--check)
+          if [ "$LIVE" = "true" ]; then
+            mode=()
+            echo "::notice::Live run: members that need it will be rebooted."
+          else
+            echo "::notice::Dry run (--check). Re-run with 'apply' ticked to reboot."
+          fi
+          if ! [[ "$FORCE" =~ ^[A-Za-z0-9,\ -]*$ ]]; then
+            echo "::error::force_members may only contain member names, commas and spaces."
+            exit 1
+          fi
+          pipx run --spec ansible ansible-playbook playbooks/playbook_etcd_rolling_restart.yaml \
+            -i inventory/etcd_hosts \
+            -u root \
+            --private-key=/tmp/mike_ssh_key \
+            "${mode[@]}" \
+            -e "etcd_rr_force='${FORCE}'" \
+            --extra-vars "ansible_ssh_pass=${ANSIBLE_SSH_PASS} ansible_ssh_common_args='-o StrictHostKeyChecking=no'" \
+            | tee "$RUNNER_TEMP/etcd_rr.log"
+
+      - name: Email on failure
+        if: failure() && steps.playbook.outcome == 'failure'
+        uses: dawidd6/action-send-mail@67ce3558d613188179559c61d3565140cf389968  # v22
+        with:
+          server_address: ${{ env.SMTP_SERVER }}
+          server_port: ${{ env.SMTP_PORT }}
+          username: ${{ env.SMTP_USERNAME }}
+          password: ${{ env.SMTP_PASSWORD }}
+          subject: "[etcd] Rolling restart STOPPED - check the cluster"
+          to: ${{ env.EMAIL_TO }}
+          from: ${{ env.EMAIL_FROM }}
+          body: |
+            The etcd rolling restart stopped before finishing.
+
+            It only takes a member down while every member is healthy, and stops
+            at the first one that doesn't come back healthy and caught up, so the
+            remaining members were left untouched and the cluster should still
+            hold quorum. Check it before the next run:
+
+              etcdctl endpoint health --cluster
+              etcdctl endpoint status --cluster -w table
+              journalctl -u etcd   (on the member it stopped at)
+
+            Run log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      - name: Cleanup Temporary Files
+        if: always()
+        run: |
+          rm -f /tmp/mike_ssh_key "$RUNNER_TEMP/etcd_rr.log"
