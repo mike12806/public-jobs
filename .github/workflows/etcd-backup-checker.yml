@@ -1,0 +1,134 @@
+name: Check etcd Backups in B2
+
+on:
+  schedule:
+    - cron: '37 */2 * * *'  # Every 2 hours at minute 37 (backups land hourly at ~:07)
+  workflow_dispatch:  # Allow manual trigger
+
+concurrency:
+  group: etcd-backup-checker
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  VAULT_ADDR: https://vault.mfaherty.net
+  RESTIC_REPO_PATH: etcd-k3s
+  MAX_AGE_HOURS: 3
+
+jobs:
+  check-etcd-backups:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8  # v4.1.2
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          hostname: github-runner-etcd-backup-checker
+          version: latest
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq curl restic
+
+      - name: Fetch etcd backup credentials from Vault
+        env:
+          VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
+        run: |
+          set -euo pipefail
+          vault_response=$(curl -sSL \
+            --header "X-Vault-Token: $VAULT_TOKEN" \
+            "$VAULT_ADDR/v1/kv/data/ci/etcd-backup")
+
+          if ! echo "$vault_response" | jq -e '.data.data.ACCESS_KEY_ID' > /dev/null 2>&1; then
+            echo "❌ Failed to fetch kv/ci/etcd-backup from Vault"
+            exit 1
+          fi
+
+          for key in ACCESS_KEY_ID SECRET_ACCESS_KEY RESTIC_PASSWORD; do
+            echo "::add-mask::$(echo "$vault_response" | jq -r ".data.data.$key")"
+          done
+
+          BUCKET=$(echo "$vault_response" | jq -r '.data.data.BUCKET')
+          ENDPOINT=$(echo "$vault_response" | jq -r '.data.data.ENDPOINT')
+          {
+            echo "AWS_ACCESS_KEY_ID=$(echo "$vault_response" | jq -r '.data.data.ACCESS_KEY_ID')"
+            echo "AWS_SECRET_ACCESS_KEY=$(echo "$vault_response" | jq -r '.data.data.SECRET_ACCESS_KEY')"
+            echo "RESTIC_PASSWORD=$(echo "$vault_response" | jq -r '.data.data.RESTIC_PASSWORD')"
+            echo "RESTIC_REPOSITORY=s3:https://${ENDPOINT}/${BUCKET}/${RESTIC_REPO_PATH}"
+          } >> "$GITHUB_ENV"
+
+      - name: Check latest etcd snapshot
+        id: check_etcd
+        run: |
+          set -euo pipefail
+
+          echo "🔍 Listing snapshots in restic repo..."
+          if ! SNAPSHOTS=$(restic snapshots --json --no-lock 2>restic_err.log); then
+            echo "error=Unable to open restic repo: $(tail -n 3 restic_err.log | tr '\n' ' ')" >> "$GITHUB_OUTPUT"
+            cat restic_err.log
+            exit 1
+          fi
+
+          COUNT=$(echo "$SNAPSHOTS" | jq 'length')
+          if [ "$COUNT" -eq 0 ]; then
+            echo "error=No snapshots found in restic repo" >> "$GITHUB_OUTPUT"
+            echo "❌ No snapshots found"
+            exit 1
+          fi
+
+          LATEST=$(echo "$SNAPSHOTS" | jq -r 'sort_by(.time) | last')
+          LATEST_TIME=$(echo "$LATEST" | jq -r '.time')
+          LATEST_ID=$(echo "$LATEST" | jq -r '.short_id')
+          LATEST_HOST=$(echo "$LATEST" | jq -r '.hostname')
+          AGE_HOURS=$(( ($(date +%s) - $(date -d "$LATEST_TIME" +%s)) / 3600 ))
+
+          echo "  Total snapshots:   $COUNT"
+          echo "  Latest snapshot:   $LATEST_ID from $LATEST_HOST at $LATEST_TIME (${AGE_HOURS}h old)"
+
+          if [ "$AGE_HOURS" -ge "$MAX_AGE_HOURS" ]; then
+            echo "error=Latest etcd snapshot $LATEST_ID is ${AGE_HOURS}h old (threshold: ${MAX_AGE_HOURS}h). Last snapshot at $LATEST_TIME from $LATEST_HOST." >> "$GITHUB_OUTPUT"
+            echo "❌ Latest snapshot is too old"
+            exit 1
+          fi
+          echo "✅ Latest snapshot is recent"
+
+      - name: Verify restic repo integrity
+        id: check_repo
+        run: |
+          set -euo pipefail
+          if ! restic check --no-lock 2>&1 | tee restic_check.log; then
+            echo "error=restic check failed: $(tail -n 5 restic_check.log | tr '\n' ' ')" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          echo "✅ Repo integrity check passed"
+
+      - name: Send email on failure
+        if: failure()
+        uses: dawidd6/action-send-mail@d38f3f7cd391cdebfe0d38efc3998b935e951c4f  # v16
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "❌ etcd Backup Check Failed"
+          body: |
+            etcd backup check failed for B2 restic repo (${{ env.RESTIC_REPO_PATH }}).
+
+            ${{ steps.check_etcd.outputs.error }}${{ steps.check_repo.outputs.error }}
+
+            If no error is shown above, an earlier step failed (Tailscale, Vault, or dependency install).
+
+            Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          to: ${{ secrets.EMAIL_TO }}
+          from: ${{ secrets.EMAIL_FROM }}
+
+      - name: Cleanup
+        if: always()
+        run: rm -rf restic_err.log restic_check.log ~/.cache/restic
