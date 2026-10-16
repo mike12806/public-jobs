@@ -37,12 +37,6 @@ jobs:
           hostname: github-runner-etcd-backup-checker
           version: latest
 
-      # vault.mfaherty.net is only in the LAN's DNS (Pi-hole), which partly
-      # runs on Kubernetes. The GSLB VIP's HAProxy passes TLS through to Vault,
-      # so the certificate is still checked against the name.
-      - name: Pin vault.mfaherty.net to the GSLB VIP
-        run: echo '192.168.1.113 vault.mfaherty.net' | sudo tee -a /etc/hosts
-
       # Secrets come from Vault (kv/ci/*), logged in through GitHub OIDC with
       # the role below (gh_hdc vault/), so they're not GitHub secrets.
       - name: Read secrets from Vault
