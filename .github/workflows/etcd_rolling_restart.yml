@@ -8,8 +8,7 @@ name: etcd Rolling Restart
 # at the first member that doesn't come back cleanly. See the playbook header.
 #
 # Like etcd_cluster.yml it runs on a GitHub-hosted runner over Tailscale, so it
-# doesn't depend on the Kubernetes cluster this datastore serves, and pins
-# vault.mfaherty.net to the GSLB VIP rather than the LAN's DNS.
+# doesn't depend on the Kubernetes cluster this datastore serves.
 #
 # Shares etcd_cluster.yml's concurrency group, so it never overlaps that
 # playbook (which also restarts members). Saturday 10:23 UTC (06:23 EDT) is
@@ -65,9 +64,6 @@ jobs:
           tags: tag:ci
           hostname: github-runner-etcd-rolling-restart
           version: latest
-
-      - name: Pin vault.mfaherty.net to the GSLB VIP
-        run: echo '192.168.1.113 vault.mfaherty.net' | sudo tee -a /etc/hosts
 
       # Secrets come from Vault (kv/ci/*), logged in through GitHub OIDC with
       # the role below (gh_hdc vault/), so they're no longer GitHub secrets.
