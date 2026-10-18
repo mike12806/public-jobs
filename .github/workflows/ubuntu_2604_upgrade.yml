@@ -44,6 +44,8 @@ on:
       group:
         description: 'Inventory group to upgrade'
         type: choice
+        required: true
+        default: unbound
         options:
           - unbound
           - redis
@@ -150,6 +152,10 @@ jobs:
           ONLY: ${{ inputs.hosts }}
         run: |
           set -o pipefail
+          if [ -z "$GROUP" ]; then
+            echo "::error::No group was passed to the workflow (inputs.group is empty). Dispatch it with a group, e.g. gh workflow run ubuntu_2604_upgrade.yml -f group=unbound"
+            exit 1
+          fi
           if ! [[ "$ONLY" =~ ^[A-Za-z0-9.,\ -]*$ ]]; then
             echo "::error::hosts may only contain host names, commas and spaces."
             exit 1
