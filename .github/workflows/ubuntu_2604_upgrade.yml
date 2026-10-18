@@ -1,0 +1,349 @@
+name: Ubuntu 26.04 Upgrade (one-off)
+
+# Runs gh_hdc's ansible/playbooks/playbook_ubuntu_2604_upgrade.yaml against
+# one group of gh_hdc ansible/inventory/ubuntu_2604_upgrade: every Ubuntu LXC
+# and VM on the Proxmox hosts, 24.04 -> 26.04. See the playbook header for what
+# happens to each host. Delete this workflow once every group is done and the
+# snapshots are cleaned up.
+#
+# Manual only, one group per dispatch, so each group can be looked at before
+# the next. Suggested order (the inventory's): unbound, redis, gslb, vault,
+# etcd, tailscale, k8s_workers, k8s_servers, docker_vms.
+#
+#   apply unticked   preflight only: finds each host's Proxmox guest and checks
+#                    it can be upgraded. Changes nothing.
+#   apply ticked     preflight for the whole group, then one job per host, one
+#                    at a time (max-parallel: 1), in inventory order. A host
+#                    that fails stops the rest (fail-fast); the hosts after it
+#                    are left untouched. One job per host because a job's limit
+#                    is 360m and a k8s node can spend a long time waiting for
+#                    Longhorn.
+#   cleanup ticked   deletes the pre-upgrade Proxmox snapshots of the group's
+#                    hosts that finished (and nothing else).
+#
+# Re-running a group is safe: finished hosts are skipped, and a host the
+# previous run stopped on resumes where it can (see the playbook).
+#
+# Other jobs that touch these hosts. Each host job waits for any run of them
+# that's in progress, but can't stop one starting later, so for the window:
+#   gh workflow disable kubernetes_rolling_reboot.yml   (reboots k8s nodes)
+#   gh workflow disable restart_hosts_1.yml             (reboots LXCs)
+#   gh workflow disable restart_hosts_2.yml
+#   gh workflow disable non_docker_hosts_hourly_update.yml   (apt on k8s + LXCs)
+#   gh workflow disable docker_hosts_hourly_update.yml       (apt on vm1/vm2)
+# and enable them again afterwards. The nightly config runs (gslb, etcd
+# cluster, log shipping, IPv6) are waited for too; they're safe to leave on.
+#
+# Also: the redis-failback CronJob (Kubernetes) moves the master back to
+# shared-redis-1 when it can. If it runs while shared-redis-1 is mid-upgrade,
+# that's one extra Sentinel failover when it reboots.
+
+on:
+  workflow_dispatch:
+    inputs:
+      group:
+        description: 'Inventory group to upgrade'
+        type: choice
+        options:
+          - unbound
+          - redis
+          - gslb
+          - vault
+          - etcd
+          - tailscale
+          - k8s_workers
+          - k8s_servers
+          - docker_vms
+      hosts:
+        description: "Only these hosts of the group (comma-separated inventory names). Blank = the whole group"
+        type: string
+        default: ''
+      apply:
+        description: 'Upgrade for real (unticked = preflight only)'
+        type: boolean
+        default: false
+      cleanup:
+        description: "Delete the group's pre-upgrade snapshots (finished hosts only) instead of upgrading"
+        type: boolean
+        default: false
+      gh_hdc_ref:
+        description: 'gh_hdc branch/ref to run the playbook from'
+        type: string
+        default: main
+
+concurrency:
+  group: ubuntu_2604_upgrade
+  cancel-in-progress: false  # never interrupt a host mid-upgrade
+
+permissions:
+  id-token: write  # log in to Vault through GitHub OIDC (here and in k8s-access)
+  contents: read
+  actions: read    # see whether conflicting workflows are running
+
+env:
+  PLAYBOOK: playbooks/playbook_ubuntu_2604_upgrade.yaml
+  INVENTORY: inventory/ubuntu_2604_upgrade
+
+jobs:
+  preflight:
+    name: Preflight (${{ inputs.group }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      hosts: ${{ steps.hosts.outputs.hosts }}
+
+    steps:
+      - name: Prefer IPv4 over IPv6
+        run: echo 'precedence ::ffff:0:0/96 100' | sudo tee -a /etc/gai.conf
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd  # v4.2.0
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          hostname: github-runner-ubuntu-2604-preflight
+          version: latest
+
+      # Secrets come from Vault (kv/ci/*), logged in through GitHub OIDC with
+      # the role below (gh_hdc vault/), so they're no longer GitHub secrets.
+      - name: Read secrets from Vault
+        uses: hashicorp/vault-action@892a26828f195e65540a40b4768ae4571f51ebfc  # v4.0.0
+        with:
+          url: https://vault.mfaherty.net
+          method: jwt
+          path: github-actions
+          role: public-jobs
+          jwtGithubAudience: https://vault.mfaherty.net
+          secrets: |
+            kv/data/ci/github GH_HDC_PAT | GH_HDC_PAT ;
+            kv/data/ci/ssh ANSIBLE_SSH_PASSWORD_1 | ANSIBLE_SSH_PASSWORD_1 ;
+            kv/data/ci/ssh MIKEYSSHKEYLINODE | MIKEYSSHKEYLINODE
+
+      - name: Checkout gh_hdc
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: mike12806/gh_hdc
+          ref: ${{ inputs.gh_hdc_ref || 'main' }}
+          token: ${{ env.GH_HDC_PAT }}
+          path: gh_hdc
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y python3-pip python3 python3-venv pipx sshpass openssh-client jq
+          pipx ensurepath
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Write SSH Private Key to File
+        env:
+          SSH_KEY: ${{ env.MIKEYSSHKEYLINODE }}
+        run: |
+          printf '%s\n' "$SSH_KEY" | sed 's/\\n/\n/g' > /tmp/mike_ssh_key
+          chmod 600 /tmp/mike_ssh_key
+
+      - name: Hosts to run
+        id: hosts
+        working-directory: gh_hdc/ansible
+        env:
+          GROUP: ${{ inputs.group }}
+          ONLY: ${{ inputs.hosts }}
+        run: |
+          set -o pipefail
+          if ! [[ "$ONLY" =~ ^[A-Za-z0-9.,\ -]*$ ]]; then
+            echo "::error::hosts may only contain host names, commas and spaces."
+            exit 1
+          fi
+          all="$(pipx run --spec ansible ansible-inventory -i "$INVENTORY" --list | jq -c --arg g "$GROUP" '.[$g].hosts // []')"
+          if [ -n "${ONLY// /}" ]; then
+            hosts="$(jq -c --arg only "${ONLY// /}" '($only | split(",")) as $o | map(select(. as $h | $o | index($h)))' <<<"$all")"
+            unknown="$(jq -r --argjson all "$all" --arg only "${ONLY// /}" '$only | split(",") - $all | join(", ")' <<<'null')"
+            if [ -n "$unknown" ]; then
+              echo "::error::Not in group $GROUP: $unknown"
+              exit 1
+            fi
+          else
+            hosts="$all"
+          fi
+          if [ "$hosts" = "[]" ]; then
+            echo "::error::No hosts selected in group $GROUP."
+            exit 1
+          fi
+          echo "hosts=$hosts" >> "$GITHUB_OUTPUT"
+          echo "### $GROUP: \`$hosts\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Preflight
+        working-directory: gh_hdc/ansible
+        env:
+          ANSIBLE_SSH_PASS: ${{ env.ANSIBLE_SSH_PASSWORD_1 }}
+          ANSIBLE_PYTHON_INTERPRETER: /usr/bin/python3
+          ANSIBLE_TIMEOUT: 30
+          ANSIBLE_STDOUT_CALLBACK: ansible.builtin.default
+          ANSIBLE_CALLBACK_RESULT_FORMAT: yaml
+          ANSIBLE_HOST_KEY_CHECKING: false
+          HOSTS: ${{ steps.hosts.outputs.hosts }}
+          MODE: ${{ inputs.cleanup && 'cleanup' || 'preflight' }}
+        run: |
+          set -o pipefail
+          limit="$(jq -r 'join(",")' <<<"$HOSTS")"
+          pipx run --spec ansible ansible-playbook "$PLAYBOOK" \
+            -i "$INVENTORY" --limit "$limit" \
+            -u root --private-key=/tmp/mike_ssh_key \
+            -e "r2604_mode=$MODE" \
+            --extra-vars "ansible_ssh_pass=${ANSIBLE_SSH_PASS} ansible_ssh_common_args='-o StrictHostKeyChecking=no'"
+
+      - name: Cleanup Temporary Files
+        if: always()
+        run: rm -f /tmp/mike_ssh_key
+
+  upgrade:
+    name: Upgrade ${{ matrix.host }}
+    needs: preflight
+    if: inputs.apply && !inputs.cleanup
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    strategy:
+      max-parallel: 1   # never two hosts at once
+      fail-fast: true   # a host that fails stops the rest
+      matrix:
+        host: ${{ fromJSON(needs.preflight.outputs.hosts) }}
+
+    steps:
+      - name: Prefer IPv4 over IPv6
+        run: echo 'precedence ::ffff:0:0/96 100' | sudo tee -a /etc/gai.conf
+
+      - name: Checkout public-jobs
+        if: startsWith(inputs.group, 'k8s')
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      # kubectl (drain, Ready, Longhorn) runs on the runner. Includes Tailscale.
+      - name: Reach the cluster
+        if: startsWith(inputs.group, 'k8s')
+        uses: ./.github/actions/k8s-access
+        with:
+          ts-oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          ts-oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          hostname: github-runner-ubuntu-2604-${{ strategy.job-index }}
+
+      - name: Connect to Tailscale
+        if: ${{ !startsWith(inputs.group, 'k8s') }}
+        uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd  # v4.2.0
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          hostname: github-runner-ubuntu-2604-${{ strategy.job-index }}
+          version: latest
+
+      - name: Read secrets from Vault
+        uses: hashicorp/vault-action@892a26828f195e65540a40b4768ae4571f51ebfc  # v4.0.0
+        with:
+          url: https://vault.mfaherty.net
+          method: jwt
+          path: github-actions
+          role: public-jobs
+          jwtGithubAudience: https://vault.mfaherty.net
+          secrets: |
+            kv/data/ci/github GH_HDC_PAT | GH_HDC_PAT ;
+            kv/data/ci/smtp EMAIL_FROM | EMAIL_FROM ;
+            kv/data/ci/smtp EMAIL_TO | EMAIL_TO ;
+            kv/data/ci/smtp SMTP_PASSWORD | SMTP_PASSWORD ;
+            kv/data/ci/smtp SMTP_PORT | SMTP_PORT ;
+            kv/data/ci/smtp SMTP_SERVER | SMTP_SERVER ;
+            kv/data/ci/smtp SMTP_USERNAME | SMTP_USERNAME ;
+            kv/data/ci/ssh ANSIBLE_SSH_PASSWORD_1 | ANSIBLE_SSH_PASSWORD_1 ;
+            kv/data/ci/ssh MIKEYSSHKEYLINODE | MIKEYSSHKEYLINODE
+
+      # Can't stop one starting later; see the header.
+      - name: Wait for jobs that reboot or update these hosts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          workflows="kubernetes_rolling_reboot.yml restart_hosts_1.yml restart_hosts_2.yml
+            non_docker_hosts_hourly_update.yml docker_hosts_hourly_update.yml daily_unbound_update.yml
+            gslb.yml etcd_cluster.yml etcd_rolling_restart.yml etcd_restore.yml vault_cluster.yml
+            redis_hosts.yml log_shipping.yml ipv6_servers.yml"
+          for attempt in $(seq 1 60); do
+            busy=""
+            for w in $workflows; do
+              n="$(gh run list --workflow "$w" --status in_progress --json databaseId --jq length 2>/dev/null || echo 0)"
+              [ "$n" -gt 0 ] && busy="$busy $w"
+            done
+            if [ -z "$busy" ]; then
+              echo "Nothing else is running on these hosts."
+              exit 0
+            fi
+            echo "Waiting for:$busy (attempt $attempt/60)"
+            sleep 60
+          done
+          echo "::error::Still running after an hour:$busy"
+          exit 1
+
+      - name: Checkout gh_hdc
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: mike12806/gh_hdc
+          ref: ${{ inputs.gh_hdc_ref || 'main' }}
+          token: ${{ env.GH_HDC_PAT }}
+          path: gh_hdc
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y python3-pip python3 python3-venv pipx sshpass openssh-client
+          pipx ensurepath
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Write SSH Private Key to File
+        env:
+          SSH_KEY: ${{ env.MIKEYSSHKEYLINODE }}
+        run: |
+          printf '%s\n' "$SSH_KEY" | sed 's/\\n/\n/g' > /tmp/mike_ssh_key
+          chmod 600 /tmp/mike_ssh_key
+
+      - name: Upgrade ${{ matrix.host }}
+        id: playbook
+        working-directory: gh_hdc/ansible
+        env:
+          ANSIBLE_SSH_PASS: ${{ env.ANSIBLE_SSH_PASSWORD_1 }}
+          ANSIBLE_PYTHON_INTERPRETER: /usr/bin/python3
+          ANSIBLE_TIMEOUT: 30
+          ANSIBLE_STDOUT_CALLBACK: ansible.builtin.default
+          ANSIBLE_CALLBACK_RESULT_FORMAT: yaml
+          ANSIBLE_HOST_KEY_CHECKING: false
+          HOST: ${{ matrix.host }}
+        run: |
+          set -o pipefail
+          pipx run --spec ansible ansible-playbook "$PLAYBOOK" \
+            -i "$INVENTORY" --limit "$HOST" \
+            -u root --private-key=/tmp/mike_ssh_key \
+            -e r2604_mode=upgrade \
+            --extra-vars "ansible_ssh_pass=${ANSIBLE_SSH_PASS} ansible_ssh_common_args='-o StrictHostKeyChecking=no'"
+
+      - name: Email on failure
+        if: failure() && steps.playbook.outcome == 'failure'
+        uses: dawidd6/action-send-mail@67ce3558d613188179559c61d3565140cf389968  # v22
+        with:
+          server_address: ${{ env.SMTP_SERVER }}
+          server_port: ${{ env.SMTP_PORT }}
+          username: ${{ env.SMTP_USERNAME }}
+          password: ${{ env.SMTP_PASSWORD }}
+          subject: "[ubuntu 26.04] Upgrade STOPPED at ${{ matrix.host }}"
+          to: ${{ env.EMAIL_TO }}
+          from: ${{ env.EMAIL_FROM }}
+          body: |
+            The Ubuntu 26.04 upgrade of ${{ inputs.group }} stopped at ${{ matrix.host }}.
+            The hosts after it in the group were not touched.
+
+            The run log says which step failed and, where there is one, which
+            Proxmox snapshot to roll back to (pct/qm rollback <vmid> pre_ubuntu_2604).
+            A k8s node that failed after its drain is left cordoned on purpose.
+
+            Re-running the group resumes: finished hosts are skipped.
+
+            Run log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      - name: Cleanup Temporary Files
+        if: always()
+        run: rm -f /tmp/mike_ssh_key
