@@ -1,0 +1,150 @@
+name: Proxmox Certificate Renewal
+
+# PBS and PDM terminate their own Let's Encrypt certificate, and the k8s gateway
+# verifies it, so an expired one turns pbs/pdm.mfaherty.net into a 502 while
+# the host itself is fine. PDM expired this way on 2026-10-18. This checks the
+# certificate each host serves and orders a new one when it expires within
+# renew_within_days (gh_hdc ansible/playbooks/playbook_proxmox_cert_renew.yaml).
+on:
+  schedule:
+    # Daily. With a 7 day threshold a failed order is retried for a week
+    # before the certificate actually expires.
+    - cron: "17 6 * * *"
+  workflow_dispatch:  # Allows manual triggering from the GitHub Actions UI
+    inputs:
+      renew_within_days:
+        description: "Renew certificates that expire within this many days (use 100 to force a renewal)"
+        required: false
+        default: "7"
+
+concurrency:
+  group: proxmox_cert_renewal
+  cancel-in-progress: false  # never interrupt an ACME order half way
+
+permissions:
+  id-token: write  # log in to Vault through GitHub OIDC
+  contents: read
+
+jobs:
+  renew-certs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd  # v4.2.0
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          hostname: github-runner-proxmox-cert-renewal
+          version: latest
+
+      # Secrets come from Vault (kv/ci/*), logged in through GitHub OIDC with
+      # the role below (gh_hdc vault/), so they're no longer GitHub secrets.
+      - name: Read secrets from Vault
+        uses: hashicorp/vault-action@892a26828f195e65540a40b4768ae4571f51ebfc  # v4.0.0
+        with:
+          url: https://vault.mfaherty.net
+          method: jwt
+          path: github-actions
+          role: public-jobs
+          jwtGithubAudience: https://vault.mfaherty.net
+          secrets: |
+            kv/data/ci/github GH_HDC_PAT | GH_HDC_PAT ;
+            kv/data/ci/smtp EMAIL_FROM | EMAIL_FROM ;
+            kv/data/ci/smtp EMAIL_TO | EMAIL_TO ;
+            kv/data/ci/smtp SMTP_PASSWORD | SMTP_PASSWORD ;
+            kv/data/ci/smtp SMTP_PORT | SMTP_PORT ;
+            kv/data/ci/smtp SMTP_SERVER | SMTP_SERVER ;
+            kv/data/ci/smtp SMTP_USERNAME | SMTP_USERNAME ;
+            kv/data/ci/ssh ANSIBLE_SSH_PASSWORD_3 | ANSIBLE_SSH_PASSWORD_3 ;
+            kv/data/ci/ssh MIKEYSSHKEYLINODE | MIKEYSSHKEYLINODE
+
+      - name: Checkout gh_hdc
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: mike12806/gh_hdc
+          token: ${{ env.GH_HDC_PAT }}
+          path: gh_hdc
+
+      - name: Cache pipx and ansible
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: |
+            ~/.local/bin
+            ~/.local/pipx
+          key: ${{ runner.os }}-pipx-ansible-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pipx-ansible-
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y python3-pip python3 python3-venv pipx sshpass openssh-client
+          pipx install ansible-core==2.13.0
+          pipx ensurepath
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Write SSH Private Key to File
+        run: |
+          echo "${{ env.MIKEYSSHKEYLINODE }}" | sed 's/\\n/\n/g' > /tmp/mike_ssh_key
+          chmod 600 /tmp/mike_ssh_key
+
+      - name: Run Ansible Playbook
+        working-directory: gh_hdc/ansible
+        env:
+          ANSIBLE_SSH_PASS_3: ${{ env.ANSIBLE_SSH_PASSWORD_3 }}
+          ANSIBLE_PYTHON_INTERPRETER: /usr/bin/python3
+          ANSIBLE_GATHERING: smart
+          ANSIBLE_TIMEOUT: 30
+          ANSIBLE_STDOUT_CALLBACK: ansible.builtin.default
+          ANSIBLE_CALLBACK_RESULT_FORMAT: yaml
+          ANSIBLE_HOST_KEY_CHECKING: false
+          RENEW_WITHIN_DAYS: ${{ inputs.renew_within_days || '7' }}
+        run: |
+          if ! [[ "$RENEW_WITHIN_DAYS" =~ ^[0-9]+$ ]] || [ "$RENEW_WITHIN_DAYS" -lt 1 ]; then
+            echo "renew_within_days must be a whole number of days, got '$RENEW_WITHIN_DAYS'" >&2
+            exit 1
+          fi
+          pipx run --spec ansible ansible-playbook playbooks/playbook_proxmox_cert_renew.yaml \
+            -i inventory/proxmox_cert_hosts \
+            -u root \
+            --private-key=/tmp/mike_ssh_key \
+            --extra-vars "ansible_ssh_pass=${ANSIBLE_SSH_PASS_3} ansible_ssh_common_args='-o StrictHostKeyChecking=no'" \
+            --extra-vars "cert_renew_report=${RUNNER_TEMP}/cert_report.txt renew_within_days=${RENEW_WITHIN_DAYS}"
+
+      # The playbook writes this report when a certificate was renewed or a host
+      # failed. If the run died before it could (e.g. both hosts unreachable),
+      # leave a note so the failure is still emailed.
+      - name: Check for a report
+        id: report
+        if: always()
+        run: |
+          if [ ! -s "$RUNNER_TEMP/cert_report.txt" ] && [ "${{ job.status }}" != "success" ]; then
+            echo "The certificate renewal run ${{ job.status }} before it could write a report (for example, no host was reachable). See the workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" > "$RUNNER_TEMP/cert_report.txt"
+          fi
+          if [ -s "$RUNNER_TEMP/cert_report.txt" ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Email certificate report
+        if: always() && steps.report.outputs.found == 'true'
+        uses: dawidd6/action-send-mail@67ce3558d613188179559c61d3565140cf389968  # v22
+        with:
+          server_address: ${{ env.SMTP_SERVER }}
+          server_port: ${{ env.SMTP_PORT }}
+          username: ${{ env.SMTP_USERNAME }}
+          password: ${{ env.SMTP_PASSWORD }}
+          subject: "${{ job.status == 'success' && '🔐 Proxmox certificate renewed' || '❌ Proxmox certificate renewal failed' }}"
+          body: file://${{ runner.temp }}/cert_report.txt
+          to: ${{ env.EMAIL_TO }}
+          from: ${{ env.EMAIL_FROM }}
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -f /tmp/mike_ssh_key
+          rm -f "$RUNNER_TEMP/cert_report.txt"
