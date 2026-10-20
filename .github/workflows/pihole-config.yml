@@ -74,7 +74,9 @@ jobs:
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
           tags: tag:ci
           hostname: github-runner-pihole-config
-          args: --accept-routes --accept-dns=false
+          # The action already passes --accept-routes; tailscale up refuses a
+          # flag given twice.
+          args: --accept-dns=false
           version: latest
 
       # Keys with "-" in them need backticks.
