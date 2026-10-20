@@ -5,7 +5,9 @@ name: Pi-hole config
 # match gh_hdc's ansible/playbooks/vars/pihole/, plus a local DNS record for
 # every tailnet device. Every 15 minutes, so anything changed in a Pi-hole's
 # UI is put back, and a change merged to gh_hdc lands within 15 minutes.
-# Replaces nebula-sync and tailscale-dns-pihole-sync.
+# The :07 run each hour also rebuilds gravity on every Pi-hole (downloads
+# every blocklist again). Replaces nebula-sync, tailscale-dns-pihole-sync,
+# pihole_mac_hourly_update and hdc's pihole-gravity-hourly CronJobs.
 #
 # This repo is public, so its logs are too. The playbook runs with
 # pihole_quiet=true: only per-host counts are printed, never diffs, records,
@@ -23,11 +25,17 @@ name: Pi-hole config
 
 on:
   schedule:
-    - cron: '7,22,37,52 * * * *'
+    # The first also rebuilds gravity (see GRAVITY below); keep them apart.
+    - cron: '7 * * * *'
+    - cron: '22,37,52 * * * *'
   workflow_dispatch:
     inputs:
       plan_only:
         description: Only compare (counts of what would change), don't apply
+        type: boolean
+        default: false
+      update_gravity:
+        description: Also rebuild gravity (download every blocklist again)
         type: boolean
         default: false
 
@@ -47,6 +55,7 @@ env:
   # vault.mfaherty.net is the GSLB VIP (TLS passed through to Vault).
   VAULT_IP: 192.168.1.113
   APPLY: ${{ !inputs.plan_only }}
+  GRAVITY: ${{ github.event.schedule == '7 * * * *' || inputs.update_gravity == true }}
   RESULTS: ${{ github.workspace }}/../pihole-results
 
 jobs:
@@ -123,16 +132,16 @@ jobs:
           set -o pipefail
           mkdir -p "$RESULTS"
           ansible-playbook ansible/playbooks/playbook_pihole.yaml -f 10 \
-            -e "{\"pihole_quiet\": true, \"pihole_apply\": $APPLY, \"pihole_result_dir\": \"$RESULTS\"}"
+            -e "{\"pihole_quiet\": true, \"pihole_apply\": $APPLY, \"pihole_update_gravity\": $GRAVITY, \"pihole_result_dir\": \"$RESULTS\"}"
 
       - name: Summary
         if: always()
         run: |
           {
-            echo "### Pi-hole config ($([ "$APPLY" = true ] && echo apply || echo compare only))"
+            echo "### Pi-hole config ($([ "$APPLY" = true ] && echo apply || echo compare only)$([ "$GRAVITY" = true ] && echo ', gravity'))"
             for f in "$RESULTS"/*.json; do
               [ -s "$f" ] || continue
-              jq -r '"- **\(.host)**: \(.changes | length) change(s)\(if .applied then ", applied" else "" end), \(.unmanaged | length) unmanaged"' "$f"
+              jq -r '"- **\(.host)**: \(.changes | length) change(s)\(if .applied then ", applied" else "" end)\(if .gravity then ", gravity rebuilt" else "" end), \(.unmanaged | length) unmanaged"' "$f"
             done
             echo
             echo "Details are kept out of this public log: run gh_hdc's **Pi-hole config** workflow by hand to see them."
