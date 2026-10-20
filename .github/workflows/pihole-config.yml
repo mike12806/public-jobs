@@ -79,7 +79,6 @@ jobs:
           args: --accept-dns=false
           version: latest
 
-      # Keys with "-" in them need backticks.
       - name: Read secrets from Vault
         uses: hashicorp/vault-action@892a26828f195e65540a40b4768ae4571f51ebfc  # v4.0.0
         with:
@@ -94,8 +93,8 @@ jobs:
             kv/data/kubernetes/pihole-proxy/pihole-exporter dns8 | PIHOLE_PASSWORD_DNS8 ;
             kv/data/kubernetes/pihole-proxy/pihole-exporter dns9 | PIHOLE_PASSWORD_DNS9 ;
             kv/data/kubernetes/pihole-proxy/pihole-exporter dns10 | PIHOLE_PASSWORD_DNS10 ;
-            kv/data/kubernetes/pihole-proxy/pihole-exporter `k8s-dns` | PIHOLE_PASSWORD_K8S_DNS ;
-            kv/data/kubernetes/pihole-proxy/pihole-exporter `k8s-dns2` | PIHOLE_PASSWORD_K8S_DNS2
+            kv/data/kubernetes/pihole-proxy/pihole-exporter k8s-dns | PIHOLE_PASSWORD_K8S_DNS ;
+            kv/data/kubernetes/pihole-proxy/pihole-exporter k8s-dns2 | PIHOLE_PASSWORD_K8S_DNS2
 
       # Optional: until kv/ci/uptime-kuma PIHOLE_PUSH_URL exists, runs just
       # don't report to Uptime Kuma.
