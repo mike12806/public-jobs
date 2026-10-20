@@ -96,20 +96,6 @@ jobs:
             kv/data/kubernetes/pihole-proxy/pihole-exporter k8s-dns | PIHOLE_PASSWORD_K8S_DNS ;
             kv/data/kubernetes/pihole-proxy/pihole-exporter k8s-dns2 | PIHOLE_PASSWORD_K8S_DNS2
 
-      # Optional: until kv/ci/uptime-kuma PIHOLE_PUSH_URL exists, runs just
-      # don't report to Uptime Kuma.
-      - name: Read the Uptime Kuma push URL from Vault
-        continue-on-error: true
-        uses: hashicorp/vault-action@892a26828f195e65540a40b4768ae4571f51ebfc  # v4.0.0
-        with:
-          url: https://vault.mfaherty.net
-          method: jwt
-          path: github-actions
-          role: public-jobs-pihole
-          jwtGithubAudience: https://vault.mfaherty.net
-          secrets: |
-            kv/data/ci/uptime-kuma PIHOLE_PUSH_URL | KUMA_PUSH_URL
-
       - name: Checkout gh_hdc
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -155,10 +141,6 @@ jobs:
           if [ "${changed:-0}" -gt 0 ] && [ "${{ github.event_name }}" = schedule ]; then
             echo "::warning::$changed change(s) put back: a Pi-hole differed from gh_hdc (a UI edit, or a merge since the last run). If a UI edit was meant, export it into gh_hdc (playbook_pihole_export.yaml)."
           fi
-
-      - name: Tell Uptime Kuma
-        if: success() && env.KUMA_PUSH_URL != ''
-        run: curl -fsS -o /dev/null --max-time 10 "${KUMA_PUSH_URL}?status=up&msg=OK&ping=" || echo "::warning::Uptime Kuma push failed"
 
       - name: Leave the tailnet
         if: always()
