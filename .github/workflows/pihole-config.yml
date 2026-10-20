@@ -1,0 +1,164 @@
+name: Pi-hole config
+
+# Runs gh_hdc's ansible/playbooks/playbook_pihole.yaml: makes every Pi-hole
+# (gh_hdc ansible/inventory/pihole_api.yaml: dns7-dns10, k8s-dns, k8s-dns2)
+# match gh_hdc's ansible/playbooks/vars/pihole/, plus a local DNS record for
+# every tailnet device. Every 15 minutes, so anything changed in a Pi-hole's
+# UI is put back, and a change merged to gh_hdc lands within 15 minutes.
+# Replaces nebula-sync and tailscale-dns-pihole-sync.
+#
+# This repo is public, so its logs are too. The playbook runs with
+# pihole_quiet=true: only per-host counts are printed, never diffs, records,
+# addresses or error details. To see what a failure was, or exactly what
+# will change, run gh_hdc's "Pi-hole config" workflow by hand.
+#
+# No DNS lookups of our own, since this is what repairs DNS: Ansible is
+# installed before joining the tailnet, Tailscale's DNS is off
+# (--accept-dns=false), Vault's address is pinned in /etc/hosts and the
+# Pi-holes are reached by IP.
+#
+# Credentials: the Pi-holes' app passwords and the gh_hdc checkout token from
+# Vault (role public-jobs-pihole, gh_hdc vault/); the Tailscale OAuth client
+# (joins as tag:ci, reads the device list) from this repo's secrets.
+
+on:
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+  workflow_dispatch:
+    inputs:
+      plan_only:
+        description: Only compare (counts of what would change), don't apply
+        type: boolean
+        default: false
+
+concurrency:
+  group: pihole-config
+  cancel-in-progress: false
+
+permissions:
+  id-token: write  # log in to Vault through GitHub OIDC
+  contents: read
+
+env:
+  ANSIBLE_CORE_VERSION: 2.20.5
+  ANSIBLE_NOCOLOR: '1'
+  ANSIBLE_CALLBACK_RESULT_FORMAT: yaml
+  ANSIBLE_INVENTORY: ${{ github.workspace }}/gh_hdc/ansible/inventory/pihole_api.yaml
+  # vault.mfaherty.net is the GSLB VIP (TLS passed through to Vault).
+  VAULT_IP: 192.168.1.113
+  APPLY: ${{ !inputs.plan_only }}
+  RESULTS: ${{ github.workspace }}/../pihole-results
+
+jobs:
+  pihole:
+    runs-on: ubuntu-24.04
+    # Gravity rebuilds (only when lists change) take a few minutes each.
+    timeout-minutes: 25
+
+    steps:
+      # Before Tailscale, while the runner still has its own DNS.
+      - name: Ansible
+        run: |
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"
+          pipx install "ansible-core==${ANSIBLE_CORE_VERSION}"
+          ansible-playbook --version | head -1
+
+      - name: Pin Vault's address
+        run: echo "${VAULT_IP} vault.mfaherty.net" | sudo tee -a /etc/hosts
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd  # v4.2.0
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          hostname: github-runner-pihole-config
+          args: --accept-routes --accept-dns=false
+          version: latest
+
+      # Keys with "-" in them need backticks.
+      - name: Read secrets from Vault
+        uses: hashicorp/vault-action@892a26828f195e65540a40b4768ae4571f51ebfc  # v4.0.0
+        with:
+          url: https://vault.mfaherty.net
+          method: jwt
+          path: github-actions
+          role: public-jobs-pihole
+          jwtGithubAudience: https://vault.mfaherty.net
+          secrets: |
+            kv/data/ci/github GH_HDC_PAT | GH_HDC_PAT ;
+            kv/data/kubernetes/pihole-proxy/pihole-exporter dns7 | PIHOLE_PASSWORD_DNS7 ;
+            kv/data/kubernetes/pihole-proxy/pihole-exporter dns8 | PIHOLE_PASSWORD_DNS8 ;
+            kv/data/kubernetes/pihole-proxy/pihole-exporter dns9 | PIHOLE_PASSWORD_DNS9 ;
+            kv/data/kubernetes/pihole-proxy/pihole-exporter dns10 | PIHOLE_PASSWORD_DNS10 ;
+            kv/data/kubernetes/pihole-proxy/pihole-exporter `k8s-dns` | PIHOLE_PASSWORD_K8S_DNS ;
+            kv/data/kubernetes/pihole-proxy/pihole-exporter `k8s-dns2` | PIHOLE_PASSWORD_K8S_DNS2
+
+      # Optional: until kv/ci/uptime-kuma PIHOLE_PUSH_URL exists, runs just
+      # don't report to Uptime Kuma.
+      - name: Read the Uptime Kuma push URL from Vault
+        continue-on-error: true
+        uses: hashicorp/vault-action@892a26828f195e65540a40b4768ae4571f51ebfc  # v4.0.0
+        with:
+          url: https://vault.mfaherty.net
+          method: jwt
+          path: github-actions
+          role: public-jobs-pihole
+          jwtGithubAudience: https://vault.mfaherty.net
+          secrets: |
+            kv/data/ci/uptime-kuma PIHOLE_PUSH_URL | KUMA_PUSH_URL
+
+      - name: Checkout gh_hdc
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: mike12806/gh_hdc
+          token: ${{ env.GH_HDC_PAT }}
+          path: gh_hdc
+
+      # Subnet routes take a moment to arrive. Names only in the log.
+      - name: Wait for the Pi-holes
+        run: |
+          set -euo pipefail
+          ansible-inventory --list | jq -r '._meta.hostvars | to_entries[] | "\(.key) \(.value.pihole_url)"' |
+          while read -r name url; do
+            curl -s -o /dev/null --retry 10 --retry-all-errors --retry-delay 3 --max-time 10 "$url/api/info/login" \
+              || { echo "::error::$name is unreachable over Tailscale"; exit 1; }
+          done
+
+      - name: Compare and apply
+        id: run
+        working-directory: gh_hdc
+        env:
+          TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          TS_OAUTH_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
+        run: |
+          set -o pipefail
+          mkdir -p "$RESULTS"
+          ansible-playbook ansible/playbooks/playbook_pihole.yaml -f 10 \
+            -e "{\"pihole_quiet\": true, \"pihole_apply\": $APPLY, \"pihole_result_dir\": \"$RESULTS\"}"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Pi-hole config ($([ "$APPLY" = true ] && echo apply || echo compare only))"
+            for f in "$RESULTS"/*.json; do
+              [ -s "$f" ] || continue
+              jq -r '"- **\(.host)**: \(.changes | length) change(s)\(if .applied then ", applied" else "" end), \(.unmanaged | length) unmanaged"' "$f"
+            done
+            echo
+            echo "Details are kept out of this public log: run gh_hdc's **Pi-hole config** workflow by hand to see them."
+          } >> "$GITHUB_STEP_SUMMARY"
+          changed=$(jq -s 'map(select(.applied) | .changes | length) | add // 0' "$RESULTS"/*.json 2>/dev/null || echo 0)
+          if [ "${changed:-0}" -gt 0 ] && [ "${{ github.event_name }}" = schedule ]; then
+            echo "::warning::$changed change(s) put back: a Pi-hole differed from gh_hdc (a UI edit, or a merge since the last run). If a UI edit was meant, export it into gh_hdc (playbook_pihole_export.yaml)."
+          fi
+
+      - name: Tell Uptime Kuma
+        if: success() && env.KUMA_PUSH_URL != ''
+        run: curl -fsS -o /dev/null --max-time 10 "${KUMA_PUSH_URL}?status=up&msg=OK&ping=" || echo "::warning::Uptime Kuma push failed"
+
+      - name: Leave the tailnet
+        if: always()
+        run: sudo tailscale logout || true
