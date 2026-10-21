@@ -1,9 +1,25 @@
 name: Linode Backup Check
 
+# Every Linode instance on the account must have Linode's backup service on,
+# with a successful backup (automatic, or the manual snapshot slot) in the
+# last MAX_AGE_HOURS. The instances are listed from the API on every run, so
+# a new one is checked without editing this file. Fails, naming each instance
+# that isn't covered.
+#
+# enable_missing (manual runs only) turns backups on for any instance that
+# has them off. That adds Linode's backup charge for that instance to the
+# bill, so it's never done by the schedule. Its first backup comes in the
+# next daily window; until then the check keeps failing for it.
+
 on:
   schedule:
     - cron: "0 6,18 * * *"  # Runs twice daily at 6:00 AM and 6:00 PM UTC
   workflow_dispatch:  # Allows manual triggering from the GitHub Actions UI
+    inputs:
+      enable_missing:
+        description: "Turn backups on for instances that have them off (adds to the Linode bill)"
+        type: boolean
+        default: false
 
 concurrency:
   group: linode_backup_checker
@@ -13,12 +29,16 @@ permissions:
   id-token: write  # log in to Vault through GitHub OIDC
   contents: read
 
+env:
+  MAX_AGE_HOURS: 48
+
 jobs:
   check-backups:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 30
 
     steps:
+      # Vault is reached over Tailscale.
       - name: Connect to Tailscale
         uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd  # v4.2.0
         with:
@@ -39,111 +59,65 @@ jobs:
           role: public-jobs
           jwtGithubAudience: https://vault.mfaherty.net
           secrets: |
-            kv/data/ci/github GH_HDC_PAT | GH_HDC_PAT ;
-            kv/data/ci/linode LINODE_CLI_TOKEN | LINODE_CLI_TOKEN ;
-            kv/data/ci/linode LINODE_ID_1 | LINODE_ID_1 ;
-            kv/data/ci/linode LINODE_ID_2 | LINODE_ID_2
+            kv/data/ci/linode LINODE_CLI_TOKEN | LINODE_TOKEN
 
-      - name: Checkout gh_hdc
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-        with:
-          repository: mike12806/gh_hdc
-          token: ${{ env.GH_HDC_PAT }}
-          path: gh_hdc
-          fetch-depth: 0
-
-      - name: Cache pipx and linode-cli
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
-        with:
-          path: |
-            ~/.local/bin
-            ~/.local/pipx
-          key: ${{ runner.os }}-pipx-linode-cli-v1
-          restore-keys: |
-            ${{ runner.os }}-pipx-linode-cli-
-
-      - name: Install dependencies
+      - name: Turn backups on where they're off
+        if: github.event_name == 'workflow_dispatch' && inputs.enable_missing
         run: |
-          sudo apt-get update -y
-          sudo apt-get install -y python3-pip python3 python3-venv pipx
-          pipx install linode-cli
-          pipx ensurepath
-          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          set -euo pipefail
+          api() { curl -fsS -H "Authorization: Bearer $LINODE_TOKEN" -H 'Content-Type: application/json' "$@"; }
+          api 'https://api.linode.com/v4/linode/instances?page_size=500' \
+            | jq -r '.data[] | select(.backups.enabled | not) | "\(.id) \(.label)"' \
+            | while read -r id label; do
+                api -X POST "https://api.linode.com/v4/linode/instances/$id/backups/enable" > /dev/null
+                echo "Turned backups on for $label ($id)."
+                echo "- Turned backups on for **$label** ($id)" >> "$GITHUB_STEP_SUMMARY"
+              done
 
-      - name: Configure Linode CLI
+      - name: Check every instance
         run: |
-          export PATH="$PATH:$HOME/.local/bin"
-          /bin/mkdir -p ~/.config/linode
-          /bin/echo -e "[DEFAULT]\ntoken = $LINODE_CLI_TOKEN\nregion = us-east" > ~/.config/linode/linode-cli
-        env:
-          LINODE_CLI_TOKEN: ${{ env.LINODE_CLI_TOKEN }}
-
-      - name: Check Linode Backups
-        run: |
-          export PATH="$PATH:$HOME/.local/bin"
-          # Get Linode IDs from secrets
-          LINODE_ID_1="${{ env.LINODE_ID_1 }}"
-          LINODE_ID_2="${{ env.LINODE_ID_2 }}"
-
-          # Get current date minus 5 days (ISO format) using absolute path for date
-          five_days_ago=$(/bin/date -d "-5 days" --iso-8601=seconds)
-          echo "Five days ago: $five_days_ago"
-
-          # Function to check backups for a given Linode ID
-          check_backups() {
-            local LINODE_ID=$1
-            echo "🔍 Checking backups for Linode ID: $LINODE_ID"
-
-            # Define a temporary file
-            tmp_file="backup_${LINODE_ID}.json"
-
-            # Write the raw JSON output directly to the temporary file
-            linode-cli linodes backups-list "$LINODE_ID" --json > "$tmp_file" 2>/dev/null
-            echo "Wrote JSON to $tmp_file"
-            
-            # Show a snippet and file size for debugging
-            head_output=$(/bin/head -n 5 "$tmp_file")
-            echo "🔍 JSON snippet from file:"
-            echo "$head_output"
-            file_size=$(/usr/bin/wc -c < "$tmp_file" 2>/dev/null || echo "unknown")
-            echo "File size (bytes): $file_size"
-
-            # Validate JSON using Python via its absolute path
-            if ! /usr/bin/python3 -c "import json,sys; json.load(sys.stdin)" < "$tmp_file"; then
-              echo "❌ Error: Invalid JSON received from linode-cli in $tmp_file (Python validation failed)"
-              exit 1
-            fi
-
-            # Filter backups created in the last 5 days using jq
-            recent_backups=$(/usr/bin/jq --arg date "$five_days_ago" '[.[] | select(.created? and .created >= $date)]' "$tmp_file")
-            echo "Filtered backups:"
-            echo "$recent_backups" | /usr/bin/jq '.'
-
-            if [[ $(echo "$recent_backups" | /usr/bin/jq 'length') -gt 0 ]]; then
-              echo "✅ Backup found for Linode ID: $LINODE_ID"
-              return 0
-            else
-              echo "❌ No backups found for Linode ID: $LINODE_ID"
-              return 1
-            fi
-          }
-
-          # Check backups for both Linodes
-          check_backups "$LINODE_ID_1"
-          result1=$?
-          check_backups "$LINODE_ID_2"
-          result2=$?
-
-          if [[ $result1 -eq 1 || $result2 -eq 1 ]]; then
+          set -euo pipefail
+          api() { curl -fsS -H "Authorization: Bearer $LINODE_TOKEN" "$@"; }
+          instances="$(api 'https://api.linode.com/v4/linode/instances?page_size=500')"
+          count="$(jq '.data | length' <<<"$instances")"
+          if [ "$count" -eq 0 ]; then
+            echo "::error::The API listed no Linode instances; check the token."
             exit 1
-          else
-            exit 0
           fi
-        env:
-          LINODE_CLI_TOKEN: ${{ env.LINODE_CLI_TOKEN }}
-
-      - name: Cleanup
-        if: always()
-        run: |
-          /bin/rm -f backup_*.json
-          /bin/rm -rf ~/.config/linode
+          now="$(date -u +%s)"
+          bad=0
+          {
+            echo "### Linode backups (latest successful must be under ${MAX_AGE_HOURS} h old)"
+            echo
+            echo "| Instance | ID | Backups | Latest successful (UTC) | Age | |"
+            echo "|---|---|---|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          while read -r id label enabled; do
+            if [ "$enabled" != true ]; then
+              echo "::error::$label ($id): backups are off."
+              echo "| $label | $id | off | | | ❌ |" >> "$GITHUB_STEP_SUMMARY"
+              bad=1
+              continue
+            fi
+            latest="$(api "https://api.linode.com/v4/linode/instances/$id/backups" | jq -r '
+              [(.automatic // [])[], (.snapshot.current // empty)]
+              | map(select(.status == "successful" and .finished != null) | .finished)
+              | sort | last // ""')"
+            if [ -z "$latest" ]; then
+              echo "::error::$label ($id): no successful backup yet."
+              echo "| $label | $id | on | none | | ❌ |" >> "$GITHUB_STEP_SUMMARY"
+              bad=1
+              continue
+            fi
+            age_h=$(( (now - $(date -u -d "${latest}Z" +%s)) / 3600 ))
+            if [ "$age_h" -ge "$MAX_AGE_HOURS" ]; then
+              echo "::error::$label ($id): latest successful backup is ${age_h} h old ($latest UTC)."
+              echo "| $label | $id | on | $latest | ${age_h} h | ❌ |" >> "$GITHUB_STEP_SUMMARY"
+              bad=1
+            else
+              echo "✅ $label ($id): latest successful backup $latest UTC (${age_h} h ago)."
+              echo "| $label | $id | on | $latest | ${age_h} h | ✅ |" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done < <(jq -r '.data[] | "\(.id) \(.label) \(.backups.enabled)"' <<<"$instances")
+          echo "Checked $count instances."
+          exit "$bad"

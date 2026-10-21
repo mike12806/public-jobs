@@ -2,8 +2,9 @@ name: Ubuntu 26.04 Upgrade (one-off)
 
 # Runs gh_hdc's ansible/playbooks/playbook_ubuntu_2604_upgrade.yaml against
 # one group of gh_hdc ansible/inventory/ubuntu_2604_upgrade: every Ubuntu LXC
-# and VM on the Proxmox hosts, 24.04 -> 26.04. See the playbook header for what
-# happens to each host. Delete this workflow once every group is done.
+# and VM on the Proxmox hosts, and the Linode Pi-holes, 24.04 -> 26.04. See
+# the playbook header for what happens to each host. Delete this workflow
+# once every group is done.
 #
 # No Proxmox snapshots any more: they filled the thin pools under the VMs.
 # Every run, preflight included, first deletes any pre_ubuntu_2604 snapshot
@@ -11,7 +12,11 @@ name: Ubuntu 26.04 Upgrade (one-off)
 #
 # Manual only, one group per dispatch, so each group can be looked at before
 # the next. Suggested order (the inventory's): unbound, redis, gslb, vault,
-# etcd, tailscale, k8s_workers, k8s_servers, docker_vms.
+# etcd, tailscale, k8s_workers, k8s_servers, docker_vms, linode.
+#
+# linode: the Linode Pi-holes. Preflight finds each instance through the
+# Linode API (kv/ci/linode) and refuses one without a recent successful
+# Linode backup, which is the rollback; no snapshot is taken.
 #
 #   apply unticked   preflight only: finds each host's Proxmox guest and checks
 #                    it can be upgraded. Changes nothing.
@@ -33,7 +38,7 @@ name: Ubuntu 26.04 Upgrade (one-off)
 #   gh workflow disable restart_hosts_1.yml             (reboots LXCs)
 #   gh workflow disable restart_hosts_2.yml
 #   gh workflow disable non_docker_hosts_hourly_update.yml   (apt on k8s + LXCs)
-#   gh workflow disable docker_hosts_hourly_update.yml       (apt on vm1/vm2)
+#   gh workflow disable docker_hosts_hourly_update.yml       (apt on vm1/vm2, the Linodes)
 # and enable them again afterwards. The nightly config runs (gslb, etcd
 # cluster, log shipping, IPv6) are waited for too; they're safe to leave on.
 #
@@ -59,6 +64,7 @@ on:
           - k8s_workers
           - k8s_servers
           - docker_vms
+          - linode
       hosts:
         description: "Only these hosts of the group (comma-separated inventory names). Blank = the whole group"
         type: string
@@ -123,7 +129,8 @@ jobs:
           secrets: |
             kv/data/ci/github GH_HDC_PAT | GH_HDC_PAT ;
             kv/data/ci/ssh ANSIBLE_SSH_PASSWORD_1 | ANSIBLE_SSH_PASSWORD_1 ;
-            kv/data/ci/ssh MIKEYSSHKEYLINODE | MIKEYSSHKEYLINODE
+            kv/data/ci/ssh MIKEYSSHKEYLINODE | MIKEYSSHKEYLINODE ;
+            kv/data/ci/linode LINODE_CLI_TOKEN | LINODE_TOKEN
 
       - name: Checkout gh_hdc
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -191,6 +198,7 @@ jobs:
           ANSIBLE_CALLBACK_RESULT_FORMAT: yaml
           ANSIBLE_HOST_KEY_CHECKING: false
           HOSTS: ${{ steps.hosts.outputs.hosts }}
+          LINODE_TOKEN: ${{ env.LINODE_TOKEN }}
           MODE: ${{ inputs.cleanup && 'cleanup' || 'preflight' }}
         run: |
           set -o pipefail
@@ -261,7 +269,8 @@ jobs:
             kv/data/ci/smtp SMTP_SERVER | SMTP_SERVER ;
             kv/data/ci/smtp SMTP_USERNAME | SMTP_USERNAME ;
             kv/data/ci/ssh ANSIBLE_SSH_PASSWORD_1 | ANSIBLE_SSH_PASSWORD_1 ;
-            kv/data/ci/ssh MIKEYSSHKEYLINODE | MIKEYSSHKEYLINODE
+            kv/data/ci/ssh MIKEYSSHKEYLINODE | MIKEYSSHKEYLINODE ;
+            kv/data/ci/linode LINODE_CLI_TOKEN | LINODE_TOKEN
 
       # Can't stop one starting later; see the header.
       - name: Wait for jobs that reboot or update these hosts
@@ -322,6 +331,7 @@ jobs:
           ANSIBLE_CALLBACK_RESULT_FORMAT: yaml
           ANSIBLE_HOST_KEY_CHECKING: false
           HOST: ${{ matrix.host }}
+          LINODE_TOKEN: ${{ env.LINODE_TOKEN }}
         run: |
           set -o pipefail
           pipx run --spec ansible ansible-playbook "$PLAYBOOK" \
@@ -345,8 +355,9 @@ jobs:
             The Ubuntu 26.04 upgrade of ${{ inputs.group }} stopped at ${{ matrix.host }}.
             The hosts after it in the group were not touched.
 
-            The run log says which step failed and which Proxmox guest the host is.
-            There is no snapshot: fix it in place, restore it from PBS, or rebuild it.
+            The run log says which step failed and which Proxmox guest or Linode
+            instance the host is. There is no snapshot: fix it in place, or restore
+            it from PBS (Proxmox) or its Linode backup (Linode), or rebuild it.
             A k8s node that failed after its drain is left cordoned on purpose.
 
             Re-running the group resumes: finished hosts are skipped.
