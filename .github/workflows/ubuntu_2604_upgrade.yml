@@ -3,8 +3,11 @@ name: Ubuntu 26.04 Upgrade (one-off)
 # Runs gh_hdc's ansible/playbooks/playbook_ubuntu_2604_upgrade.yaml against
 # one group of gh_hdc ansible/inventory/ubuntu_2604_upgrade: every Ubuntu LXC
 # and VM on the Proxmox hosts, 24.04 -> 26.04. See the playbook header for what
-# happens to each host. Delete this workflow once every group is done and the
-# snapshots are cleaned up.
+# happens to each host. Delete this workflow once every group is done.
+#
+# No Proxmox snapshots any more: they filled the thin pools under the VMs.
+# Every run, preflight included, first deletes any pre_ubuntu_2604 snapshot
+# left on any guest on any Proxmox host.
 #
 # Manual only, one group per dispatch, so each group can be looked at before
 # the next. Suggested order (the inventory's): unbound, redis, gslb, vault,
@@ -18,8 +21,8 @@ name: Ubuntu 26.04 Upgrade (one-off)
 #                    are left untouched. One job per host because a job's limit
 #                    is 360m and a k8s node can spend a long time waiting for
 #                    Longhorn.
-#   cleanup ticked   deletes the pre-upgrade Proxmox snapshots of the group's
-#                    hosts that finished (and nothing else).
+#   cleanup ticked   only deletes leftover pre_ubuntu_2604 snapshots (which
+#                    every run does anyway) and reports; upgrades nothing.
 #
 # Re-running a group is safe: finished hosts are skipped, and a host the
 # previous run stopped on resumes where it can (see the playbook).
@@ -65,7 +68,7 @@ on:
         type: boolean
         default: false
       cleanup:
-        description: "Delete the group's pre-upgrade snapshots (finished hosts only) instead of upgrading"
+        description: "Only delete leftover pre_ubuntu_2604 snapshots (every run does this first) instead of upgrading"
         type: boolean
         default: false
       gh_hdc_ref:
@@ -342,8 +345,8 @@ jobs:
             The Ubuntu 26.04 upgrade of ${{ inputs.group }} stopped at ${{ matrix.host }}.
             The hosts after it in the group were not touched.
 
-            The run log says which step failed and, where there is one, which
-            Proxmox snapshot to roll back to (pct/qm rollback <vmid> pre_ubuntu_2604).
+            The run log says which step failed and which Proxmox guest the host is.
+            There is no snapshot: fix it in place, restore it from PBS, or rebuild it.
             A k8s node that failed after its drain is left cordoned on purpose.
 
             Re-running the group resumes: finished hosts are skipped.
