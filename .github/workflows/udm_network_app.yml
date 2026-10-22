@@ -1,0 +1,167 @@
+name: UDM Network App
+
+# The UniFi Network app on the UDM Pro leaks heap: after about 15 days it spends
+# all its time in GC, the UI and API hang (routing carries on) and it dies with
+# OutOfMemoryError, as on 2026-10-22. gh_hdc
+# ansible/playbooks/playbook_udm_network_app.yaml reads the app's GC log over
+# SSH and restarts just the app (systemctl restart unifi, a couple of minutes,
+# routing unaffected) when its live heap or GC time starts to rise, or, on the
+# nightly run, once it has been up 5 days. SSH to the UDM stops working once the
+# app is under memory pressure, so every limit acts well before that.
+#
+# SSH key and the UDM's host key: Vault kv/ci/udm, put there by
+# ~/udm-ssh-key-to-vault.sh on the Mac mini (run it again if logins start
+# failing after a UniFi OS update).
+on:
+  schedule:
+    - cron: "40 8 * * *"     # nightly (04:40 New York, summer time): also restarts by age
+    - cron: "10 */2 * * *"   # every 2 hours: restarts only on heap or GC limits
+  workflow_dispatch:  # Allows manual triggering from the GitHub Actions UI
+    inputs:
+      check_only:
+        description: "Only report what it would do; don't restart"
+        type: boolean
+        default: true
+      force:
+        description: "Restart the Network app regardless of its state"
+        type: boolean
+        default: false
+      max_age_days:
+        description: "Restart once the app has been up this many days (0 = never by age)"
+        required: false
+        default: "0"
+
+concurrency:
+  group: udm_network_app
+  cancel-in-progress: false  # never interrupt a restart half way
+
+permissions:
+  id-token: write  # log in to Vault through GitHub OIDC
+  contents: read
+
+jobs:
+  check-network-app:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd  # v4.2.0
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          hostname: github-runner-udm-network-app
+          version: latest
+
+      # Secrets come from Vault (kv/ci/*), logged in through GitHub OIDC with
+      # the role below (gh_hdc vault/), so they're no longer GitHub secrets.
+      - name: Read secrets from Vault
+        uses: hashicorp/vault-action@892a26828f195e65540a40b4768ae4571f51ebfc  # v4.0.0
+        with:
+          url: https://vault.mfaherty.net
+          method: jwt
+          path: github-actions
+          role: public-jobs
+          jwtGithubAudience: https://vault.mfaherty.net
+          secrets: |
+            kv/data/ci/github GH_HDC_PAT | GH_HDC_PAT ;
+            kv/data/ci/smtp EMAIL_FROM | EMAIL_FROM ;
+            kv/data/ci/smtp EMAIL_TO | EMAIL_TO ;
+            kv/data/ci/smtp SMTP_PASSWORD | SMTP_PASSWORD ;
+            kv/data/ci/smtp SMTP_PORT | SMTP_PORT ;
+            kv/data/ci/smtp SMTP_SERVER | SMTP_SERVER ;
+            kv/data/ci/smtp SMTP_USERNAME | SMTP_USERNAME ;
+            kv/data/ci/udm SSH_PRIVATE_KEY | UDM_SSH_PRIVATE_KEY ;
+            kv/data/ci/udm SSH_KNOWN_HOSTS | UDM_SSH_KNOWN_HOSTS
+
+      - name: Checkout gh_hdc
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: mike12806/gh_hdc
+          token: ${{ env.GH_HDC_PAT }}
+          path: gh_hdc
+
+      - name: Cache pipx and ansible
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: |
+            ~/.local/bin
+            ~/.local/pipx
+          key: ${{ runner.os }}-pipx-ansible-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pipx-ansible-
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y python3-pip python3 python3-venv pipx openssh-client
+          pipx install ansible-core==2.13.0
+          pipx ensurepath
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Write the SSH key and the UDM's host key
+        run: |
+          umask 077
+          printf '%s\n' "$UDM_SSH_PRIVATE_KEY" > "$RUNNER_TEMP/udm_ssh_key"
+          printf '%s\n' "$UDM_SSH_KNOWN_HOSTS" > "$RUNNER_TEMP/udm_known_hosts"
+
+      - name: Run Ansible Playbook
+        working-directory: gh_hdc/ansible
+        env:
+          ANSIBLE_GATHERING: explicit
+          ANSIBLE_TIMEOUT: 30
+          ANSIBLE_STDOUT_CALLBACK: ansible.builtin.default
+          ANSIBLE_CALLBACK_RESULT_FORMAT: yaml
+          # Nightly runs restart by age; the 2-hourly ones only on heap or GC.
+          # 5 days keeps live heap near 210 MB, far from the ~330 MB where it
+          # thrashes and SSH to the UDM stops answering.
+          MAX_AGE_DAYS: ${{ github.event.schedule == '40 8 * * *' && '5' || inputs.max_age_days || '0' }}
+          FORCE: ${{ inputs.force || false }}
+          CHECK: ${{ github.event_name == 'workflow_dispatch' && inputs.check_only && '--check' || '' }}
+        run: |
+          if ! [[ "$MAX_AGE_DAYS" =~ ^[0-9]+$ ]]; then
+            echo "max_age_days must be a whole number of days, got '$MAX_AGE_DAYS'" >&2
+            exit 1
+          fi
+          # shellcheck disable=SC2086  # CHECK is empty or one flag
+          pipx run --spec ansible ansible-playbook playbooks/playbook_udm_network_app.yaml $CHECK \
+            -i inventory/udm \
+            --private-key="$RUNNER_TEMP/udm_ssh_key" \
+            --ssh-common-args="-o UserKnownHostsFile=$RUNNER_TEMP/udm_known_hosts -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes" \
+            --extra-vars "udm_report=${RUNNER_TEMP}/udm_report.txt max_age_days=${MAX_AGE_DAYS} force=${FORCE}"
+
+      # The playbook writes this report when it restarted the app (or would
+      # have, for a check-only run) or something went wrong. If the run died
+      # before it could (e.g. the UDM was unreachable), leave a note so the
+      # failure is still emailed.
+      - name: Check for a report
+        id: report
+        if: always()
+        run: |
+          if [ ! -s "$RUNNER_TEMP/udm_report.txt" ] && [ "${{ job.status }}" != "success" ]; then
+            echo "The UDM Network app check ${{ job.status }} before it could write a report (for example, the UDM was unreachable or rejected the SSH key; ~/udm-ssh-key-to-vault.sh reinstalls it). See the workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" > "$RUNNER_TEMP/udm_report.txt"
+          fi
+          if [ -s "$RUNNER_TEMP/udm_report.txt" ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Email report
+        if: always() && steps.report.outputs.found == 'true'
+        uses: dawidd6/action-send-mail@67ce3558d613188179559c61d3565140cf389968  # v22
+        with:
+          server_address: ${{ env.SMTP_SERVER }}
+          server_port: ${{ env.SMTP_PORT }}
+          username: ${{ env.SMTP_USERNAME }}
+          password: ${{ env.SMTP_PASSWORD }}
+          subject: "${{ job.status != 'success' && '❌ UDM Network app check failed' || (github.event_name == 'workflow_dispatch' && inputs.check_only) && '🔍 UDM Network app would be restarted' || '🔄 UDM Network app restarted' }}"
+          body: file://${{ runner.temp }}/udm_report.txt
+          to: ${{ env.EMAIL_TO }}
+          from: ${{ env.EMAIL_FROM }}
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/udm_ssh_key" "$RUNNER_TEMP/udm_known_hosts" "$RUNNER_TEMP/udm_report.txt"
