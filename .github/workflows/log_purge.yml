@@ -41,7 +41,7 @@ permissions:
 
 jobs:
   plan-buckets:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     env:
       ES_INDEX: ks-logstash-log*
@@ -309,7 +309,7 @@ jobs:
   purge-old-logs:
     needs: plan-buckets
     if: needs.plan-buckets.outputs.has_work == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 360
     strategy:
       fail-fast: false
@@ -576,7 +576,7 @@ jobs:
   report-summary:
     needs: [plan-buckets, purge-old-logs]
     if: always() && needs.plan-buckets.outputs.has_work == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
       - name: Aggregate performance metrics
@@ -604,7 +604,7 @@ jobs:
   force-merge:
     needs: [plan-buckets, purge-old-logs]
     if: needs.plan-buckets.outputs.has_work == 'true' && needs.purge-old-logs.result == 'success'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 120
     env:
       ES_INDEX: ks-logstash-log*
