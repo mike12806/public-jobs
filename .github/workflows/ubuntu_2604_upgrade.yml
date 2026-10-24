@@ -98,7 +98,7 @@ env:
 jobs:
   preflight:
     name: Preflight (${{ inputs.group }})
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     outputs:
       hosts: ${{ steps.hosts.outputs.hosts }}
@@ -217,7 +217,7 @@ jobs:
     name: Upgrade ${{ matrix.host }}
     needs: preflight
     if: inputs.apply && !inputs.cleanup
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 360
     strategy:
       max-parallel: 1   # never two hosts at once

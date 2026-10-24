@@ -11,7 +11,7 @@ on:
 
 jobs:
   check-k8s-nodes:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
 
     steps:
       - name: Connect to Tailscale
