@@ -8,6 +8,11 @@ name: Check Renovate Health
 # can't catch that, so this reads the newest finished run's log in each
 # namespace and emails if it didn't complete a repository, crashed, or is
 # older than 90 minutes.
+#
+# From 2026-10-18 to 2026-10-24 Renovate 44.161 could not authenticate to git
+# (gh_hdc #3955): every run still "finished" each repository, but with
+# "result": "external-host-error" or failed branch pushes, so no PR opened
+# anywhere for 6 days. It also emails when the two newest runs both hit that.
 
 on:
   schedule:
@@ -99,14 +104,27 @@ jobs:
           MAX_AGE_MIN=${MAX_AGE_MIN:-90}
           now=$(date -u +%s)
           failures=""
+          # Repos whose run ended in a git host error, and failed branch pushes,
+          # as "repo, repo|pushes" (empty when there are none). Anchored on
+          # Renovate's own output: quoted commit messages and PR bodies escape
+          # their JSON quotes, so these patterns cannot match inside them.
+          git_trouble() {
+            awk '
+              /^ *INFO: Repository finished \(repository=/ { match($0, /repository=[^)]*/); repo = substr($0, RSTART + 11, RLENGTH - 11) }
+              /^ +"result": "external-host-error",?$/ { if (repo != "") bad[repo] = 1 }
+              /^ *WARN: Error updating branch \(/ { push++ }
+              END { n = 0; for (r in bad) list = list (n++ ? ", " : "") r; if (n || push) printf "%s|%d\n", list, push }
+            '
+          }
           for ns in renovate renovate-github; do
             pod_json=$(kubectl -n "$ns" get pods -o json 2>&1) || { failures+="- $ns: kubectl get pods failed: $pod_json\n"; continue; }
-            newest=$(jq -r '[.items[] | select(.status.phase=="Succeeded" or .status.phase=="Failed")
+            # Newest finished run first, then the one before it.
+            recent=$(jq -r '[.items[] | select(.status.phase=="Succeeded" or .status.phase=="Failed")
                              | {name: .metadata.name, phase: .status.phase,
                                 done: (.status.containerStatuses[0].state.terminated.finishedAt // .status.startTime)}]
-                            | sort_by(.done) | last | if . == null then "" else "\(.name) \(.phase) \(.done)" end' <<<"$pod_json")
-            if [ -z "$newest" ]; then failures+="- $ns: no finished Renovate run retained in the namespace\n"; continue; fi
-            read -r pod phase done_at <<<"$newest"
+                            | sort_by(.done) | .[-2:] | reverse | .[] | "\(.name) \(.phase) \(.done)"' <<<"$pod_json")
+            if [ -z "$recent" ]; then failures+="- $ns: no finished Renovate run retained in the namespace\n"; continue; fi
+            read -r pod phase done_at <<<"$(head -1 <<<"$recent")"
             age_min=$(( (now - $(date -u -d "$done_at" +%s 2>/dev/null || date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$done_at" +%s)) / 60 ))
             logs=$(kubectl -n "$ns" logs "$pod" 2>&1) || { failures+="- $ns: could not read logs of $pod\n"; continue; }
             finished=$(grep -c "Repository finished" <<<"$logs" || true)
@@ -114,12 +132,23 @@ jobs:
             # also contains PR bodies, which can quote these words (a PR about this very
             # crash did, and tripped the first version of this check).
             crash=$(grep -m3 -E "^ *(FATAL: |ERROR: (unhandledRejection|uncaughtException)|(INFO|WARN|ERROR|FATAL): Renovate is exiting with a non-zero code)" <<<"$logs" | cut -c1-200 || true)
-            echo "$ns: newest finished run $pod ($phase) ${age_min}m ago; 'Repository finished' x$finished"
+            trouble=$(git_trouble <<<"$logs")
+            echo "$ns: newest finished run $pod ($phase) ${age_min}m ago; 'Repository finished' x$finished; git trouble: ${trouble:-none}"
             if [ "$age_min" -gt "$MAX_AGE_MIN" ]; then failures+="- $ns: newest finished run $pod is ${age_min} min old (limit ${MAX_AGE_MIN}); is the CronJob running?\n"; fi
             if [ -n "$crash" ] || [ "$finished" -eq 0 ]; then
               failures+="- $ns: run $pod did not complete a repository"
               [ -n "$crash" ] && failures+=". First errors:\n$(sed 's/^/    /' <<<"$crash")"
               failures+="\n"
+            fi
+            # One run with a host error can be a GitHub/Gitea blip; two in a row
+            # (40 minutes) is Renovate failing to talk to git.
+            prev=$(sed -n 2p <<<"$recent" | cut -d' ' -f1)
+            if [ -n "$trouble" ] && [ -n "$prev" ]; then
+              prev_trouble=$(kubectl -n "$ns" logs "$prev" 2>/dev/null | git_trouble)
+              if [ -n "$prev_trouble" ]; then
+                IFS='|' read -r repos pushes <<<"$trouble"
+                failures+="- $ns: runs $prev and $pod both failed to use git (host error in: ${repos:-none}; failed branch pushes: $pushes). Look for 'could not read Username' in the log.\n"
+              fi
             fi
           done
           if [ -n "$failures" ]; then
