@@ -44,7 +44,7 @@ permissions:
 
 jobs:
   ipv6-servers:
-    runs-on: ubuntu-26.04
+    runs-on: self-hosted
     timeout-minutes: 45
 
     steps:
