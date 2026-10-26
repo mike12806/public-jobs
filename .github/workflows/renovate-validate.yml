@@ -7,7 +7,7 @@ on:
 jobs:
   validate:
     name: validate-renovate-config
-    runs-on: ubuntu-26.04
+    runs-on: self-hosted
     permissions:
       contents: read
       pull-requests: read
@@ -17,6 +17,9 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Validate Renovate config
+        env:
+          # renovate: datasource=npm depName=renovate
+          RENOVATE_VERSION: 44.181.7
         run: |
           # Find all potential Renovate config files
           config_files=$(find . -type f \( \
@@ -29,7 +32,7 @@ jobs:
           # Validate each config file
           for config in $config_files; do
             echo "Validating $config..."
-            npx --yes -p renovate@43 renovate-config-validator "$config"
+            npx --yes -p "renovate@${RENOVATE_VERSION}" renovate-config-validator "$config"
             if [ $? -ne 0 ]; then
               echo "Error: Invalid Renovate configuration in $config"
               exit 1

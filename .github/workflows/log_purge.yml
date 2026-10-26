@@ -41,7 +41,7 @@ permissions:
 
 jobs:
   plan-buckets:
-    runs-on: ubuntu-26.04
+    runs-on: self-hosted
     timeout-minutes: 30
     env:
       ES_INDEX: ks-logstash-log*
@@ -87,11 +87,6 @@ jobs:
           repository: mike12806/gh_hdc
           token: ${{ env.GH_HDC_PAT }}
           path: gh_hdc
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y jq curl
 
       - name: Sanity check endpoint & index
         run: |
@@ -309,7 +304,7 @@ jobs:
   purge-old-logs:
     needs: plan-buckets
     if: needs.plan-buckets.outputs.has_work == 'true'
-    runs-on: ubuntu-26.04
+    runs-on: self-hosted
     timeout-minutes: 360
     strategy:
       fail-fast: false
@@ -359,11 +354,6 @@ jobs:
           repository: mike12806/gh_hdc
           token: ${{ env.GH_HDC_PAT }}
           path: gh_hdc
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y curl
 
       - name: Sanity check endpoint & index
         run: |
@@ -576,7 +566,7 @@ jobs:
   report-summary:
     needs: [plan-buckets, purge-old-logs]
     if: always() && needs.plan-buckets.outputs.has_work == 'true'
-    runs-on: ubuntu-26.04
+    runs-on: self-hosted
     timeout-minutes: 10
     steps:
       - name: Aggregate performance metrics
@@ -604,7 +594,7 @@ jobs:
   force-merge:
     needs: [plan-buckets, purge-old-logs]
     if: needs.plan-buckets.outputs.has_work == 'true' && needs.purge-old-logs.result == 'success'
-    runs-on: ubuntu-26.04
+    runs-on: self-hosted
     timeout-minutes: 120
     env:
       ES_INDEX: ks-logstash-log*
@@ -641,11 +631,6 @@ jobs:
           repository: mike12806/gh_hdc
           token: ${{ env.GH_HDC_PAT }}
           path: gh_hdc
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y jq curl
 
       - name: Force merge to reclaim disk space
         run: |
