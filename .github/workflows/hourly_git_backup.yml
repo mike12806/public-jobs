@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   backup:
-    runs-on: ubuntu-26.04
+    runs-on: self-hosted
 
     steps:
       - name: Prefer IPv4 for Tailscale
