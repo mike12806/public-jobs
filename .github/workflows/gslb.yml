@@ -88,24 +88,6 @@ jobs:
           token: ${{ env.GH_HDC_PAT }}
           path: gh_hdc
 
-      - name: Cache pipx and ansible
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
-        with:
-          path: |
-            ~/.local/bin
-            ~/.local/pipx
-          key: ${{ runner.os }}-pipx-ansible-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pipx-ansible-
-
-      # dnsutils: the playbook checks DNS on the VIP with dig.
-      - name: Install dependencies
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y python3-pip python3 python3-venv pipx sshpass openssh-client dnsutils
-          pipx ensurepath
-          echo "$HOME/.local/bin" >> $GITHUB_PATH
-
       - name: Write SSH Private Key to File
         env:
           SSH_KEY: ${{ env.MIKEYSSHKEYLINODE }}
@@ -134,7 +116,7 @@ jobs:
           else
             echo "::notice::Dry run (--check). Re-run with 'apply' ticked to make changes."
           fi
-          pipx run --spec ansible ansible-playbook playbooks/playbook_gslb.yaml \
+          ansible-playbook playbooks/playbook_gslb.yaml \
             -i inventory/gslb_hosts \
             -u root \
             --private-key=/tmp/mike_ssh_key \

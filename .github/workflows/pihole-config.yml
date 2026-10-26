@@ -14,8 +14,8 @@ name: Pi-hole config
 # addresses or error details. To see what a failure was, or exactly what
 # will change, run gh_hdc's "Pi-hole config" workflow by hand.
 #
-# No DNS lookups of our own, since this is what repairs DNS: Ansible is
-# installed before joining the tailnet, Tailscale's DNS is off
+# No DNS lookups of our own, since this is what repairs DNS: Ansible comes
+# with the runner image (nothing to download), Tailscale's DNS is off
 # (--accept-dns=false), Vault's address is pinned in /etc/hosts and the
 # Pi-holes are reached by IP.
 #
@@ -48,7 +48,6 @@ permissions:
   contents: read
 
 env:
-  ANSIBLE_CORE_VERSION: 2.20.5
   ANSIBLE_NOCOLOR: '1'
   ANSIBLE_CALLBACK_RESULT_FORMAT: yaml
   ANSIBLE_INVENTORY: ${{ github.workspace }}/gh_hdc/ansible/inventory/pihole_api.yaml
@@ -65,14 +64,6 @@ jobs:
     timeout-minutes: 25
 
     steps:
-      # Before Tailscale, while the runner still has its own DNS.
-      - name: Ansible
-        run: |
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          export PATH="$HOME/.local/bin:$PATH"
-          pipx install "ansible-core==${ANSIBLE_CORE_VERSION}"
-          ansible-playbook --version | head -1
-
       - name: Pin Vault's address
         run: echo "${VAULT_IP} vault.mfaherty.net" | sudo tee -a /etc/hosts
 
