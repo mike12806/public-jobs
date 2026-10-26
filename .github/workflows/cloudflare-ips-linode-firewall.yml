@@ -1,0 +1,70 @@
+name: Sync Cloudflare IPs to Linode Firewall
+
+# The Linodes behind the Cloudflare load balancer (immich.mfaherty.net ->
+# HAProxy -> WireGuard -> the k8s gateway) accept HTTPS only from Cloudflare,
+# through the inbound rule accept-inbound-https-cloudflare. This keeps that
+# rule's IPv4 list equal to https://api.cloudflare.com/client/v4/ips; every
+# other rule, the policies and the rule's IPv6 list are left alone. See
+# scripts/cloudflare_ips_linode_firewall.py.
+#
+# Nothing is written when the rule is already in sync, or when Cloudflare's
+# list can't be fetched or fails validation (fail closed).
+
+on:
+  schedule:
+    - cron: '23 * * * *'  # hourly, off the top of the hour
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Report the change without updating the firewall"
+        type: boolean
+        default: true
+
+concurrency:
+  group: cloudflare-ips-linode-firewall
+  cancel-in-progress: false
+
+permissions:
+  id-token: write  # log in to Vault through GitHub OIDC
+  contents: read
+
+jobs:
+  sync:
+    runs-on: self-hosted
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      # Vault is reached over Tailscale.
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@99a8333667fff04fdd6cffb46dfd409f8329a7bf  # v4.3.0
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          hostname: github-runner-cf-linode-firewall
+          version: latest
+
+      # Secrets come from Vault (kv/ci/*), logged in through GitHub OIDC with
+      # the role below (gh_hdc vault/), so they're no longer GitHub secrets.
+      # The token needs firewall:read_write; the script reports Linode's
+      # error if it doesn't have it.
+      - name: Read secrets from Vault
+        uses: hashicorp/vault-action@892a26828f195e65540a40b4768ae4571f51ebfc  # v4.0.0
+        with:
+          url: https://vault.mfaherty.net
+          method: jwt
+          path: github-actions
+          role: public-jobs
+          jwtGithubAudience: https://vault.mfaherty.net
+          secrets: |
+            kv/data/ci/linode LINODE_CLI_TOKEN | LINODE_TOKEN
+
+      - name: Sync the firewall rule
+        env:
+          RULE_LABEL: accept-inbound-https-cloudflare
+          # Scheduled runs apply; manual runs default to a dry run.
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+        run: python3 scripts/cloudflare_ips_linode_firewall.py
