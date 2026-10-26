@@ -60,7 +60,7 @@ env:
 
 jobs:
   pihole:
-    runs-on: ubuntu-26.04
+    runs-on: self-hosted
     # Gravity rebuilds (only when lists change) take a few minutes each.
     timeout-minutes: 25
 
