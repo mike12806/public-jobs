@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   restart-cattle-agent:
-    runs-on: ubuntu-26.04
+    runs-on: self-hosted
     timeout-minutes: 10
 
     steps:

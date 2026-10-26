@@ -40,7 +40,7 @@ permissions:
 
 jobs:
   vault-cluster:
-    runs-on: ubuntu-26.04
+    runs-on: self-hosted
     timeout-minutes: 60
 
     steps:
