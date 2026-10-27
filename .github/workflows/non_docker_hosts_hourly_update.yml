@@ -2,7 +2,7 @@ name: Hourly Non Docker Host Update Check
 
 on:
   schedule:
-    - cron: "56 * * * *"  # Runs hourly at minute 56 (staggered off the top of the hour)
+    - cron: "14 * * * *"  # Runs hourly at minute 14 (staggered off the top of the hour)
   workflow_dispatch:  # Allows manual triggering from GitHub Actions UI
 
 concurrency:
