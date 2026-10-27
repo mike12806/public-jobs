@@ -2,7 +2,7 @@ name: Hourly Git Backup to B2
 
 on:
   schedule:
-    - cron: '0 * * * *'    # Run every hour
+    - cron: '4 * * * *'    # Run every hour at minute 4 (staggered off the top of the hour)
   workflow_dispatch:      # Allow manual trigger
 
 permissions:
