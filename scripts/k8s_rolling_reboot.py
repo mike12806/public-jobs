@@ -404,10 +404,16 @@ def run_on_host(node: str, script: str, timeout: int = 120) -> tuple[bool, str]:
                        capture_output=True, timeout=30)
 
 
+# The host's /var/run is an absolute symlink to /run. Followed under /host it
+# resolves inside the container, to the container's own empty /run, so the
+# sentinel has to be read through /host/run directly.
+REBOOT_SENTINEL = "/host/run/reboot-required"
+
+
 def reboot_required(node: str) -> bool | None:
     """True/False, or None if the host could not be read."""
     ok, out = run_on_host(
-        node, "test -f /host/var/run/reboot-required && echo YES || echo NO"
+        node, f"test -f {REBOOT_SENTINEL} && echo YES || echo NO"
     )
     if not ok and "YES" not in out and "NO" not in out:
         return None
@@ -415,7 +421,7 @@ def reboot_required(node: str) -> bool | None:
 
 
 def reboot_reason(node: str) -> str:
-    _, out = run_on_host(node, "cat /host/var/run/reboot-required.pkgs 2>/dev/null")
+    _, out = run_on_host(node, f"cat {REBOOT_SENTINEL}.pkgs 2>/dev/null")
     pkgs = [p for p in out.split() if p]
     return ", ".join(pkgs[:8]) + ("..." if len(pkgs) > 8 else "") if pkgs else "unknown"
 
