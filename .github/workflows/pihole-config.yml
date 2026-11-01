@@ -14,10 +14,10 @@ name: Pi-hole config
 # addresses or error details. To see what a failure was, or exactly what
 # will change, run gh_hdc's "Pi-hole config" workflow by hand.
 #
-# No DNS lookups of our own, since this is what repairs DNS: Ansible comes
-# with the runner image (nothing to download), Tailscale's DNS is off
-# (--accept-dns=false), Vault's address is pinned in /etc/hosts and the
-# Pi-holes are reached by IP.
+# No lookups through our own DNS, since this is what repairs DNS: Ansible
+# installs before the job joins the tailnet (the runner's own resolver finds
+# PyPI), Tailscale's DNS is off (--accept-dns=false), Vault's address is pinned
+# in /etc/hosts and the Pi-holes are reached by IP.
 #
 # Credentials: the Pi-holes' app passwords and the gh_hdc checkout token from
 # Vault (role public-jobs-pihole, gh_hdc vault/); the Tailscale OAuth client
@@ -59,13 +59,24 @@ env:
 
 jobs:
   pihole:
-    runs-on: self-hosted
+    runs-on: ubuntu-26.04
     # Gravity rebuilds (only when lists change) take a few minutes each.
     timeout-minutes: 25
 
     steps:
       - name: Pin Vault's address
         run: echo "${VAULT_IP} vault.mfaherty.net" | sudo tee -a /etc/hosts
+
+      # Same version as the ARC runner image. Installed before Tailscale, so pip
+      # doesn't depend on tailnet DNS and third-party code runs off the tailnet.
+      - name: Install Ansible
+        env:
+          ANSIBLE_VERSION: 14.5.0
+          PIPX_HOME: ${{ runner.temp }}/pipx
+          PIPX_BIN_DIR: ${{ runner.temp }}/pipx/bin
+        run: |
+          pipx install --include-deps "ansible==${ANSIBLE_VERSION}"
+          echo "$PIPX_BIN_DIR" >> "$GITHUB_PATH"
 
       - name: Connect to Tailscale
         uses: tailscale/github-action@99a8333667fff04fdd6cffb46dfd409f8329a7bf  # v4.3.0

@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   check-cnpg-backups:
-    runs-on: self-hosted
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
 
     steps:

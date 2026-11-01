@@ -41,7 +41,7 @@ permissions:
 
 jobs:
   log-shipping:
-    runs-on: self-hosted
+    runs-on: ubuntu-26.04
     timeout-minutes: 45
 
     steps:
@@ -49,6 +49,17 @@ jobs:
         run: |
           # Force IPv4 preference to avoid Tailscale IPv6 connectivity issues
           echo 'precedence ::ffff:0:0/96 100' | sudo tee -a /etc/gai.conf
+
+      # Same version as the ARC runner image. Installed before Tailscale, so pip
+      # doesn't depend on tailnet DNS and third-party code runs off the tailnet.
+      - name: Install Ansible
+        env:
+          ANSIBLE_VERSION: 14.5.0
+          PIPX_HOME: ${{ runner.temp }}/pipx
+          PIPX_BIN_DIR: ${{ runner.temp }}/pipx/bin
+        run: |
+          pipx install --include-deps "ansible==${ANSIBLE_VERSION}"
+          echo "$PIPX_BIN_DIR" >> "$GITHUB_PATH"
 
       - name: Connect to Tailscale
         uses: tailscale/github-action@99a8333667fff04fdd6cffb46dfd409f8329a7bf  # v4.3.0
