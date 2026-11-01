@@ -14,10 +14,10 @@ name: Pi-hole config
 # addresses or error details. To see what a failure was, or exactly what
 # will change, run gh_hdc's "Pi-hole config" workflow by hand.
 #
-# No DNS lookups of our own, since this is what repairs DNS: Ansible comes
-# with the runner image (nothing to download), Tailscale's DNS is off
-# (--accept-dns=false), Vault's address is pinned in /etc/hosts and the
-# Pi-holes are reached by IP.
+# No lookups through our own DNS, since this is what repairs DNS: Ansible
+# installs before the job joins the tailnet (the runner's own resolver finds
+# PyPI), Tailscale's DNS is off (--accept-dns=false), Vault's address is pinned
+# in /etc/hosts and the Pi-holes are reached by IP.
 #
 # Credentials: the Pi-holes' app passwords and the gh_hdc checkout token from
 # Vault (role public-jobs-pihole, gh_hdc vault/); the Tailscale OAuth client
