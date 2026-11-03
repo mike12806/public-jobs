@@ -123,10 +123,14 @@ jobs:
               echo "  ✅ WAL archiving is working"
             fi
             
-            # Check last backup status using the Backup CRs.
+            # Check last backup status. The age comes from the ObjectStore, which
+            # the barman plugin updates from the catalog in B2, not from the Backup
+            # CRs: the plugin deletes the CR of a completed backup if a B2 read error
+            # leaves it out of one catalog listing, so a missing CR doesn't mean a
+            # missing backup. Failed Backup CRs are kept, so they're still used below.
             # NOTE: this deliberately does NOT use kubectl events. Events have a
             # 1h TTL on this cluster, so with daily backups the "Completed" event
-            # has expired for ~23 of this job's 24 hourly runs. Backup CRs persist.
+            # has expired for ~23 of this job's 24 hourly runs.
             SCHEDULED_BACKUPS=$(kubectl -n cloudnative-pg get scheduledbackup -o json | jq -r ".items[] | select(.spec.cluster.name==\"$CLUSTER\") | .metadata.name")
 
             if [ -z "$SCHEDULED_BACKUPS" ]; then
@@ -135,23 +139,24 @@ jobs:
 
             ALL_BACKUPS=$(kubectl -n cloudnative-pg get backups.postgresql.cnpg.io -o json)
 
-            # Most recent successfully completed backup for this cluster
-            LAST_COMPLETED=$(echo "$ALL_BACKUPS" | jq -r --arg c "$CLUSTER" '
-              [ .items[]
-                | select(.spec.cluster.name == $c)
-                | select(.status.phase == "completed")
-                | select(.status.stoppedAt != null) ]
-              | sort_by(.status.stoppedAt) | last // empty')
+            OBJECT_STORE=$(kubectl -n cloudnative-pg get clusters.postgresql.cnpg.io $CLUSTER -o json | jq -r '
+              [ .spec.plugins[]?
+                | select(.name == "barman-cloud.cloudnative-pg.io")
+                | .parameters.barmanObjectName ]
+              | first // empty')
 
-            if [ -z "$LAST_COMPLETED" ]; then
-              echo "    ❌ No completed backups found for this cluster"
-              FAILED_CHECKS="${FAILED_CHECKS}${CLUSTER}: No completed backups found\n"
+            LAST_BACKUP_TIME=""
+            if [ -n "$OBJECT_STORE" ]; then
+              LAST_BACKUP_TIME=$(kubectl -n cloudnative-pg get objectstores.barmancloud.cnpg.io "$OBJECT_STORE" -o json | jq -r --arg c "$CLUSTER" '
+                .status.serverRecoveryWindow[$c].lastSuccessfulBackupTime // empty')
+            fi
+
+            if [ -z "$LAST_BACKUP_TIME" ]; then
+              echo "    ❌ No successful backup recorded for this cluster"
+              FAILED_CHECKS="${FAILED_CHECKS}${CLUSTER}: No successful backup recorded on ObjectStore '${OBJECT_STORE:-none}'\n"
               ALL_PASSED=false
             else
-              LAST_BACKUP_TIME=$(echo "$LAST_COMPLETED" | jq -r '.status.stoppedAt')
-              BACKUP_NAME=$(echo "$LAST_COMPLETED" | jq -r '.metadata.name')
-
-              echo "    Latest successful backup: $BACKUP_NAME at $LAST_BACKUP_TIME"
+              echo "    Latest successful backup in ${OBJECT_STORE}: $LAST_BACKUP_TIME"
 
               # Any failed backups since that success mean backups are broken now
               FAILED_SINCE=$(echo "$ALL_BACKUPS" | jq -r --arg c "$CLUSTER" --arg since "$LAST_BACKUP_TIME" '
