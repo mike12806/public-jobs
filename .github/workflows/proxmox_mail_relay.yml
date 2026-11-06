@@ -1,0 +1,138 @@
+name: Proxmox Mail Relay
+
+# Postfix on the Proxmox hosts relays through Gmail with its own copy of the
+# login. It was missed when the app password was rotated on 2025-09-03, and
+# backup reports bounced for 14 months. This keeps it in step with Vault
+# kv/ci/smtp (gh_hdc ansible/playbooks/playbook_proxmox_mail_relay.yaml), and
+# fails if that login stops working.
+#
+# This repo is public, so its logs are too: the playbook keeps the password out
+# of the output (no_log) and this runs without --diff.
+on:
+  schedule:
+    - cron: "47 7 * * *"  # Daily
+  workflow_dispatch:  # Allows manual triggering from the GitHub Actions UI
+    inputs:
+      dry_run:
+        description: "Dry run (--check): report which hosts would change"
+        type: boolean
+        default: false
+      gh_hdc_ref:
+        description: "gh_hdc branch/ref to run the playbook from"
+        required: false
+        default: main
+
+concurrency:
+  group: proxmox_mail_relay
+  cancel-in-progress: false  # never interrupt a host between file and table
+
+permissions:
+  id-token: write  # log in to Vault through GitHub OIDC
+  contents: read
+
+jobs:
+  update-login:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+
+    steps:
+      # Same version as the ARC runner image. Installed before Tailscale, so pip
+      # doesn't depend on tailnet DNS and third-party code runs off the tailnet.
+      - name: Install Ansible
+        env:
+          ANSIBLE_VERSION: 14.5.0
+          PIPX_HOME: ${{ runner.temp }}/pipx
+          PIPX_BIN_DIR: ${{ runner.temp }}/pipx/bin
+        run: |
+          pipx install --include-deps "ansible==${ANSIBLE_VERSION}"
+          echo "$PIPX_BIN_DIR" >> "$GITHUB_PATH"
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@064b10558093f38325e838ddea35486bdc6b1d5c  # v4.4.0
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          hostname: github-runner-proxmox-mail-relay
+          version: latest
+
+      # Secrets come from Vault (kv/ci/*), logged in through GitHub OIDC with
+      # the role below (gh_hdc vault/), so they're no longer GitHub secrets.
+      - name: Read secrets from Vault
+        uses: hashicorp/vault-action@892a26828f195e65540a40b4768ae4571f51ebfc  # v4.0.0
+        with:
+          url: https://vault.mfaherty.net
+          method: jwt
+          path: github-actions
+          role: public-jobs
+          jwtGithubAudience: https://vault.mfaherty.net
+          secrets: |
+            kv/data/ci/github GH_HDC_PAT | GH_HDC_PAT ;
+            kv/data/ci/smtp EMAIL_FROM | EMAIL_FROM ;
+            kv/data/ci/smtp EMAIL_TO | EMAIL_TO ;
+            kv/data/ci/smtp SMTP_PASSWORD | SMTP_PASSWORD ;
+            kv/data/ci/smtp SMTP_PORT | SMTP_PORT ;
+            kv/data/ci/smtp SMTP_SERVER | SMTP_SERVER ;
+            kv/data/ci/smtp SMTP_USERNAME | SMTP_USERNAME ;
+            kv/data/ci/ssh ANSIBLE_SSH_PASSWORD_3 | ANSIBLE_SSH_PASSWORD_3 ;
+            kv/data/ci/ssh MIKEYSSHKEYLINODE | MIKEYSSHKEYLINODE
+
+      - name: Checkout gh_hdc
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: mike12806/gh_hdc
+          ref: ${{ inputs.gh_hdc_ref || 'main' }}
+          token: ${{ env.GH_HDC_PAT }}
+          path: gh_hdc
+
+      - name: Write SSH Private Key to File
+        env:
+          SSH_KEY: ${{ env.MIKEYSSHKEYLINODE }}
+        run: |
+          printf '%s\n' "$SSH_KEY" | sed 's/\\n/\n/g' > /tmp/mike_ssh_key
+          chmod 600 /tmp/mike_ssh_key
+
+      - name: Run Ansible Playbook
+        working-directory: gh_hdc/ansible
+        env:
+          ANSIBLE_SSH_PASS_3: ${{ env.ANSIBLE_SSH_PASSWORD_3 }}
+          ANSIBLE_PYTHON_INTERPRETER: /usr/bin/python3
+          ANSIBLE_GATHERING: smart
+          ANSIBLE_TIMEOUT: 30
+          ANSIBLE_STDOUT_CALLBACK: ansible.builtin.default
+          ANSIBLE_CALLBACK_RESULT_FORMAT: yaml
+          ANSIBLE_HOST_KEY_CHECKING: false
+          DRY_RUN: ${{ inputs.dry_run || false }}
+        run: |
+          mode=()
+          if [ "$DRY_RUN" = "true" ]; then
+            mode=(--check)
+            echo "::notice::Dry run (--check). No host is changed."
+          fi
+          ansible-playbook playbooks/playbook_proxmox_mail_relay.yaml \
+            -i inventory/proxmox_hosts \
+            -u root \
+            --private-key=/tmp/mike_ssh_key \
+            "${mode[@]}" \
+            --extra-vars "ansible_ssh_pass=${ANSIBLE_SSH_PASS_3} ansible_ssh_common_args='-o StrictHostKeyChecking=no'"
+
+      # Can't send if the login itself is what failed; the run is still red.
+      - name: Email the failure
+        if: failure() && github.event_name == 'schedule'
+        uses: dawidd6/action-send-mail@47af4a10b540781705f283a2cf1a9650713ac795  # v23
+        with:
+          server_address: ${{ env.SMTP_SERVER }}
+          server_port: ${{ env.SMTP_PORT }}
+          username: ${{ env.SMTP_USERNAME }}
+          password: ${{ env.SMTP_PASSWORD }}
+          subject: "❌ Proxmox mail relay login failed"
+          body: |
+            Keeping the Proxmox hosts' Postfix login in step with Vault kv/ci/smtp failed, so backup report mail may be bouncing.
+            Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          to: ${{ env.EMAIL_TO }}
+          from: ${{ env.EMAIL_FROM }}
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -f /tmp/mike_ssh_key
