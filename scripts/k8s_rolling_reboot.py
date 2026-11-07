@@ -623,13 +623,22 @@ def replica_map() -> dict[str, dict[str, bool]]:
     for r in data.get("items", []):
         spec = r.get("spec", {})
         vol, node = spec.get("volumeName"), spec.get("nodeID")
-        if not vol or not node:
+        if not vol:
             # Refuse to guess. Reporting fewer replicas than exist would be
             # conservative; placing a replica on the wrong node would not.
             raise Abort(
                 f"replica {r.get('metadata', {}).get('name')} has no volumeName "
-                "or nodeID -- cannot tell which node holds which copy"
+                "-- cannot tell which volume it is a copy of"
             )
+        if not node:
+            # Never scheduled: Longhorn made the object but found no disk for
+            # it, so it holds no data anywhere and no reboot can take a copy
+            # away. The usual source is best-effort data locality asking for a
+            # local replica on a node that lacks the space -- which stays put
+            # for as long as the workload does, so aborting on it would fail
+            # every run until then. Leaving it out also keeps it from counting
+            # toward the volume's floor, which it could never help meet.
+            continue
         healthy = bool(spec.get("healthyAt")) and not spec.get("failedAt")
         # Two replicas of one volume on a single node is an anti-affinity
         # violation, but if it happens that node counts as holding a healthy
