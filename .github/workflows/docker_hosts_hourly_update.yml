@@ -23,7 +23,7 @@ jobs:
       # doesn't depend on tailnet DNS and third-party code runs off the tailnet.
       - name: Install Ansible
         env:
-          ANSIBLE_VERSION: 14.5.0
+          ANSIBLE_VERSION: 14.6.0
           PIPX_HOME: ${{ runner.temp }}/pipx
           PIPX_BIN_DIR: ${{ runner.temp }}/pipx/bin
         run: |
