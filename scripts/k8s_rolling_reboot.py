@@ -6,7 +6,9 @@ early leaving the cluster up -- never "keep going and hope".
 
 Per node, in sequence:
   1. skip unless /var/run/reboot-required exists on the host
-  2. cordon + drain: a short polite pass, then one deleting pass for pods a
+  2. cordon, let any GitHub Actions job running on the node finish (ARC
+     runners are retired, never evicted; see retire_runners), then drain: a
+     short polite pass, then one deleting pass for pods a
      PodDisruptionBudget will never release. A drain that fails even then
      aborts the run.
   3. reboot, escalating only on failure:
@@ -88,6 +90,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 # --- tunables -----------------------------------------------------------------
+RUNNER_WAIT = 3600           # 60m for GitHub Actions jobs already running on a
+                             # cordoned node to finish before it is drained.
+                             # Self-hosted jobs here take minutes; one still
+                             # going after an hour is wedged, and the node is
+                             # handed back rather than rebooted under it.
 DRAIN_TIMEOUT = 180          # 3m of polite eviction; a PDB refusal never clears
 DRAIN_FORCE_TIMEOUT = 300    # 5m more, deleting rather than evicting
 DOWN_WAIT = 150              # 2.5m for a reboot to take the node NotReady at all
@@ -164,15 +171,20 @@ HEARTBEAT = 60               # never go longer than this without saying
 # FAULT_GRACE is in here because a fault seen during a node's redundancy wait
 # extends that wait by the window it spends re-checking. STORAGE_TIMEOUT counts
 # twice: once before the uncordon and once after.
-NODE_WORST_CASE = (DRAIN_TIMEOUT + DRAIN_FORCE_TIMEOUT + GRACEFUL_WAIT
-                   + HARD_STOP_WAIT + RETURN_TIMEOUT + 2 * STORAGE_TIMEOUT
-                   + SETTLE_TIMEOUT + FAULT_GRACE)
+NODE_WORST_CASE = (RUNNER_WAIT + DRAIN_TIMEOUT + DRAIN_FORCE_TIMEOUT
+                   + GRACEFUL_WAIT + HARD_STOP_WAIT + RETURN_TIMEOUT
+                   + 2 * STORAGE_TIMEOUT + SETTLE_TIMEOUT + FAULT_GRACE)
 # What a node still needs after its redundancy wait returns: everything in the
 # worst case except the wait itself. The wait is allowed to run long while
 # rebuilds are progressing, so it has to leave this much of the run budget
 # behind -- waiting until the budget is gone and then cordoning a node is how
 # you get killed at GitHub's 360m limit with a node half rebooted.
 REBOOT_RESERVE = NODE_WORST_CASE - SETTLE_TIMEOUT
+# Likewise for the runner wait, which comes after it: the drain onward.
+DRAIN_RESERVE = REBOOT_RESERVE - RUNNER_WAIT
+# ARC puts this label on every runner pod and names the pod after its
+# EphemeralRunner.
+RUNNER_LABEL = "actions-ephemeral-runner"
 # GitHub caps a job at 360 minutes and kills it mid-step, which here could mean
 # a node left cordoned or half-rebooted with no failure email (a cancelled job
 # skips if: failure()). So stop starting nodes before that can happen. The
@@ -1331,6 +1343,89 @@ def storage_back(node: str, require: tuple[str, ...],
     return False
 
 
+def runners_on(node: str) -> list[tuple[str, str, str]]:
+    """(namespace, name, job) for each live ARC runner pod on `node`.
+
+    `job` is "<repo> <workflow ref>" for a runner GitHub has handed a job, and
+    "" for an idle one. A pod that has already finished is not a runner any
+    more: ARC removes it on its own, and nothing is left to interrupt.
+    """
+    pods = [p for p in kubectl_json(
+                "get", "pods", "-A", "-l", f"{RUNNER_LABEL}=True",
+                "--field-selector", f"spec.nodeName={node}")["items"]
+            if p.get("status", {}).get("phase") not in ("Succeeded", "Failed")]
+    if not pods:
+        return []
+    # Which job a runner holds is on its EphemeralRunner, not its pod.
+    raw = kubectl("get", "ephemeralrunners", "-A", "-o", "json", check=False)
+    jobs = {}
+    for er in (json.loads(raw)["items"] if raw else []):
+        st = er.get("status") or {}
+        if st.get("jobRequestId"):
+            jobs[(er["metadata"]["namespace"], er["metadata"]["name"])] = (
+                f"{st.get('jobRepositoryName') or '?'} "
+                f"{st.get('jobWorkflowRef') or ''}").strip()
+    return [(p["metadata"]["namespace"], p["metadata"]["name"],
+             jobs.get((p["metadata"]["namespace"], p["metadata"]["name"]), ""))
+            for p in pods]
+
+
+def retire_runners(node: str, budget_left: float | None) -> None:
+    """Get the GitHub Actions runners off a cordoned `node` without killing a job.
+
+    A drain evicts a runner pod like any other, and the runner answers SIGTERM
+    by abandoning its job ("The runner has received a shutdown signal"). That
+    is how this run used to fail other repositories' CI.
+
+    So delete each runner's EphemeralRunner instead. ARC's finalizer
+    deregisters the runner from GitHub before it lets the pod go, and GitHub
+    refuses while a job is assigned, so ARC retries every 30s and leaves the
+    pod alone until the job ends. An idle runner is deregistered first, so it
+    cannot be handed a job on its way out: there is no window between "looks
+    idle" and "gone". ARC replaces each one, and the cordon keeps the
+    replacements off this node. drain_node() skips runner pods, so nothing
+    races this.
+
+    Bounded by RUNNER_WAIT, and by the run budget less what the drain and
+    reboot still need. A job still running at the end is not interrupted: the
+    caller uncordons the node and stops the run, and the node stays flagged
+    for the next one.
+    """
+    runners = runners_on(node)
+    if not runners:
+        return
+    for ns, name, job in runners:
+        log(f"      runner {ns}/{name}: {'BUSY ' + job if job else 'idle'}")
+        kubectl("delete", "ephemeralrunner", "-n", ns, name,
+                "--wait=false", "--ignore-not-found")
+
+    limit = float(RUNNER_WAIT)
+    if budget_left is not None:
+        limit = max(min(limit, budget_left - DRAIN_RESERVE), 60.0)
+    deadline = time.time() + limit
+    beat = time.time()
+    while True:
+        remaining = runners_on(node)
+        if not remaining:
+            log("      runners gone")
+            return
+        if time.time() >= deadline:
+            break
+        if time.time() - beat >= HEARTBEAT:
+            beat = time.time()
+            log(f"      waiting on {len(remaining)} runner(s): "
+                + ", ".join(f"{ns}/{name} ({job or 'idle'})"
+                            for ns, name, job in remaining)
+                + f"; {int(deadline - time.time())}s left")
+        time.sleep(POLL)
+    raise Abort(
+        f"GitHub Actions jobs on {node} were still running after "
+        f"{int(limit)}s: "
+        + ", ".join(f"{ns}/{name} ({job or 'idle'})"
+                    for ns, name, job in remaining)
+    )
+
+
 def drain_node(node: str) -> None:
     """Evict what leaves politely, then delete what will not.
 
@@ -1342,11 +1437,15 @@ def drain_node(node: str) -> None:
     not pods a budget is protecting. Deleting instead of evicting is what gets
     past a PDB, so do that on the second pass.
 
+    Runner pods are left out of both passes: retire_runners() has already
+    waited for them, and evicting one would abandon whatever job it holds.
+
     This is not a bypass of the health gates. Preflight still refuses to start
     on a degraded cluster, the identity assertion still runs, and Longhorn must
     be fully settled before the next node is touched.
     """
-    common = ("--ignore-daemonsets", "--delete-emptydir-data")
+    common = ("--ignore-daemonsets", "--delete-emptydir-data",
+              f"--pod-selector=!{RUNNER_LABEL}")
     try:
         # retries=1: kubectl()'s default would run the whole timeout three times
         # over before reporting a stall.
@@ -1447,6 +1546,7 @@ def reboot_node(node: str, vm: VmRef, dry_run: bool) -> None:
 def process_node(node: str, vm: VmRef, dry_run: bool, forced: bool = False,
                  budget_left: float | None = None,
                  control_plane: bool = False) -> bool:
+    started = time.time()
     if forced:
         log(f"  {node}: FORCED -- treating as needing a reboot (test override)")
     else:
@@ -1460,12 +1560,17 @@ def process_node(node: str, vm: VmRef, dry_run: bool, forced: bool = False,
     assert_identity(node, vm)
 
     if dry_run:
-        log(f"    DRY-RUN: would cordon, drain, reboot, uncordon {node}")
+        runners = runners_on(node)
+        busy = sum(1 for _, _, job in runners if job)
+        log(f"    DRY-RUN: would cordon, retire {len(runners)} runner(s) "
+            f"({busy} busy), drain, reboot, uncordon {node}")
         return True
 
     log("    cordon + drain")
     cordon_node(node)
     try:
+        retire_runners(node, None if budget_left is None
+                       else budget_left - (time.time() - started))
         drain_node(node)
     except (Abort, subprocess.TimeoutExpired) as exc:
         uncordon_node(node, check=False)
