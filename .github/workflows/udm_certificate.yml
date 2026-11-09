@@ -1,0 +1,154 @@
+name: UDM Certificate
+
+# The UDM Pro serves a Cloudflare Origin CA certificate for unifi.mfaherty.net,
+# so hdctl (Workers VPC, verify_full) and the cluster gateway can verify it
+# instead of UniFi OS's self-signed unifi.local one. gh_hdc
+# ansible/playbooks/playbook_udm_certificate.yaml checks the certificate the
+# UDM actually serves and renews it when fewer than 30 days are left, or as
+# soon as UniFi OS stops serving it (a firmware update putting its own back):
+# a new key made on the UDM (it never leaves it), a 365-day certificate from
+# Cloudflare's Origin CA, and a restart of unifi-core only (routing, Wi-Fi and
+# the Network app keep running). A renewal or a failure is emailed.
+#
+# Daily, in the morning so a renewal happens while someone is around, and
+# well clear of the UDM Network App job's 04:40 restart. With 30 days of
+# margin, a renewal that keeps failing is reported every day for a month
+# before anything expires.
+#
+# Vault kv/ci/udm: the SSH key and the UDM's host key (put there by
+# ~/udm-ssh-key-to-vault.sh on the Mac mini), and CF_ORIGIN_CA_TOKEN, a
+# Cloudflare token limited to Zone > SSL and Certificates > Edit on
+# mfaherty.net. This repository's logs are public; the playbook prints
+# nothing secret.
+on:
+  schedule:
+    - cron: "25 13 * * *"  # 09:25 New York, summer time
+  workflow_dispatch:
+    inputs:
+      check_only:
+        description: "Only report whether it would renew; change nothing"
+        type: boolean
+        default: true
+      force:
+        description: "Renew even if the current certificate is fine"
+        type: boolean
+        default: false
+
+concurrency:
+  group: udm_certificate
+  cancel-in-progress: false  # never interrupt a certificate swap half way
+
+permissions:
+  id-token: write  # log in to Vault through GitHub OIDC
+  contents: read
+
+jobs:
+  udm-certificate:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+
+    steps:
+      # Same version as the ARC runner image. Installed before Tailscale, so pip
+      # doesn't depend on tailnet DNS and third-party code runs off the tailnet.
+      - name: Install Ansible
+        env:
+          ANSIBLE_VERSION: 14.5.0
+          PIPX_HOME: ${{ runner.temp }}/pipx
+          PIPX_BIN_DIR: ${{ runner.temp }}/pipx/bin
+        run: |
+          pipx install --include-deps "ansible==${ANSIBLE_VERSION}"
+          echo "$PIPX_BIN_DIR" >> "$GITHUB_PATH"
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@064b10558093f38325e838ddea35486bdc6b1d5c  # v4.4.0
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          hostname: github-runner-udm-certificate
+          version: latest
+
+      - name: Read secrets from Vault
+        uses: hashicorp/vault-action@892a26828f195e65540a40b4768ae4571f51ebfc  # v4.0.0
+        with:
+          url: https://vault.mfaherty.net
+          method: jwt
+          path: github-actions
+          role: public-jobs
+          jwtGithubAudience: https://vault.mfaherty.net
+          secrets: |
+            kv/data/ci/github GH_HDC_PAT | GH_HDC_PAT ;
+            kv/data/ci/smtp EMAIL_FROM | EMAIL_FROM ;
+            kv/data/ci/smtp EMAIL_TO | EMAIL_TO ;
+            kv/data/ci/smtp SMTP_PASSWORD | SMTP_PASSWORD ;
+            kv/data/ci/smtp SMTP_PORT | SMTP_PORT ;
+            kv/data/ci/smtp SMTP_SERVER | SMTP_SERVER ;
+            kv/data/ci/smtp SMTP_USERNAME | SMTP_USERNAME ;
+            kv/data/ci/udm SSH_PRIVATE_KEY | UDM_SSH_PRIVATE_KEY ;
+            kv/data/ci/udm SSH_KNOWN_HOSTS | UDM_SSH_KNOWN_HOSTS ;
+            kv/data/ci/udm CF_ORIGIN_CA_TOKEN | CF_ORIGIN_CA_TOKEN
+
+      - name: Checkout gh_hdc
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: mike12806/gh_hdc
+          token: ${{ env.GH_HDC_PAT }}
+          path: gh_hdc
+
+      - name: Write the SSH key and the UDM's host key
+        run: |
+          umask 077
+          printf '%s\n' "$UDM_SSH_PRIVATE_KEY" > "$RUNNER_TEMP/udm_ssh_key"
+          printf '%s\n' "$UDM_SSH_KNOWN_HOSTS" > "$RUNNER_TEMP/udm_known_hosts"
+
+      - name: Run Ansible Playbook
+        working-directory: gh_hdc/ansible
+        env:
+          ANSIBLE_GATHERING: explicit
+          ANSIBLE_TIMEOUT: 30
+          ANSIBLE_STDOUT_CALLBACK: ansible.builtin.default
+          ANSIBLE_CALLBACK_RESULT_FORMAT: yaml
+          FORCE: ${{ inputs.force || false }}
+          CHECK: ${{ github.event_name == 'workflow_dispatch' && inputs.check_only && '--check' || '' }}
+        run: |
+          # shellcheck disable=SC2086  # CHECK is empty or one flag
+          ansible-playbook playbooks/playbook_udm_certificate.yaml $CHECK \
+            -i inventory/udm \
+            --private-key="$RUNNER_TEMP/udm_ssh_key" \
+            --ssh-common-args="-o UserKnownHostsFile=$RUNNER_TEMP/udm_known_hosts -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes" \
+            --extra-vars "udm_report=${RUNNER_TEMP}/udm_report.txt force=${FORCE}"
+
+      # The playbook writes this report when it renewed (or would have, for a
+      # check-only run) or something went wrong. If the run died before it
+      # could (e.g. the UDM was unreachable), leave a note so the failure is
+      # still emailed.
+      - name: Check for a report
+        id: report
+        if: always()
+        run: |
+          if [ ! -s "$RUNNER_TEMP/udm_report.txt" ] && [ "${{ job.status }}" != "success" ]; then
+            echo "The UDM certificate check ${{ job.status }} before it could write a report (for example, the UDM was unreachable or rejected the SSH key; ~/udm-ssh-key-to-vault.sh reinstalls it). Until it runs, the UDM's certificate isn't being renewed. See the workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" > "$RUNNER_TEMP/udm_report.txt"
+          fi
+          if [ -s "$RUNNER_TEMP/udm_report.txt" ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Email report
+        if: always() && steps.report.outputs.found == 'true'
+        uses: dawidd6/action-send-mail@27bf7a883db6de205849f760badd38a1a3ce0dd0  # v24
+        with:
+          server_address: ${{ env.SMTP_SERVER }}
+          server_port: ${{ env.SMTP_PORT }}
+          username: ${{ env.SMTP_USERNAME }}
+          password: ${{ env.SMTP_PASSWORD }}
+          subject: "${{ job.status != 'success' && '❌ UDM certificate check failed' || (github.event_name == 'workflow_dispatch' && inputs.check_only) && '🔍 UDM certificate would be renewed' || '🔐 UDM certificate renewed' }}"
+          body: file://${{ runner.temp }}/udm_report.txt
+          to: ${{ env.EMAIL_TO }}
+          from: ${{ env.EMAIL_FROM }}
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/udm_ssh_key" "$RUNNER_TEMP/udm_known_hosts" "$RUNNER_TEMP/udm_report.txt"
