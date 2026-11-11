@@ -55,11 +55,6 @@ jobs:
           token: ${{ env.GH_HDC_PAT }}
           path: gh_hdc
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y jq
-
       - name: Setup kubectl
         uses: azure/setup-kubectl@bda439f5f36b99b262ebdcd3613869bddb064c8e  # v5.2.0
         with:
