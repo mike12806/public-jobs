@@ -140,10 +140,8 @@ jobs:
           token: ${{ env.GH_HDC_PAT }}
           path: gh_hdc
 
-      - name: Install dependencies
+      - name: Set up pipx
         run: |
-          sudo apt-get update -y
-          sudo apt-get install -y python3-pip python3 python3-venv pipx sshpass openssh-client jq
           pipx ensurepath
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
@@ -306,10 +304,8 @@ jobs:
           token: ${{ env.GH_HDC_PAT }}
           path: gh_hdc
 
-      - name: Install dependencies
+      - name: Set up pipx
         run: |
-          sudo apt-get update -y
-          sudo apt-get install -y python3-pip python3 python3-venv pipx sshpass openssh-client
           pipx ensurepath
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 

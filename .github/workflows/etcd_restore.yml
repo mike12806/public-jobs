@@ -147,14 +147,13 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pipx-ansible-
 
-      # iputils-ping: the playbook pings a new member's address before
-      # creating it, to catch a device still holding that lease.
-      - name: Install dependencies
+      # ping (iputils-ping, on the runner image): the playbook pings a new
+      # member's address before creating it, to catch a device still holding
+      # that lease.
+      - name: Set up pipx
         run: |
-          sudo apt-get update -y
-          sudo apt-get install -y python3-pip python3 python3-venv pipx sshpass openssh-client iputils-ping
           pipx ensurepath
-          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       # New containers get this key's public half as root's authorized key.
       - name: Write SSH Private Key to File
