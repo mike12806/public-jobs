@@ -47,6 +47,19 @@
       ],
       "depNameTemplate": "ansible",
       "datasourceTemplate": "pypi"
+    },
+    {
+      "customType": "regex",
+      "description": "restic version pin in the etcd backup checker (installed from the GitHub release, not apt)",
+      "managerFilePatterns": [
+        ".github/workflows/etcd-backup-checker.yml"
+      ],
+      "matchStrings": [
+        "RESTIC_VERSION:\\s*[\"']?(?<currentValue>[^\"'\\s]+)[\"']?"
+      ],
+      "depNameTemplate": "restic/restic",
+      "datasourceTemplate": "github-releases",
+      "extractVersionTemplate": "^v(?<version>.*)$"
     }
   ]
 }

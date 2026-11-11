@@ -31,17 +31,28 @@ jobs:
           echo 'precedence ::ffff:0:0/96 100' | sudo tee -a /etc/gai.conf
 
       # The tailnet is only for Vault. B2 and SMTP are public, so nothing here
-      # looks up names through the tailnet's DNS: packages install before the
+      # looks up names through the tailnet's DNS: restic installs before the
       # job joins, Tailscale's DNS is off, Vault's address is pinned, and the
-      # job leaves the tailnet once it has the secrets. (A blip in tailnet DNS
-      # failed apt-get on 2026-11-11.)
+      # job leaves the tailnet once it has the secrets.
       - name: Pin Vault's address
         run: echo "${VAULT_IP} vault.mfaherty.net" | sudo tee -a /etc/hosts
 
-      - name: Install dependencies
+      # From restic's GitHub release, not apt: on 2026-11-11 Canonical's IPv4
+      # nameservers stopped answering, so the runner couldn't resolve
+      # *.ubuntu.com and apt-get failed. jq is already on the runner image.
+      - name: Install restic
+        env:
+          RESTIC_VERSION: 0.19.1
         run: |
-          sudo apt-get update -y
-          sudo apt-get install -y jq restic
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          base="https://github.com/restic/restic/releases/download/v${RESTIC_VERSION}"
+          file="restic_${RESTIC_VERSION}_linux_amd64.bz2"
+          curl -fsSL --retry 5 --retry-all-errors -O "$base/$file" -O "$base/SHA256SUMS"
+          grep " ${file}\$" SHA256SUMS | sha256sum -c -
+          bunzip2 -c "$file" | sudo install -m 0755 /dev/stdin /usr/local/bin/restic
+          restic version
+          jq --version
 
       - name: Connect to Tailscale
         uses: tailscale/github-action@064b10558093f38325e838ddea35486bdc6b1d5c  # v4.4.0
@@ -146,7 +157,7 @@ jobs:
 
             ${{ steps.check_etcd.outputs.error }}${{ steps.check_repo.outputs.error }}
 
-            If no error is shown above, an earlier step failed (dependency install, Tailscale, or Vault).
+            If no error is shown above, an earlier step failed (restic install, Tailscale, or Vault).
 
             Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           to: ${{ env.EMAIL_TO }}
