@@ -7,7 +7,7 @@ on:
 
 concurrency:
   group: restart_hosts_1
-  cancel-in-progress: true
+  cancel-in-progress: false  # never interrupt a host mid-reboot
 
 permissions:
   id-token: write  # log in to Vault through GitHub OIDC
