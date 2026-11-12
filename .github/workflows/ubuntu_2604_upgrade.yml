@@ -279,7 +279,7 @@ jobs:
           workflows="kubernetes_rolling_reboot.yml restart_hosts_1.yml restart_hosts_2.yml
             non_docker_hosts_hourly_update.yml docker_hosts_hourly_update.yml daily_unbound_update.yml
             gslb.yml etcd_cluster.yml etcd_rolling_restart.yml etcd_restore.yml vault_cluster.yml
-            redis_hosts.yml log_shipping.yml ipv6_servers.yml"
+            redis_hosts.yml log_shipping.yml"
           for attempt in $(seq 1 60); do
             busy=""
             for w in $workflows; do
