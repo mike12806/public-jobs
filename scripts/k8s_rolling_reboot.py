@@ -97,6 +97,16 @@ RUNNER_WAIT = 3600           # 60m for GitHub Actions jobs already running on a
                              # handed back rather than rebooted under it.
 DRAIN_TIMEOUT = 180          # 3m of polite eviction; a PDB refusal never clears
 DRAIN_FORCE_TIMEOUT = 300    # 5m more, deleting rather than evicting
+CNPG_DRAIN_TIMEOUT = 1200    # 20m more of eviction only, for CloudNativePG
+                             # instances. Their PDBs refuse while the cluster
+                             # is mid-switchover: the operator moves the
+                             # primary off a cordoned node, then restarts the
+                             # old one as a replica, and only then does its
+                             # budget allow the eviction. Deleting past that is
+                             # what corrupted harbor-postgres-5 (2026-11-12): it
+                             # was force-deleted mid-demotion, 4s before the
+                             # reboot. So CNPG pods are evicted or the node is
+                             # handed back -- never deleted.
 DOWN_WAIT = 150              # 2.5m for a reboot to take the node NotReady at all
 GRACEFUL_WAIT = 420          # 7m for an in-guest reboot to go down AND return
 HARD_STOP_WAIT = 180         # 3m for the VM to actually reach 'stopped'
@@ -171,8 +181,8 @@ HEARTBEAT = 60               # never go longer than this without saying
 # FAULT_GRACE is in here because a fault seen during a node's redundancy wait
 # extends that wait by the window it spends re-checking. STORAGE_TIMEOUT counts
 # twice: once before the uncordon and once after.
-NODE_WORST_CASE = (RUNNER_WAIT + DRAIN_TIMEOUT + DRAIN_FORCE_TIMEOUT
-                   + GRACEFUL_WAIT + HARD_STOP_WAIT + RETURN_TIMEOUT
+NODE_WORST_CASE = (RUNNER_WAIT + DRAIN_TIMEOUT + CNPG_DRAIN_TIMEOUT
+                   + DRAIN_FORCE_TIMEOUT + GRACEFUL_WAIT + HARD_STOP_WAIT + RETURN_TIMEOUT
                    + 2 * STORAGE_TIMEOUT + SETTLE_TIMEOUT + FAULT_GRACE)
 # What a node still needs after its redundancy wait returns: everything in the
 # worst case except the wait itself. The wait is allowed to run long while
@@ -185,6 +195,8 @@ DRAIN_RESERVE = REBOOT_RESERVE - RUNNER_WAIT
 # ARC puts this label on every runner pod and names the pod after its
 # EphemeralRunner.
 RUNNER_LABEL = "actions-ephemeral-runner"
+# CloudNativePG puts this label on every instance pod (and its join/initdb jobs).
+CNPG_LABEL = "cnpg.io/cluster"
 # GitHub caps a job at 360 minutes and kills it mid-step, which here could mean
 # a node left cordoned or half-rebooted with no failure email (a cancelled job
 # skips if: failure()). So stop starting nodes before that can happen. The
@@ -1440,26 +1452,58 @@ def drain_node(node: str) -> None:
     Runner pods are left out of both passes: retire_runners() has already
     waited for them, and evicting one would abandon whatever job it holds.
 
+    CloudNativePG instances are never deleted. Their budget refusing is the
+    operator still switching the primary off this node and restarting the old
+    one as a replica; deleting past it can cut that off half done (it left
+    harbor-postgres-5 unable to start on 2026-11-12). They get a longer,
+    eviction-only pass, and if that still fails the node is handed back
+    rather than rebooted.
+
     This is not a bypass of the health gates. Preflight still refuses to start
     on a degraded cluster, the identity assertion still runs, and Longhorn must
     be fully settled before the next node is touched.
     """
-    common = ("--ignore-daemonsets", "--delete-emptydir-data",
-              f"--pod-selector=!{RUNNER_LABEL}")
+    common = ("--ignore-daemonsets", "--delete-emptydir-data")
     try:
         # retries=1: kubectl()'s default would run the whole timeout three times
         # over before reporting a stall.
-        kubectl("drain", node, *common, f"--timeout={DRAIN_TIMEOUT}s",
+        kubectl("drain", node, *common, f"--pod-selector=!{RUNNER_LABEL}",
+                f"--timeout={DRAIN_TIMEOUT}s",
                 timeout=DRAIN_TIMEOUT + 60, retries=1)
         return
     except (Abort, subprocess.TimeoutExpired) as exc:
         log(f"      eviction unfinished after {DRAIN_TIMEOUT}s "
             f"({str(exc)[:160]})")
 
-    log("      forcing: deleting the pods eviction will not release")
+    cnpg = cnpg_pods_on(node)
+    if cnpg:
+        log(f"      CloudNativePG still here ({', '.join(cnpg)}): evicting only, "
+            f"up to {CNPG_DRAIN_TIMEOUT // 60}m, while the operator moves it")
+        try:
+            kubectl("drain", node, *common, f"--pod-selector={CNPG_LABEL}",
+                    f"--timeout={CNPG_DRAIN_TIMEOUT}s",
+                    timeout=CNPG_DRAIN_TIMEOUT + 60, retries=1)
+        except (Abort, subprocess.TimeoutExpired) as exc:
+            raise Abort(
+                f"CloudNativePG pod(s) on {node} still refused eviction after "
+                f"{CNPG_DRAIN_TIMEOUT // 60}m ({', '.join(cnpg_pods_on(node)) or 'gone now'}); "
+                f"not deleting them ({str(exc)[:120]})")
+
+    log("      forcing: deleting the pods eviction will not release "
+        "(never CloudNativePG)")
     kubectl("drain", node, *common, "--force", "--disable-eviction",
+            f"--pod-selector=!{RUNNER_LABEL},!{CNPG_LABEL}",
             f"--timeout={DRAIN_FORCE_TIMEOUT}s",
             timeout=DRAIN_FORCE_TIMEOUT + 60, retries=1)
+
+
+def cnpg_pods_on(node: str) -> list[str]:
+    """namespace/name of each CloudNativePG pod still running on `node`."""
+    return [f"{p['metadata']['namespace']}/{p['metadata']['name']}"
+            for p in kubectl_json(
+                "get", "pods", "-A", "-l", CNPG_LABEL,
+                "--field-selector", f"spec.nodeName={node}")["items"]
+            if p.get("status", {}).get("phase") not in ("Succeeded", "Failed")]
 
 
 def reboot_node(node: str, vm: VmRef, dry_run: bool) -> None:
