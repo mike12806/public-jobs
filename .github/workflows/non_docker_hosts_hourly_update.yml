@@ -5,9 +5,14 @@ on:
     - cron: "14 * * * *"  # Runs hourly at minute 14 (staggered off the top of the hour)
   workflow_dispatch:  # Allows manual triggering from GitHub Actions UI
 
+# Shares the lock with kubernetes_rolling_reboot.yml: that job reboots the same
+# k8s nodes this one updates, and a node rebooting mid-play fails the run as
+# unreachable. Never cancel in progress -- in a shared group that would let
+# the next hourly tick kill a rolling reboot half-way through a node. Ticks
+# that arrive during a reboot wait; GitHub keeps only the newest pending one.
 concurrency:
-  group: non_docker_hosts_hourly_update
-  cancel-in-progress: true
+  group: kubernetes_nodes
+  cancel-in-progress: false
 
 permissions:
   id-token: write  # log in to Vault through GitHub OIDC

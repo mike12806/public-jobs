@@ -74,8 +74,10 @@ on:
     # nodes being started.
     - cron: "0 5 * * *"
 
+# Shared with non_docker_hosts_hourly_update.yml, which runs apt on the same
+# nodes: a node must not reboot while that play is connected to it.
 concurrency:
-  group: kubernetes_rolling_reboot
+  group: kubernetes_nodes
   cancel-in-progress: false # never interrupt a node mid-reboot
 
 jobs:
