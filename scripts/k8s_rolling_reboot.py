@@ -1831,9 +1831,15 @@ def resolve(args, dry_run: bool,
             log("  NOT a dry run: these nodes WILL be cordoned, drained "
                 "and rebooted for real")
 
-    log("Checking which nodes need a reboot")
+    # A single-node job reads only its own node. The plan job already read
+    # every node's sentinel and handed this job its one name; reading the rest
+    # again here answers nothing this job acts on, and made one slow read on a
+    # node it would never touch abort the node it was sent to reboot.
+    scan = [args.only] if args.only else plan.nodes
+    log("Checking which nodes need a reboot"
+        + (f" (single-node mode: {args.only} only)" if args.only else ""))
     candidates, unreachable = [], []
-    for name in plan.nodes:
+    for name in scan:
         if name not in plan.vms:
             continue
         if force_all or name in force_names:
