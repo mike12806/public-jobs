@@ -95,6 +95,10 @@ RUNNER_WAIT = 3600           # 60m for GitHub Actions jobs already running on a
                              # Self-hosted jobs here take minutes; one still
                              # going after an hour is wedged, and the node is
                              # handed back rather than rebooted under it.
+BACKUP_WAIT = 1800           # 30m for vzdump backups already running to
+                             # finish before a node on the PBS path is drained
+                             # (see wait_for_backups). Past that the node is
+                             # drained anyway and the backup fails, as before.
 DRAIN_TIMEOUT = 180          # 3m of polite eviction; a PDB refusal never clears
 DRAIN_FORCE_TIMEOUT = 300    # 5m more, deleting rather than evicting
 CNPG_DRAIN_TIMEOUT = 1200    # 20m more of eviction only, for CloudNativePG
@@ -181,7 +185,7 @@ HEARTBEAT = 60               # never go longer than this without saying
 # FAULT_GRACE is in here because a fault seen during a node's redundancy wait
 # extends that wait by the window it spends re-checking. STORAGE_TIMEOUT counts
 # twice: once before the uncordon and once after.
-NODE_WORST_CASE = (RUNNER_WAIT + DRAIN_TIMEOUT + CNPG_DRAIN_TIMEOUT
+NODE_WORST_CASE = (RUNNER_WAIT + BACKUP_WAIT + DRAIN_TIMEOUT + CNPG_DRAIN_TIMEOUT
                    + DRAIN_FORCE_TIMEOUT + GRACEFUL_WAIT + HARD_STOP_WAIT + RETURN_TIMEOUT
                    + 2 * STORAGE_TIMEOUT + SETTLE_TIMEOUT + FAULT_GRACE)
 # What a node still needs after its redundancy wait returns: everything in the
@@ -205,6 +209,9 @@ CNPG_LABEL = "cnpg.io/cluster"
 PBS_GATEWAY_NAMESPACE = "kube-system"
 PBS_GATEWAY_LABEL = "gateway.networking.k8s.io/gateway-name=pbs-gateway"
 PBS_GATEWAY_GRACE = 10
+# kube-vip labels the node announcing the PBS gateway's VIP (192.168.1.5).
+# Rebooting that node moves the VIP and resets every backup stream through it.
+PBS_VIP_LABEL = "service-provided.kube-vip.io/pbs-gateway-nginx-gateway.kube-system"
 # GitHub caps a job at 360 minutes and kills it mid-step, which here could mean
 # a node left cordoned or half-rebooted with no failure email (a cancelled job
 # skips if: failure()). So stop starting nodes before that can happen. The
@@ -971,6 +978,7 @@ class Plan:
     nodes: list[str] = field(default_factory=list)
     vms: dict[str, VmRef] = field(default_factory=dict)
     unmapped: list[str] = field(default_factory=list)
+    hosts: list["PveHost"] = field(default_factory=list)
 
 
 def load_hosts() -> list[PveHost]:
@@ -1020,7 +1028,7 @@ def load_hosts() -> list[PveHost]:
 
 def discover(hosts: list[PveHost], node_names: list[str]) -> Plan:
     """Map k8s node names to Proxmox VMs across standalone hosts."""
-    plan = Plan(nodes=node_names)
+    plan = Plan(nodes=node_names, hosts=hosts)
     by_name: dict[str, list[VmRef]] = {}
     for h in hosts:
         try:
@@ -1615,9 +1623,114 @@ def reboot_node(node: str, vm: VmRef, dry_run: bool) -> None:
         )
 
 
+def on_pbs_path(node: str) -> list[str]:
+    """Why rebooting `node` would cut PBS backups; empty if it wouldn't.
+
+    Backups reach PBS through gh_hdc's pbs-gateway (VIP 192.168.1.5,
+    externalTrafficPolicy Cluster). Only two nodes matter: the one announcing
+    the VIP, and the one running the gateway pod a stream is pinned to.
+    """
+    why = []
+    labels = kubectl_json("get", "node", node)["metadata"].get("labels", {})
+    if PBS_VIP_LABEL in labels:
+        why.append("holds the PBS VIP")
+    pods = pbs_gateway_pods_on(node)
+    if pods:
+        why.append(f"runs {', '.join(pods)}")
+    return why
+
+
+_TASK_AUDIT: dict[str, bool] = {}
+
+
+def can_see_tasks(h: PveHost) -> bool:
+    """Whether `h`'s token may list other users' tasks (Sys.Audit on the node).
+
+    Without it Proxmox doesn't refuse the task list, it just leaves out the
+    scheduler's vzdump tasks -- which would read as "no backups" and make
+    the wait a silent no-op. Asked once per host per run.
+    """
+    if h.name not in _TASK_AUDIT:
+        try:
+            perms = h.call(f"/access/permissions?path=/nodes/{h.pve_node}") or {}
+            ok = any(p.get("Sys.Audit") for p in perms.values())
+        except Exception as exc:  # noqa: BLE001
+            log(f"      {h.name}: can't read token permissions ({str(exc)[:120]})")
+            ok = False
+        if not ok:
+            log(f"      {h.name}: token lacks Sys.Audit on /nodes/{h.pve_node}, so "
+                f"its running backups are invisible; not waiting on that host")
+        _TASK_AUDIT[h.name] = ok
+    return _TASK_AUDIT[h.name]
+
+
+def active_backups(hosts: list[PveHost]) -> list[str]:
+    """Running vzdump tasks on every reachable Proxmox host, as 'HOST:vmids'.
+
+    A host that can't be asked is logged and skipped: a Proxmox API problem
+    must not hold up node reboots, and the drain's own grace still applies.
+    """
+    found = []
+    for h in hosts:
+        if not h.pve_node:
+            continue
+        if not can_see_tasks(h):
+            continue
+        try:
+            tasks = h.call(f"/nodes/{h.pve_node}/tasks?source=active&typefilter=vzdump") or []
+        except Exception as exc:  # noqa: BLE001
+            log(f"      {h.name}: can't list running backups ({str(exc)[:120]}); "
+                f"not waiting on it")
+            continue
+        for t in tasks:
+            if t.get("type") == "vzdump" and not t.get("endtime"):
+                found.append(f"{h.name}:{t.get('id') or 'all'}")
+    return found
+
+
+def wait_for_backups(node: str, hosts: list[PveHost],
+                     budget_left: float | None) -> None:
+    """Hold the drain of a node on the PBS path until running backups finish.
+
+    vzdump holds one connection per guest through the PBS gateway, so a
+    drain or reboot of the VIP holder or of the serving gateway pod's node
+    fails it. Backups here mostly take seconds to minutes; nightly ones up to
+    ~2h, but those are scheduled to finish well before this run starts. Any
+    running backup counts -- a PVE task doesn't say which gateway pod carries
+    it. Waiting is best effort: at BACKUP_WAIT (or the run budget) the drain
+    goes ahead.
+    """
+    why = on_pbs_path(node)
+    if not why:
+        return
+    limit = float(BACKUP_WAIT)
+    if budget_left is not None:
+        limit = max(min(limit, budget_left - (DRAIN_RESERVE - BACKUP_WAIT)), 0.0)
+    started = time.time()
+    last_said = 0.0
+    while True:
+        running = active_backups(hosts)
+        if not running:
+            if time.time() - started > POLL:
+                log(f"      backups done after {(time.time() - started) / 60:.0f}m")
+            return
+        waited = time.time() - started
+        if waited >= limit:
+            log(f"      backups still running after {waited / 60:.0f}m "
+                f"({', '.join(running)}); draining anyway -- they will fail")
+            return
+        if waited == 0 or time.time() - last_said >= HEARTBEAT:
+            log(f"      {node} {' and '.join(why)}; waiting up to "
+                f"{(limit - waited) / 60:.0f}m more for running backups: "
+                f"{', '.join(running)}")
+            last_said = time.time()
+        time.sleep(POLL)
+
+
 def process_node(node: str, vm: VmRef, dry_run: bool, forced: bool = False,
                  budget_left: float | None = None,
-                 control_plane: bool = False) -> bool:
+                 control_plane: bool = False,
+                 hosts: list[PveHost] | None = None) -> bool:
     started = time.time()
     if forced:
         log(f"  {node}: FORCED -- treating as needing a reboot (test override)")
@@ -1634,8 +1747,11 @@ def process_node(node: str, vm: VmRef, dry_run: bool, forced: bool = False,
     if dry_run:
         runners = runners_on(node)
         busy = sum(1 for _, _, job in runners if job)
+        why = on_pbs_path(node)
+        backups = (f", wait for backups ({' and '.join(why)}; running now: "
+                   f"{', '.join(active_backups(hosts or [])) or 'none'})" if why else "")
         log(f"    DRY-RUN: would cordon, retire {len(runners)} runner(s) "
-            f"({busy} busy), drain, reboot, uncordon {node}")
+            f"({busy} busy){backups}, drain, reboot, uncordon {node}")
         return True
 
     log("    cordon + drain")
@@ -1643,6 +1759,10 @@ def process_node(node: str, vm: VmRef, dry_run: bool, forced: bool = False,
     try:
         retire_runners(node, None if budget_left is None
                        else budget_left - (time.time() - started))
+        # After the runner wait, right before the drain, so a backup that
+        # started meanwhile is still caught. Cordoning doesn't stop backups.
+        wait_for_backups(node, hosts or [], None if budget_left is None
+                         else budget_left - (time.time() - started))
         drain_node(node)
     except (Abort, subprocess.TimeoutExpired) as exc:
         uncordon_node(node, check=False)
@@ -2025,7 +2145,8 @@ def main() -> int:
             if not process_node(name, plan.vms[name], dry_run,
                                 forced=name in forced,
                                 budget_left=None if dry_run else left,
-                                control_plane=name in cp):
+                                control_plane=name in cp,
+                                hosts=plan.hosts):
                 no_storage.append(name)
             if not dry_run:
                 done.append(time.time() - t0)
