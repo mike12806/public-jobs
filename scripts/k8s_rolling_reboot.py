@@ -197,6 +197,14 @@ DRAIN_RESERVE = REBOOT_RESERVE - RUNNER_WAIT
 RUNNER_LABEL = "actions-ephemeral-runner"
 # CloudNativePG puts this label on every instance pod (and its join/initdb jobs).
 CNPG_LABEL = "cnpg.io/cluster"
+# gh_hdc's dedicated PBS gateway. Its nginx pods drain in-flight backup streams
+# for up to ~4h on termination (preStop + a 14700s grace period), so a rollout
+# doesn't cut backups. A drain here can't wait that long: the force pass would
+# time out and abort the run. Its pods get the eviction pass to finish, then
+# their remaining grace is cut short -- the node is about to reboot anyway.
+PBS_GATEWAY_NAMESPACE = "kube-system"
+PBS_GATEWAY_LABEL = "gateway.networking.k8s.io/gateway-name=pbs-gateway"
+PBS_GATEWAY_GRACE = 10
 # GitHub caps a job at 360 minutes and kills it mid-step, which here could mean
 # a node left cordoned or half-rebooted with no failure email (a cancelled job
 # skips if: failure()). So stop starting nodes before that can happen. The
@@ -1489,12 +1497,32 @@ def drain_node(node: str) -> None:
                 f"{CNPG_DRAIN_TIMEOUT // 60}m ({', '.join(cnpg_pods_on(node)) or 'gone now'}); "
                 f"not deleting them ({str(exc)[:120]})")
 
+    pbs = pbs_gateway_pods_on(node)
+    if pbs:
+        # Already terminating from the eviction pass; a delete with a shorter
+        # grace period shortens it. Any backup still streaming through these
+        # pods fails, as it would if the node rebooted under it.
+        log(f"      PBS gateway still draining ({', '.join(pbs)}): cutting its "
+            f"grace to {PBS_GATEWAY_GRACE}s")
+        kubectl("delete", "pods", "-n", PBS_GATEWAY_NAMESPACE,
+                "-l", PBS_GATEWAY_LABEL, "--field-selector", f"spec.nodeName={node}",
+                f"--grace-period={PBS_GATEWAY_GRACE}", "--wait=false", check=False)
+
     log("      forcing: deleting the pods eviction will not release "
         "(never CloudNativePG)")
     kubectl("drain", node, *common, "--force", "--disable-eviction",
             f"--pod-selector=!{RUNNER_LABEL},!{CNPG_LABEL}",
             f"--timeout={DRAIN_FORCE_TIMEOUT}s",
             timeout=DRAIN_FORCE_TIMEOUT + 60, retries=1)
+
+
+def pbs_gateway_pods_on(node: str) -> list[str]:
+    """Names of the PBS gateway pods still on `node`."""
+    return [p["metadata"]["name"]
+            for p in kubectl_json(
+                "get", "pods", "-n", PBS_GATEWAY_NAMESPACE, "-l", PBS_GATEWAY_LABEL,
+                "--field-selector", f"spec.nodeName={node}")["items"]
+            if p.get("status", {}).get("phase") not in ("Succeeded", "Failed")]
 
 
 def cnpg_pods_on(node: str) -> list[str]:
