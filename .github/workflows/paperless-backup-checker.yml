@@ -82,7 +82,9 @@ jobs:
           token=$(jq -r '.authorizationToken' <<<"$auth")
           echo "::add-mask::${token}"
           api_url=$(jq -r '.apiInfo.storageApi.apiUrl' <<<"$auth")
-          bucket_id=$(jq -r '.apiInfo.storageApi.allowed.buckets[0].id // empty' <<<"$auth")
+          # b2api v3: a key limited to one bucket has it in storageApi.bucketId
+          # (null for an all-buckets key).
+          bucket_id=$(jq -r '.apiInfo.storageApi.bucketId // empty' <<<"$auth")
           [ -n "$bucket_id" ] || fail "The B2 key isn't limited to a bucket; it should be limited to the export bucket"
 
           body=$(jq -nc --arg b "$bucket_id" --arg f "$HEARTBEAT" \
