@@ -39,16 +39,28 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - name: Checkout (for the vault-secrets action)
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      # Joins with this repo's Tailscale OAuth client (tag:ci), like the other
+      # jobs here. The shared vault-secrets action's tag:ci-vault trust
+      # credential doesn't accept this repo's workflows (403 on token exchange).
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@064b10558093f38325e838ddea35486bdc6b1d5c  # v4.4.0
         with:
-          sparse-checkout: .github/actions
-
-      - name: Read secrets from Vault
-        uses: ./.github/actions/vault-secrets
-        with:
-          role: public-jobs
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
           hostname: github-runner-paperless-backup-checker
+          version: latest
+
+      # Secrets come from Vault (kv/ci/*), logged in through GitHub OIDC with
+      # the public-jobs role (gh_hdc vault/github-roles/public-jobs.json).
+      - name: Read secrets from Vault
+        uses: hashicorp/vault-action@892a26828f195e65540a40b4768ae4571f51ebfc  # v4.0.0
+        with:
+          url: https://vault.mfaherty.net
+          method: jwt
+          path: github-actions
+          role: public-jobs
+          jwtGithubAudience: https://vault.mfaherty.net
           secrets: |
             kv/data/ci/paperless-backup B2_ACCOUNT_ID | B2_ACCOUNT_ID ;
             kv/data/ci/paperless-backup B2_APPLICATION_KEY | B2_APPLICATION_KEY ;
@@ -58,6 +70,11 @@ jobs:
             kv/data/ci/smtp SMTP_PORT | SMTP_PORT ;
             kv/data/ci/smtp SMTP_SERVER | SMTP_SERVER ;
             kv/data/ci/smtp SMTP_USERNAME | SMTP_USERNAME
+
+      # Everything after this reaches only B2 and SMTP over the internet, so
+      # leave the tailnet before the email action (third-party code) runs.
+      - name: Disconnect from Tailscale
+        run: sudo tailscale down && echo "Left the tailnet"
 
       - name: Check the backup heartbeat's age
         id: check
