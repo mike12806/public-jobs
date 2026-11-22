@@ -84,9 +84,27 @@ class AnsibleWorkflows(unittest.TestCase):
                 self.assertEqual(len(tracked.get(path.name, [])), mentions,
                                  "Renovate's matchStrings don't read every ANSIBLE_VERSION in %s" % path.name)
 
+    def test_updates_wait_for_the_checks(self):
+        # The pins move only through Renovate, and its PR merges only once
+        # ansible-workflows.yml (the stage gate) passes.
+        config = json.loads((ROOT / "renovate.json").read_text())
+        rules = [r for r in config.get("packageRules", []) if "ansible" in r.get("matchDepNames", [])]
+        self.assertTrue(rules, "renovate.json has no packageRule for ansible")
+        # Renovate applies every matching rule in order; the last one wins.
+        merged = {}
+        for rule in rules:
+            merged.update(rule)
+        self.assertIs(merged.get("automerge"), True)
+        self.assertIs(merged.get("ignoreTests"), False, "ansible updates must wait for the checks")
+        self.assertIs(merged.get("platformAutomerge"), False,
+                      "GitHub's auto-merge waits only for required checks, not ansible-workflows.yml")
+
     def test_one_version(self):
         versions = {name: sorted(set(values)) for name, values in pins().items()}
         self.assertEqual(len({v for values in versions.values() for v in values}), 1, versions)
+        for name, values in versions.items():
+            for value in values:
+                self.assertRegex(value, r"^\d+\.\d+\.\d+$", "pin an exact Ansible version in %s" % name)
 
     def test_installs_are_pinned(self):
         for workflow, job, index, step, env in steps():
