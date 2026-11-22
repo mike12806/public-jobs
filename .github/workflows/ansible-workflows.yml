@@ -45,11 +45,11 @@ jobs:
           echo "$PIPX_BIN_DIR" >> "$GITHUB_PATH"
           "$PIPX_BIN_DIR/ansible-playbook" --version
 
-      # The pinned Ansible's Python has PyYAML.
+      # The pinned Ansible's Python has PyYAML. (Its entry points' shebang
+      # carries flags, "#!.../bin/python -E", so it isn't read from there.)
       - name: Every workflow uses the pin
         run: |
-          python=$(head -1 "$(command -v ansible-playbook)" | sed 's/^#!//')
-          "$python" -m unittest discover -s tests -v
+          "$RUNNER_TEMP/pipx/venvs/ansible/bin/python" -m unittest discover -s tests -v
 
       - name: Run a play as the playbook workflows do
         env:
@@ -76,7 +76,8 @@ jobs:
                 ansible.builtin.command: "true"
                 changed_when: true
           EOF
-          ansible-playbook -i localhost, -c local "$play" < /dev/null 2>&1 | tee "$log"
+          # By path: the runner image has an Ansible of its own in /opt/pipx_bin.
+          "$RUNNER_TEMP/pipx/bin/ansible-playbook" -i localhost, -c local "$play" < /dev/null 2>&1 | tee "$log"
           rc=$?
           # The way gslb.yml and etcd_cluster.yml find hosts with changes.
           changed=$(sed -n '/^PLAY RECAP/,$p' "$log" | grep -oE '^localhost .*changed=[1-9][0-9]*' | awk '{print $1}')
