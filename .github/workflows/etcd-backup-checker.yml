@@ -42,7 +42,7 @@ jobs:
       # *.ubuntu.com and apt-get failed. jq is already on the runner image.
       - name: Install restic
         env:
-          RESTIC_VERSION: 0.19.1
+          RESTIC_VERSION: 0.20.0
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP"
