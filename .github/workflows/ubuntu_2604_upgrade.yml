@@ -156,6 +156,7 @@ jobs:
         id: hosts
         working-directory: gh_hdc/ansible
         env:
+          ANSIBLE_VERSION: 15.0.0
           GROUP: ${{ inputs.group }}
           ONLY: ${{ inputs.hosts }}
         run: |
@@ -168,7 +169,7 @@ jobs:
             echo "::error::hosts may only contain host names, commas and spaces."
             exit 1
           fi
-          all="$(pipx run --spec ansible ansible-inventory -i "$INVENTORY" --list | jq -c --arg g "$GROUP" '.[$g].hosts // []')"
+          all="$(pipx run --spec "ansible==${ANSIBLE_VERSION}" ansible-inventory -i "$INVENTORY" --list | jq -c --arg g "$GROUP" '.[$g].hosts // []')"
           if [ -n "${ONLY// /}" ]; then
             hosts="$(jq -c --arg only "${ONLY// /}" '($only | split(",")) as $o | map(select(. as $h | $o | index($h)))' <<<"$all")"
             unknown="$(jq -r --argjson all "$all" --arg only "${ONLY// /}" '$only | split(",") - $all | join(", ")' <<<'null')"
@@ -189,6 +190,7 @@ jobs:
       - name: Preflight
         working-directory: gh_hdc/ansible
         env:
+          ANSIBLE_VERSION: 15.0.0
           ANSIBLE_SSH_PASS: ${{ env.ANSIBLE_SSH_PASSWORD_1 }}
           ANSIBLE_PYTHON_INTERPRETER: /usr/bin/python3
           ANSIBLE_TIMEOUT: 30
@@ -201,7 +203,7 @@ jobs:
         run: |
           set -o pipefail
           limit="$(jq -r 'join(",")' <<<"$HOSTS")"
-          pipx run --spec ansible ansible-playbook "$PLAYBOOK" \
+          pipx run --spec "ansible==${ANSIBLE_VERSION}" ansible-playbook "$PLAYBOOK" \
             -i "$INVENTORY" --limit "$limit" \
             -u root --private-key=/tmp/mike_ssh_key \
             -e "r2604_mode=$MODE" \
@@ -320,6 +322,7 @@ jobs:
         id: playbook
         working-directory: gh_hdc/ansible
         env:
+          ANSIBLE_VERSION: 15.0.0
           ANSIBLE_SSH_PASS: ${{ env.ANSIBLE_SSH_PASSWORD_1 }}
           ANSIBLE_PYTHON_INTERPRETER: /usr/bin/python3
           ANSIBLE_TIMEOUT: 30
@@ -330,7 +333,7 @@ jobs:
           LINODE_TOKEN: ${{ env.LINODE_TOKEN }}
         run: |
           set -o pipefail
-          pipx run --spec ansible ansible-playbook "$PLAYBOOK" \
+          pipx run --spec "ansible==${ANSIBLE_VERSION}" ansible-playbook "$PLAYBOOK" \
             -i "$INVENTORY" --limit "$HOST" \
             -u root --private-key=/tmp/mike_ssh_key \
             -e r2604_mode=upgrade \

@@ -9,6 +9,15 @@
     "custom.regex",
     "github-actions"
   ],
+  "packageRules": [
+    {
+      "description": "Ansible upgrades automerge only once the PR's checks pass: ansible-workflows.yml installs the new version and runs a play with it",
+      "matchDepNames": [
+        "ansible"
+      ],
+      "ignoreTests": false
+    }
+  ],
   "customManagers": [
     {
       "customType": "regex",

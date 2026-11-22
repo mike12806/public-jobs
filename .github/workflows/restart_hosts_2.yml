@@ -61,9 +61,9 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pipx-ansible-
 
-      - name: Install dependencies
+      # The playbook runs with pipx run (the pinned ANSIBLE_VERSION below).
+      - name: Set up pipx
         run: |
-          pipx install ansible-core==2.13.0
           pipx ensurepath
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
@@ -81,6 +81,7 @@ jobs:
       - name: Run Ansible Playbook
         working-directory: gh_hdc/ansible  # Adjust path as needed
         env:
+          ANSIBLE_VERSION: 15.0.0
           ANSIBLE_SSH_PASS: ${{ env.ANSIBLE_SSH_PASSWORD_1 }}
           ANSIBLE_PYTHON_INTERPRETER: /usr/bin/python3
           ANSIBLE_GATHERING: smart
@@ -90,7 +91,7 @@ jobs:
           ANSIBLE_HOST_KEY_CHECKING: false
         run: |
           export PATH="$HOME/.local/bin:$PATH"
-          pipx run --spec ansible ansible-playbook playbooks/playbook_weekly_restart.yaml \
+          pipx run --spec "ansible==${ANSIBLE_VERSION}" ansible-playbook playbooks/playbook_weekly_restart.yaml \
             -i inventory/needs_restart_2 \
             -u root \
             --private-key=/tmp/mike_ssh_key \

@@ -120,6 +120,7 @@ jobs:
         id: playbook
         working-directory: gh_hdc/ansible
         env:
+          ANSIBLE_VERSION: 15.0.0
           ANSIBLE_SSH_PASS: ${{ env.ANSIBLE_SSH_PASSWORD_1 }}
           ANSIBLE_PRIVATE_KEY_FILE: /tmp/mike_ssh_key
           ANSIBLE_PYTHON_INTERPRETER: /usr/bin/python3
@@ -145,7 +146,7 @@ jobs:
             echo "::error::force_members may only contain member names, commas and spaces."
             exit 1
           fi
-          pipx run --spec ansible ansible-playbook playbooks/playbook_etcd_rolling_restart.yaml \
+          pipx run --spec "ansible==${ANSIBLE_VERSION}" ansible-playbook playbooks/playbook_etcd_rolling_restart.yaml \
             -i inventory/etcd_hosts \
             -u root \
             --private-key=/tmp/mike_ssh_key \

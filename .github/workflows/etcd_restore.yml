@@ -167,6 +167,7 @@ jobs:
         id: playbook
         working-directory: gh_hdc/ansible
         env:
+          ANSIBLE_VERSION: 15.0.0
           ANSIBLE_SSH_PASS: ${{ env.ANSIBLE_SSH_PASSWORD_1 }}
           ANSIBLE_PRIVATE_KEY_FILE: /tmp/mike_ssh_key
           ANSIBLE_PYTHON_INTERPRETER: /usr/bin/python3
@@ -199,7 +200,7 @@ jobs:
           SKIP_K3S: ${{ inputs.skip_k3s }}
         run: |
           set -o pipefail
-          pipx run --spec ansible ansible-playbook playbooks/playbook_etcd_restore.yaml \
+          pipx run --spec "ansible==${ANSIBLE_VERSION}" ansible-playbook playbooks/playbook_etcd_restore.yaml \
             -i inventory/etcd_hosts \
             -u root \
             --private-key=/tmp/mike_ssh_key \
@@ -216,6 +217,7 @@ jobs:
         if: inputs.mode == 'member'
         working-directory: gh_hdc/ansible
         env:
+          ANSIBLE_VERSION: 15.0.0
           ANSIBLE_SSH_PASS: ${{ env.ANSIBLE_SSH_PASSWORD_1 }}
           ANSIBLE_PRIVATE_KEY_FILE: /tmp/mike_ssh_key
           ANSIBLE_PYTHON_INTERPRETER: /usr/bin/python3
@@ -243,7 +245,7 @@ jobs:
           PVE7_SECRET: ${{ env.PVE7_SECRET }}
         run: |
           set -o pipefail
-          pipx run --spec ansible ansible-playbook playbooks/playbook_etcd_cluster.yaml \
+          pipx run --spec "ansible==${ANSIBLE_VERSION}" ansible-playbook playbooks/playbook_etcd_cluster.yaml \
             -i inventory/etcd_hosts \
             -u root \
             --private-key=/tmp/mike_ssh_key \
