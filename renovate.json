@@ -11,11 +11,13 @@
   ],
   "packageRules": [
     {
-      "description": "Ansible upgrades automerge only once the PR's checks pass: ansible-workflows.yml installs the new version and runs a play with it",
+      "description": "Ansible (every workflow's ANSIBLE_VERSION pin): every update automerges, majors included, but only once all the PR's checks pass. ansible-workflows.yml is the stage gate: it checks every pin agrees, installs the new version and runs a play with it. Renovate merges by itself (platformAutomerge off) because GitHub's auto-merge would wait only for the branch's required checks, not this one.",
       "matchDepNames": [
         "ansible"
       ],
-      "ignoreTests": false
+      "automerge": true,
+      "ignoreTests": false,
+      "platformAutomerge": false
     }
   ],
   "customManagers": [
