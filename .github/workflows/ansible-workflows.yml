@@ -1,0 +1,91 @@
+name: Ansible workflows
+
+# The workflows that run gh_hdc's playbooks all install one pinned Ansible
+# (ANSIBLE_VERSION, which Renovate bumps). On a pull request that touches
+# them, check that:
+#   - every one of them installs or runs Ansible at that pin, so none runs
+#     whatever is newest (tests/test_ansible_workflows.py);
+#   - that version installs on the hosted runner they use, and runs a play
+#     with their settings (stdout callback, YAML results, /usr/bin/python3 on
+#     the target) without warnings, ending in the PLAY RECAP the drift checks
+#     in gslb.yml, etcd_cluster.yml and log_shipping.yml read.
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/**'
+      - 'tests/**'
+      - 'renovate.json'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  ansible:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      # Renovate bumps this pin with the others; the tests below fail unless
+      # they all agree.
+      - name: Install the pinned Ansible
+        env:
+          ANSIBLE_VERSION: 15.0.0
+          PIPX_HOME: ${{ runner.temp }}/pipx
+          PIPX_BIN_DIR: ${{ runner.temp }}/pipx/bin
+        run: |
+          pipx install --include-deps "ansible==${ANSIBLE_VERSION}"
+          echo "$PIPX_BIN_DIR" >> "$GITHUB_PATH"
+          "$PIPX_BIN_DIR/ansible-playbook" --version
+
+      # The pinned Ansible's Python has PyYAML.
+      - name: Every workflow uses the pin
+        run: |
+          python=$(head -1 "$(command -v ansible-playbook)" | sed 's/^#!//')
+          "$python" -m unittest discover -s tests -v
+
+      - name: Run a play as the playbook workflows do
+        env:
+          ANSIBLE_PYTHON_INTERPRETER: /usr/bin/python3
+          ANSIBLE_GATHERING: smart
+          ANSIBLE_TIMEOUT: 30
+          ANSIBLE_STDOUT_CALLBACK: ansible.builtin.default
+          ANSIBLE_CALLBACK_RESULT_FORMAT: yaml
+          ANSIBLE_HOST_KEY_CHECKING: false
+        run: |
+          set +e -uo pipefail
+          play="$RUNNER_TEMP/play.yaml"
+          log="$RUNNER_TEMP/play.log"
+          cat > "$play" <<'EOF'
+          - name: Smoke test
+            hosts: all
+            gather_facts: true
+            tasks:
+              - name: Facts came back
+                ansible.builtin.assert:
+                  that: ansible_facts.python.version.major == 3
+                  quiet: true
+              - name: Change something
+                ansible.builtin.command: "true"
+                changed_when: true
+          EOF
+          ansible-playbook -i localhost, -c local "$play" < /dev/null 2>&1 | tee "$log"
+          rc=$?
+          # The way gslb.yml and etcd_cluster.yml find hosts with changes.
+          changed=$(sed -n '/^PLAY RECAP/,$p' "$log" | grep -oE '^localhost .*changed=[1-9][0-9]*' | awk '{print $1}')
+          if [ "$changed" != localhost ]; then
+            echo "::error::The drift checks wouldn't find the change in this PLAY RECAP."
+            rc=1
+          fi
+          if grep -nE '^\[(WARNING|DEPRECATION WARNING|ERROR)\]' "$log"; then
+            echo "::error::Ansible printed the warnings or errors above."
+            rc=1
+          fi
+          exit $rc
