@@ -2,26 +2,31 @@ name: etcd Rolling Restart
 
 # Runs gh_hdc's ansible/playbooks/playbook_etcd_rolling_restart.yaml against
 # the etcd LXCs (gh_hdc ansible/inventory/etcd_hosts): reboots only members
-# that need it (reboot-required, or processes on replaced libraries after the
+# that need it (reboot-required, or processes on replaced files after the
 # hourly updates), one at a time, only while every member is healthy, handing
 # off leadership first and waiting for each to catch up before the next. Stops
 # at the first member that doesn't come back cleanly. See the playbook header.
+#
+# Daily, not weekly: the hourly update holds service restarts on these LXCs
+# (gh_hdc inventory/non_docker_lxc, defer_service_restarts), so this is what
+# puts an installed fix into service. On a day with no updates it reboots
+# nothing. lxc_rolling_restart.yml does the same for the other LXC sets.
 #
 # Like etcd_cluster.yml it runs on a GitHub-hosted runner over Tailscale, so it
 # doesn't depend on the Kubernetes cluster this datastore serves.
 #
 # Shares etcd_cluster.yml's concurrency group, so it never overlaps that
-# playbook (which also restarts members). Saturday 10:23 UTC (06:23 EDT) is
-# clear of the nightly etcd_cluster dry run (08:47 UTC), the members' defrag
-# timers (03:15 local) and the k8s rolling reboot's start window (05:00-09:00
-# UTC).
+# playbook (which also restarts members). 10:23 UTC (06:23 EDT) is clear of
+# the nightly etcd_cluster dry run (08:47 UTC), the members' defrag timers
+# (03:15 local), the k8s rolling reboot's start window (05:00-09:00 UTC) and
+# lxc_rolling_restart.yml (11:44 UTC).
 #
 # Manual runs are dry runs (--check) unless "apply" is ticked. force_members
 # ("all" or "etcd-2,etcd-4") reboots those regardless of need, to rehearse.
 
 on:
   schedule:
-    - cron: "23 10 * * 6"
+    - cron: "23 10 * * *"
   workflow_dispatch:
     inputs:
       apply:
