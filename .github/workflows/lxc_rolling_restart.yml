@@ -1,0 +1,205 @@
+name: LXC Rolling Restart
+# Runs gh_hdc's ansible/playbooks/playbook_lxc_rolling_restart.yaml against
+# the redundant LXC sets in gh_hdc ansible/inventory/lxc_rolling_restart
+# (unbound, shared-redis, Vault, GSLB, the Tailscale subnet routers).
+#
+# The hourly update (non_docker_hosts_hourly_update.yml) installs packages on
+# these LXCs but holds service restarts, because it updates every host at once
+# and a package's own restart would hit every member of a set together. This
+# job applies them: it restarts only the containers still running replaced
+# code (or with reboot-required), one at a time across all sets, only while
+# the container's whole set is healthy, with each set's primary (active Vault
+# node, VIP holder, Redis master) last. It stops at the first host that
+# doesn't come back clean; the rest are left untouched. A set with a member
+# that's down is skipped and the run fails, so it's noticed. See the playbook
+# header.
+#
+# GitHub-hosted runner over Tailscale (this repo is public), so it doesn't
+# depend on the Kubernetes cluster or on the LXCs it restarts.
+#
+# Shares the hourly update's concurrency group, so it never restarts a host
+# while apt runs on it, and the hourly run never finds a host mid-restart.
+# 11:44 UTC is clear of the k8s rolling reboot's start window (05:00-09:00
+# UTC), the nightly GSLB/Vault/etcd checks (08:17-08:47 UTC) and the etcd
+# rolling restart (10:23 UTC), and lands after that hour's update run has
+# usually finished. If an update run is still going it waits; GitHub keeps
+# only the newest pending run in a group, so a day on which it would wait
+# past the next hourly tick is skipped and the next day catches up.
+#
+# Manual runs are dry runs (--check) unless "apply" is ticked. force_hosts
+# ("all" or "vault-5,gslb-2") restarts those regardless of need, to rehearse;
+# limit narrows the run to sets or hosts.
+on:
+  schedule:
+    - cron: "44 11 * * *"
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: 'Restart for real (unticked = dry run with --check)'
+        type: boolean
+        default: false
+      force_hosts:
+        description: "Restart these regardless of need: 'all' or e.g. 'vault-5,gslb-2'. Blank = only hosts that need it"
+        type: string
+        default: ''
+      limit:
+        description: "Only these sets or hosts, e.g. 'vault' or 'gslb,unbound3'. Blank = all"
+        type: string
+        default: ''
+      gh_hdc_ref:
+        description: 'gh_hdc branch/ref to run the playbook from'
+        type: string
+        default: main
+concurrency:
+  group: kubernetes_nodes
+  cancel-in-progress: false  # never interrupt a host mid-restart
+permissions:
+  id-token: write  # log in to Vault through GitHub OIDC
+  contents: read
+jobs:
+  lxc-rolling-restart:
+    runs-on: ubuntu-26.04
+    # 17 hosts at roughly 3-4 minutes each when every one needs it (the first
+    # run); a normal day restarts a few.
+    timeout-minutes: 120
+    steps:
+      - name: Prefer IPv4 over IPv6
+        run: |
+          # Force IPv4 preference to avoid Tailscale IPv6 connectivity issues
+          echo 'precedence ::ffff:0:0/96 100' | sudo tee -a /etc/gai.conf
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@064b10558093f38325e838ddea35486bdc6b1d5c  # v4.4.0
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          hostname: github-runner-lxc-rolling-restart
+          version: latest
+
+      # Secrets come from Vault (kv/ci/*), logged in through GitHub OIDC with
+      # the role below (gh_hdc vault/), so they're no longer GitHub secrets.
+      - name: Read secrets from Vault
+        uses: hashicorp/vault-action@892a26828f195e65540a40b4768ae4571f51ebfc  # v4.0.0
+        with:
+          url: https://vault.mfaherty.net
+          method: jwt
+          path: github-actions
+          role: public-jobs
+          jwtGithubAudience: https://vault.mfaherty.net
+          secrets: |
+            kv/data/ci/github GH_HDC_PAT | GH_HDC_PAT ;
+            kv/data/ci/smtp EMAIL_FROM | EMAIL_FROM ;
+            kv/data/ci/smtp EMAIL_TO | EMAIL_TO ;
+            kv/data/ci/smtp SMTP_PASSWORD | SMTP_PASSWORD ;
+            kv/data/ci/smtp SMTP_PORT | SMTP_PORT ;
+            kv/data/ci/smtp SMTP_SERVER | SMTP_SERVER ;
+            kv/data/ci/smtp SMTP_USERNAME | SMTP_USERNAME ;
+            kv/data/ci/ssh ANSIBLE_SSH_PASSWORD_1 | ANSIBLE_SSH_PASSWORD_1 ;
+            kv/data/ci/ssh MIKEYSSHKEYLINODE | MIKEYSSHKEYLINODE
+
+      - name: Checkout gh_hdc
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: mike12806/gh_hdc
+          ref: ${{ inputs.gh_hdc_ref || 'main' }}
+          token: ${{ env.GH_HDC_PAT }}
+          path: gh_hdc
+
+      - name: Cache pipx and ansible
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: |
+            ~/.local/bin
+            ~/.local/pipx
+          key: ${{ runner.os }}-pipx-ansible-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pipx-ansible-
+
+      - name: Set up pipx
+        run: |
+          pipx ensurepath
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Write SSH Private Key to File
+        env:
+          SSH_KEY: ${{ env.MIKEYSSHKEYLINODE }}
+        run: |
+          printf '%s\n' "$SSH_KEY" | sed 's/\\n/\n/g' > /tmp/mike_ssh_key
+          chmod 600 /tmp/mike_ssh_key
+
+      - name: Run Ansible Playbook
+        id: playbook
+        working-directory: gh_hdc/ansible
+        env:
+          ANSIBLE_VERSION: 15.0.0
+          ANSIBLE_SSH_PASS: ${{ env.ANSIBLE_SSH_PASSWORD_1 }}
+          ANSIBLE_PRIVATE_KEY_FILE: /tmp/mike_ssh_key
+          ANSIBLE_PYTHON_INTERPRETER: /usr/bin/python3
+          ANSIBLE_GATHERING: smart
+          ANSIBLE_TIMEOUT: 30
+          ANSIBLE_STDOUT_CALLBACK: ansible.builtin.default
+          ANSIBLE_CALLBACK_RESULT_FORMAT: yaml
+          ANSIBLE_HOST_KEY_CHECKING: false
+          # A scheduled run is always live, never forced and never limited; a
+          # manual one is a dry run unless "apply" is ticked.
+          LIVE: ${{ github.event_name == 'schedule' || inputs.apply }}
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force_hosts || '' }}
+          LIMIT: ${{ github.event_name == 'workflow_dispatch' && inputs.limit || '' }}
+        run: |
+          set -o pipefail
+          mode=(--check)
+          if [ "$LIVE" = "true" ]; then
+            mode=()
+            echo "::notice::Live run: hosts that need it will be restarted."
+          else
+            echo "::notice::Dry run (--check). Re-run with 'apply' ticked to restart."
+          fi
+          for v in "$FORCE" "$LIMIT"; do
+            if ! [[ "$v" =~ ^[A-Za-z0-9.,\ -]*$ ]]; then
+              echo "::error::force_hosts and limit may only contain host or set names, commas and spaces."
+              exit 1
+            fi
+          done
+          limit=()
+          if [ -n "${LIMIT// /}" ]; then
+            limit=(--limit "${LIMIT// /}")
+          fi
+          pipx run --spec "ansible==${ANSIBLE_VERSION}" ansible-playbook playbooks/playbook_lxc_rolling_restart.yaml \
+            -i inventory/lxc_rolling_restart \
+            -u root \
+            --private-key=/tmp/mike_ssh_key \
+            "${mode[@]}" "${limit[@]}" \
+            -e "rr_force='${FORCE}'" \
+            --extra-vars "ansible_ssh_pass=${ANSIBLE_SSH_PASS} ansible_ssh_common_args='-o StrictHostKeyChecking=no'" \
+            | tee "$RUNNER_TEMP/lxc_rr.log"
+
+      - name: Email on failure
+        if: failure() && steps.playbook.outcome == 'failure'
+        uses: dawidd6/action-send-mail@27bf7a883db6de205849f760badd38a1a3ce0dd0  # v24
+        with:
+          server_address: ${{ env.SMTP_SERVER }}
+          server_port: ${{ env.SMTP_PORT }}
+          username: ${{ env.SMTP_USERNAME }}
+          password: ${{ env.SMTP_PASSWORD }}
+          subject: "[LXC] Rolling restart STOPPED - check the sets"
+          to: ${{ env.EMAIL_TO }}
+          from: ${{ env.EMAIL_FROM }}
+          body: |
+            The LXC rolling restart didn't finish.
+
+            Either a set had a member that was down or unreadable (that whole set
+            was left alone), or a host didn't come back clean (the run stopped
+            there; the hosts after it were left alone). Every set it touched was
+            healthy before each restart, so the rest should still be serving.
+
+            Until it's fixed, the hosts it didn't restart keep running replaced
+            code, security fixes included. The summary at the end of the log says
+            which; the failing task says why.
+
+            Run log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      - name: Cleanup Temporary Files
+        if: always()
+        run: |
+          rm -f /tmp/mike_ssh_key "$RUNNER_TEMP/lxc_rr.log"
